@@ -10,6 +10,10 @@ import { run } from "./lib/process.mjs";
 import { cacheRuntimeFromApp, hydrateSourcePayloadFromRuntime, validateRuntimeApp } from "./lib/runtime.mjs";
 import { SYSTEM_TOOLS } from "./lib/system-tools.mjs";
 
+if (process.platform === "win32") {
+  await import("./bootstrap-windows-runtime.mjs");
+} else {
+
 async function exists(target) {
   try {
     await access(target);
@@ -89,3 +93,4 @@ const hydrated = await hydrateSourcePayloadFromRuntime(runtimeApp);
 console.log(`Runtime ready: ${cachedRuntimeApp}`);
 console.log(`Checksum-pinned source payload ready: ${hydrated.destination} (${hydrated.sha256})`);
 console.log("The checksum-pinned app supplies only the Electron shell, ABI-matched native dependencies, and explicitly documented build fallbacks.");
+}

@@ -3,6 +3,9 @@ name: repository checks
 on:
   push:
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1"
 
 permissions:
   contents: read
@@ -25,3 +28,49 @@ jobs:
         run: npm run frontend:build
       - name: Verify a fresh clean-history export is lossless
         run: npm run publication:check
+
+  windows-x64-portable:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - name: Hydrate only the pinned Windows carrier
+        shell: pwsh
+        run: git lfs pull --include="research-archives/original/0.18.0/windows-x64/Grok_Bot_0.18.0_Setup.exe" --exclude=""
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.5.0
+          cache: npm
+      - name: Install the locked dependency graph
+        run: npm ci --no-audit --no-fund
+      - name: Verify Windows-specific source boundaries
+        run: |
+          npm run typecheck
+          npm run source:typecheck
+          npm run test:windows
+      - name: Bootstrap without executing the NSIS carrier
+        run: npm run bootstrap:windows
+      - name: Build and verify the local unsigned portable directory
+        run: |
+          npm run package:windows
+          npm run verify:windows
+      - name: Launch a fresh isolated profile and reach Router settings
+        run: npm run smoke:windows
+
+  full-original-provenance:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - name: Hydrate both original carriers for the scheduled provenance audit
+        run: git lfs pull --include="research-archives/original/0.18.0/macos-arm64/Grok_Bot_0.18.0.dmg,research-archives/original/0.18.0/windows-x64/Grok_Bot_0.18.0_Setup.exe" --exclude=""
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.5.0
+      - name: Hash both original artifacts against the immutable inventory
+        run: node --test tests/research-archives.test.mjs

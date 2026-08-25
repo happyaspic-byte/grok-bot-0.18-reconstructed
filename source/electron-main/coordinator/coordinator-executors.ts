@@ -114,6 +114,7 @@ export interface CoordinatorControlExecutorDependencies {
   readonly getRpcTraceWindowTraceparent?: () => string | undefined;
   readonly listRoutedMcpTools?: () => Promise<unknown>;
   readonly executeRoutedMcpTool?: (request: unknown) => Promise<unknown>;
+  readonly getCliProxyTurnConfig?: () => Promise<unknown>;
   readonly readLocalExecDaemonDiscovery?: () => Promise<LocalExecDiscovery | null>;
   readonly clearLocalExecDaemonDiscoveryIfMatches?: (expected: LocalExecDiscovery) => Promise<boolean>;
   readonly native?: {
@@ -469,6 +470,10 @@ export function createCoordinatorControlExecutors(
     executeRoutedMcpTool: async (request: unknown) => {
       if (dependencies.executeRoutedMcpTool == null) throw new Error("Desktop MCP routing is unavailable.");
       return await dependencies.executeRoutedMcpTool(request);
+    },
+    getCliProxyTurnConfig: async () => {
+      if (dependencies.getCliProxyTurnConfig == null) throw new Error("9Router routing is unavailable.");
+      return await dependencies.getCliProxyTurnConfig();
     },
     async mintLocalExecDaemonCredential() {
       return (await connector.issueLocalExecDaemonCredential?.()) ?? null;

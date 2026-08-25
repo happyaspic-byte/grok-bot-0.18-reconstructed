@@ -3,7 +3,8 @@
 ![Grok Bot Router settings with Codex selected and local usage totals](docs/assets/router-settings.png)
 
 This repository is an unofficial, source-oriented reconstruction of the
-publicly shipped Grok Bot 0.18.0 macOS app.
+publicly shipped Grok Bot 0.18.0 desktop app. The reviewed build path supports
+macOS arm64 and an unsigned, local-only Windows x64 portable directory.
 
 The project began as an attempt to understand how the desktop app was put
 together. It now contains readable TypeScript implementations of its Electron,
@@ -13,7 +14,8 @@ application.
 
 It also adds a few practical experiments:
 
-- an inference router for Cursor, Claude Code, Codex, and OpenRouter;
+- an inference router for Cursor, Claude Code, Codex, OpenRouter, and local
+  OpenAI-compatible APIs such as 9Router;
 - Grok Bot plugin/MCP tools across the routed providers;
 - local usage tracking for routed inference;
 - an optional local Docker sandbox in place of the remote box; and
@@ -35,7 +37,7 @@ The public Grok Bot 0.18.0 application is instead treated as a pinned build
 input. During bootstrap, the toolchain downloads it, verifies its SHA-256
 identity, and extracts the pieces required to assemble the reconstruction.
 
-The resulting app is a hybrid by design:
+The resulting macOS app is a hybrid by design:
 
 - application runtimes are compiled from the readable sources under `source/`;
 - the polished shipped renderer remains the UI baseline;
@@ -54,9 +56,12 @@ React components, names, comments, file structure, or design-system source.
 
 Recreating the complete frontend with the same polish and behavior would have
 been a separate, much larger reverse-engineering project. It was not a realistic
-goal for a weekend build. The practical choice was therefore to reconstruct the
-runtime and control-plane code, retain the checksum-pinned shipped renderer,
-and make the smallest auditable UI patch needed for the new Router settings.
+goal for a weekend build. The practical choice for the polished macOS package
+was therefore to reconstruct the runtime and control-plane code, retain the
+checksum-pinned shipped renderer, and make the smallest auditable UI patch
+needed for the new Router settings. The Windows portable path instead packages
+the reviewed clean-source renderer so OpenAI-compatible/9Router settings remain
+in the normal build graph rather than a platform-specific minified patch.
 
 `frontend/` is a readable partial reconstruction and design workspace. It is
 useful for understanding UI contracts and experimenting with clean components,
@@ -88,11 +93,38 @@ Open **Settings → Router** to choose the backend used for new turns:
 | Claude Code | Existing Claude Code login | Routed Grok Bot MCP tools |
 | Codex | Existing local ChatGPT/Codex login | Direct Responses transport with Grok Bot tools |
 | OpenRouter | API key saved through the desktop secrets bridge | Grok Bot tool-execution loop |
+| OpenAI-compatible / 9Router | Dedicated OS-encrypted proxy/client API key | Disabled by default; advanced environment opt-in only |
 
 Cursor is the default. Claude Code and Codex do not require separate API keys
 when their local clients are already authenticated. The application preserves
 streaming responses, thinking state, reactions, rich plugin mentions, and MCP
 tool execution across routed conversations.
+
+#### 9Router / OpenAI-compatible setup
+
+Use **9Router 0.4.82 or newer**, then open **Settings → Router** and select
+**OpenAI-compatible / 9Router**. The default API root is
+`http://127.0.0.1:20128/v1`. Save the 9Router **proxy/client API key** (not its
+management key), use **Test & load models**, and enter or select the exact model
+ID. Manual model entry remains available because 9Router's `/v1/models` result
+can omit free or no-auth models.
+
+Chat Completions is the default protocol because it currently has the broadest
+9Router compatibility. Responses and Auto fallback remain explicit choices for
+models that support them. Use only authenticated `/v1` endpoints; the `/codex`
+rewrite is intentionally rejected. Plain HTTP is loopback-only. A non-loopback
+endpoint must use HTTPS and requires the explicit UI opt-in.
+
+The 9Router key is stored in its own fixed-purpose Electron `safeStorage` file.
+It is never placed in user secrets, box-secret synchronization, environment
+variables, settings, renderer status responses, or transcripts. If OS secure
+storage is unavailable, it is held only in memory for the current session.
+Each inference turn obtains a transient main-to-coordinator lease.
+
+MCP/plugin tools are intentionally disabled for this provider. Administrators
+who have independently reviewed the proxy and tool effects can opt in before
+launch with `SAND_9ROUTER_ENABLE_UNREVIEWED_MCP_TOOLS=1`; duplicate tool names
+are rejected. This advanced switch does not persist or sync to the box.
 
 **Usage & Billing** shows the locally recorded request and token totals for
 providers that return usage data. These figures are activity records, not an
@@ -117,14 +149,12 @@ Remote mode remains the default.
 
 ## Requirements
 
-- macOS on Apple Silicon
-- Node.js 26.5.x
-- Xcode Command Line Tools
-- Git LFS
-- Docker Desktop (optional, only for the local sandbox)
-- local Claude Code or Codex authentication for those router choices
+All builds require Node.js 26.5.x and Git LFS. macOS packaging requires Apple
+Silicon and Xcode Command Line Tools. Windows packaging requires Windows 10/11
+x64; the exact 7-Zip extractor is supplied by the locked `7zip-bin` dependency.
+Docker Desktop is optional and needed only for the local sandbox.
 
-## Quick start
+## macOS quick start
 
 ```sh
 git clone <your-repository-url>
@@ -155,6 +185,75 @@ dist/Grok Bot 0.18 Reconstructed.app
 Reconstructed packages disable the upstream updater at the packaging boundary
 and default upstream Sentry and telemetry emission off. Explicitly supplied
 environment configuration is still respected.
+
+## Windows x64 local portable build
+
+The Windows path intentionally produces a directory, not an installer. It
+checksum-verifies the preserved Setup executable, extracts it with the pinned
+`7zip-bin@5.2.0` binary without executing NSIS, validates the upstream
+`app.asar`, Electron carrier, signer, and every unpacked native module as PE
+x86-64, then replaces the application payload with the clean-source
+reconstruction.
+
+Run the following in PowerShell or a Developer Command Prompt:
+
+```powershell
+git lfs install
+git lfs pull --include="research-archives/original/0.18.0/windows-x64/Grok_Bot_0.18.0_Setup.exe" --exclude=""
+npm ci
+npm run bootstrap:windows
+npm run typecheck
+npm run source:typecheck
+npm run test:windows
+npm run package:windows
+npm run verify:windows
+npm run smoke:windows
+```
+
+The output is:
+
+```text
+dist/Grok Bot 0.18 Reconstructed-win32-x64/
+  Grok Bot 0.18 Reconstructed.exe
+```
+
+`package:win` and `package-windows` are aliases for `package:windows`.
+`smoke:windows` launches the packaged executable with a new temporary profile,
+waits for the clean renderer, and verifies that Router settings are reachable.
+CI performs the same bounded launch on `windows-latest` but discards the binary;
+it does not publish a portable ZIP or release.
+
+### Using 9Router or another OpenAI-compatible local API
+
+Run 9Router separately, create a proxy/client API key in its Dashboard, and use
+the model IDs shown by that Dashboard. In **Settings → Router**, select the
+OpenAI-compatible/9Router provider. The default local endpoint is:
+
+```text
+http://127.0.0.1:20128/v1
+```
+
+Use `127.0.0.1`, rather than `localhost`, to avoid an IPv6/IPv4 loopback
+mismatch. The proxy/client API key is a credential; on Windows its store is
+protected with a real DACL (current user, SYSTEM, and Administrators), not a
+POSIX `0600` claim. The shared credential helper enforces and re-verifies that
+boundary.
+
+### Windows trust and identity boundary
+
+The portable output is unofficial and unsigned as a reconstructed
+distribution. Renaming the retained upstream Electron executable does not make
+the reconstructed directory an upstream-signed product. No NSIS installer,
+code-signing certificate, updater metadata, or automatic public release is
+provided; complete a separate rights and signing review before redistribution.
+
+The Windows build uses a distinct product/package/executable name, defaults to
+`%APPDATA%\Grok Bot 0.18 Reconstructed`, hard-disables the official updater,
+removes updater executables/configuration, and does not register the inherited
+`sand:` callback. That default avoids taking the official app's protocol
+association. Consequently, a fresh isolated profile does not use Cursor's
+desktop OAuth callback; 9Router/OpenAI-compatible mode is the supported
+credential-independent first-run path for this portable build.
 
 ## Architecture
 
@@ -206,6 +305,9 @@ npm run frontend:build    # build the readable renderer reconstruction
 npm run package           # build, sign, and verify the macOS app
 npm run verify            # verify an existing packaged app
 npm run smoke             # bounded native smoke check
+npm run package:windows   # local unsigned Windows x64 portable directory
+npm run verify:windows    # structural/hash/native verification of that directory
+npm run smoke:windows     # fresh-profile packaged Windows launch + Router reachability
 npm run publication:check # prove a fresh-history export is lossless
 ```
 
@@ -216,8 +318,9 @@ Generated directories including `.cache`, `.build`, `dist`, `src/app/dist`,
 
 The app launches and the core reconstructed flows are usable, including routed
 inference, connected plugins, and the local Docker sandbox. This is still an
-experimental reconstruction: it targets one pinned macOS/arm64 release, depends
-on external provider sessions, and does not promise compatibility with future
+experimental reconstruction: it targets the pinned 0.18.0 macOS/arm64 and
+Windows/x64 carriers, depends on external provider sessions or a configured
+OpenAI-compatible endpoint, and does not promise compatibility with future
 Grok Bot versions.
 
 For changes, read [CONTRIBUTING.md](CONTRIBUTING.md). For the clean-history

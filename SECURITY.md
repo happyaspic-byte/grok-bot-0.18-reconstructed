@@ -16,3 +16,17 @@ cleanup.
 
 Please report issues privately to the repository owner rather than opening a
 public disclosure against this experimental codebase.
+
+## OpenAI-compatible / 9Router boundary
+
+- Run 9Router 0.4.82 or newer and expose only its authenticated `/v1` API.
+- HTTP endpoints are restricted to loopback. Remote endpoints require HTTPS
+  plus an explicit opt-in; credentials, query strings, fragments,
+  `host.docker.internal`, and endpoint-specific paths are rejected.
+- The proxy/client API key uses a dedicated fixed-purpose `safeStorage` store.
+  It is not part of the general user-secret export or box-secret sync.
+- Requests reject redirects and enforce time, request, response, model-count,
+  and tool-output limits. Provider bodies and credentials are not copied into
+  displayed errors.
+- MCP tools are disabled unless the administrator-only
+  `SAND_9ROUTER_ENABLE_UNREVIEWED_MCP_TOOLS=1` process opt-in is present.

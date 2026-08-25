@@ -423,6 +423,7 @@ export function createProductionCoordinatorAdapter<
         getRpcTraceWindowTraceparent: ports.telemetry.getRpcTraceWindowTraceparent,
         listRoutedMcpTools: () => context.requireMcp().listRoutedTools(),
         executeRoutedMcpTool: (request) => context.requireMcp().executeRoutedTool(request),
+        getCliProxyTurnConfig: () => context.secretsStores.cliProxySecretStore.getTurnConfig(),
         native: ports.localExecNative,
       });
       const createRuntime = () =>

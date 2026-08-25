@@ -13,6 +13,8 @@ import { getSandRootDir } from "../../host-paths.js";
 import { SandSettingsStore } from "../../../shared/node/settings/sand-settings-store.js";
 import { getBoxSecretsStorePath } from "../secrets/secrets-service.js";
 import { streamCodexDirectResponses, type CodexDirectTool } from "./codex-direct-responses.js";
+import { streamOpenAiCompatible, type OpenAiCompatibleTool } from "./openai-compatible-stream.js";
+import type { CliProxyTurnConfig } from "../../../shared/cli-proxy.js";
 import type { LabelMessage, PromptExecutor } from "./sand-labeling.js";
 
 type Loose = Record<string, any>;
@@ -254,17 +256,57 @@ function openRouterExecutor(messages: readonly ProviderMessage[], invocationId: 
   return { fullStream: result.fullStream, response: result.response, usage: result.usage, extendedUsage, providerMetadata: result.providerMetadata, invocationId: Promise.resolve(invocationId) };
 }
 
+function cliProxyTools(definitions: readonly Loose[] | undefined): OpenAiCompatibleTool[] | undefined {
+  if (definitions == null || definitions.length === 0) return undefined;
+  const tools = definitions.flatMap((source): OpenAiCompatibleTool[] => {
+    const parameters = source.inputSchema ?? source.parameters;
+    return typeof source.name === "string" && source.name.length > 0 && parameters != null ? [{ name: source.name, ...(typeof source.description === "string" ? { description: source.description } : {}), parameters, source }] : [];
+  });
+  return tools.length === 0 ? undefined : tools;
+}
+
+function cliProxyExecutor(config: CliProxyTurnConfig, messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void) {
+  const usage = deferred<{ promptTokens: number; completionTokens: number; totalTokens: number }>();
+  const extendedUsage = deferred<{ inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; maxTokens: number }>();
+  const resultResponse = deferred<ReturnType<typeof response>>();
+  const metadata = deferred<Record<string, unknown>>();
+  const tools = cliProxyTools(definitions);
+  const fullStream = (async function* () {
+    let text = "";
+    try {
+      for await (const event of streamOpenAiCompatible({
+        config,
+        instructions: GROK_ROUTER_SYSTEM_PROMPT,
+        messages,
+        ...(tools == null ? {} : { tools }),
+        ...(executeTool == null ? {} : { executeTool: async (selected, args, toolCallId) => executeTool(selected.source, args, toolCallId) }),
+        maxSteps: tools == null ? 1 : 8,
+      })) {
+        if (event.type === "text-delta") { text += event.delta; yield { type: "text-delta" as const, textDelta: event.delta }; continue; }
+        const basic = { promptTokens: event.usage.inputTokens, completionTokens: event.usage.outputTokens, totalTokens: event.usage.inputTokens + event.usage.outputTokens };
+        const extended = { ...event.usage, maxTokens: 0 };
+        onUsage?.(event.usage);
+        usage.resolve(basic); extendedUsage.resolve(extended);
+        metadata.resolve({ openai: { responseId: event.responseId, protocol: event.protocol, compatible: true } });
+        resultResponse.resolve(response(text, invocationId, config.model));
+      }
+    } catch (error) { usage.reject(error); extendedUsage.reject(error); metadata.reject(error); resultResponse.reject(error); throw error; }
+  })();
+  return { fullStream, response: resultResponse.promise, usage: usage.promise, extendedUsage: extendedUsage.promise, providerMetadata: metadata.promise, invocationId: Promise.resolve(invocationId) };
+}
+
 class ProviderPromptExecutor extends BasePromptExecutor<ProviderMessage> {
   constructor(readonly provider: RoutedProvider, initialMessages?: readonly ProviderMessage[], readonly onUsage?: (usage: UsageRecord) => void) { super(new BasePromptBuilder(initialMessages)); }
   stream(_ctx: unknown, invocationId = crypto.randomUUID(), definitions?: readonly Loose[]) {
     if (this.provider === "codex") return codexExecutor(this.getMessages(), invocationId, definitions, undefined, this.onUsage);
     if (this.provider === "claude-code") return claudeExecutor(this.getMessages(), invocationId, this.onUsage);
+    if (this.provider === "cli-proxy") throw new Error("9Router requests require the desktop's per-turn secure credential lease.");
     return openRouterExecutor(this.getMessages(), invocationId, definitions, undefined, this.onUsage);
   }
 }
 
 export function createProviderPromptSession(provider: RoutedProvider): { getModelId(): string; getExecutor(state?: unknown): PromptExecutor } {
-  const modelId = provider === "codex" ? configuredCodexModel() : provider === "claude-code" ? "claude-code" : process.env.SAND_OPENROUTER_MODEL?.trim() || "openai/gpt-5.2";
+  const modelId = provider === "codex" ? configuredCodexModel() : provider === "claude-code" ? "claude-code" : provider === "cli-proxy" ? "9router" : process.env.SAND_OPENROUTER_MODEL?.trim() || "openai/gpt-5.2";
   return { getModelId: () => modelId, getExecutor: state => new ProviderPromptExecutor(provider, Array.isArray(state) ? state as ProviderMessage[] : undefined, usage => recordRoutedUsage(provider, usage)) };
 }
 
@@ -272,6 +314,7 @@ export async function runRoutedProviderText(provider: RoutedProvider, messages: 
   readonly mcpServerUrl?: string;
   readonly tools?: readonly Loose[];
   readonly executeTool?: RoutedToolExecutor;
+  readonly cliProxyConfig?: CliProxyTurnConfig;
   readonly onTextDelta?: (delta: string, accumulated: string) => void;
 }): Promise<string> {
   const invocationId = crypto.randomUUID();
@@ -280,7 +323,11 @@ export async function runRoutedProviderText(provider: RoutedProvider, messages: 
     ? codexExecutor(messages, invocationId, options?.tools, options?.executeTool, onUsage)
     : provider === "claude-code"
       ? claudeExecutor(messages, invocationId, onUsage, options?.mcpServerUrl)
-      : openRouterExecutor(messages, invocationId, options?.tools, options?.executeTool, onUsage);
+      : provider === "cli-proxy"
+        ? options?.cliProxyConfig == null
+          ? (() => { throw new Error("9Router is not configured. Open Settings → Router."); })()
+          : cliProxyExecutor(options.cliProxyConfig, messages, invocationId, options?.tools, options?.executeTool, onUsage)
+        : openRouterExecutor(messages, invocationId, options?.tools, options?.executeTool, onUsage);
   let text = "";
   for await (const event of result.fullStream) {
     if (event.type === "text-delta" && typeof event.textDelta === "string") {
