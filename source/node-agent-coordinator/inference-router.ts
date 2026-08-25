@@ -6,6 +6,7 @@ import { runRoutedProviderText } from "../host/extensions/inference/provider-ses
 import type { SandInferenceProvider } from "../shared/inference-router.js";
 import { SandSettingsStore } from "../shared/node/settings/sand-settings-store.js";
 import { createRoutedMcpBridge } from "./routed-mcp-bridge.js";
+import { normalizeCliProxyTurnConfig } from "../shared/cli-proxy.js";
 
 type StoredEntry = {
   readonly provider: Exclude<SandInferenceProvider, "cursor">;
@@ -34,7 +35,7 @@ export function parseInferenceRouterTranscriptStore(value: unknown): Store {
     const entries: StoredEntry[] = [];
     for (const raw of rawEntries) {
       const row = asRecord(raw);
-      if (row == null || !["codex", "claude-code", "openrouter"].includes(String(row.provider)) || !["user", "assistant"].includes(String(row.role)) || typeof row.content !== "string" || typeof row.id !== "string" || typeof row.timestampMs !== "number" || (row.clientNonce !== undefined && typeof row.clientNonce !== "string") || (row.richText !== undefined && typeof row.richText !== "string")) continue;
+      if (row == null || !["codex", "claude-code", "openrouter", "cli-proxy"].includes(String(row.provider)) || !["user", "assistant"].includes(String(row.role)) || typeof row.content !== "string" || typeof row.id !== "string" || typeof row.timestampMs !== "number" || (row.clientNonce !== undefined && typeof row.clientNonce !== "string") || (row.richText !== undefined && typeof row.richText !== "string")) continue;
       if (row.reactions !== undefined && (!Array.isArray(row.reactions) || row.reactions.some(reaction => asRecord(reaction) == null || typeof asRecord(reaction)!.emoji !== "string" || typeof asRecord(reaction)!.by !== "string"))) continue;
       entries.push(row as unknown as StoredEntry);
     }
@@ -159,14 +160,17 @@ export function createCoordinatorInferenceRouter(options: {
       emitTranscript(agentId, assistantStreamStarted ? "updated" : "appended", entry);
       assistantStreamStarted = true;
     };
+    const cliProxyConfig = provider === "cli-proxy" ? normalizeCliProxyTurnConfig(await options.dispatchRemote("getCliProxyTurnConfig", {})) : undefined;
+    const cliProxyToolsEnabled = provider !== "cli-proxy" || process.env.SAND_9ROUTER_ENABLE_UNREVIEWED_MCP_TOOLS === "1";
     const bridge = provider === "claude-code" ? await createRoutedMcpBridge({
       listTools: () => options.dispatchRemote("listRoutedMcpTools", {}),
       callTool: tool => options.dispatchRemote("executeRoutedMcpTool", { ...tool, agentId }),
     }) : null;
-    const directTools = bridge == null ? await options.dispatchRemote("listRoutedMcpTools", {}) : undefined;
+    const directTools = bridge == null && cliProxyToolsEnabled ? await options.dispatchRemote("listRoutedMcpTools", {}) : undefined;
     const tools = Array.isArray(directTools) ? directTools as Record<string, any>[] : undefined;
     const onTextDelta = (_delta: string, accumulated: string) => emitAssistant(accumulated, true);
     try { content = await runRoutedProviderText(provider, messages, bridge == null ? {
+      ...(cliProxyConfig === undefined ? {} : { cliProxyConfig }),
       ...(tools === undefined ? {} : { tools }),
       executeTool: async (definition, toolArgs, toolCallId) => await options.dispatchRemote("executeRoutedMcpTool", {
         providerIdentifier: definition.providerIdentifier,

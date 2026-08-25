@@ -10,6 +10,8 @@ import {
   SandUserSecretsStore,
   type SandUserSecretsStore as UserSecretsStore,
 } from "./user-secrets-store.js";
+import { SandCliProxySecretStore } from "./cli-proxy-secret-store.js";
+import { fetchCliProxyModels } from "../../shared/node/cli-proxy-models.js";
 
 export class SandBoxSecretsPushQuiescedError extends Error {
   constructor() { super("Box secrets pushes are quiesced for quit"); }
@@ -115,11 +117,12 @@ export function registerSecretsIpc(deps: {
   readonly stores: {
     readonly userSecretsStore: Pick<UserSecretsStore, "listKeys" | "isPersistent" | "reveal" | "upsert" | "remove">;
     readonly clientPersistenceStore: Pick<SandClientPersistenceStore, "read" | "write" | "remove" | "listKeys" | "migrateFromLocalStorage">;
+    readonly cliProxySecretStore: Pick<SandCliProxySecretStore, "status" | "save" | "remove" | "getConnectionConfig">;
   };
   readonly pushBoxSecrets: () => Promise<boolean>;
 }): void {
   const { ipcMain, guards, pushBoxSecrets } = deps;
-  const { userSecretsStore, clientPersistenceStore } = deps.stores;
+  const { userSecretsStore, clientPersistenceStore, cliProxySecretStore } = deps.stores;
   ipcMain.handle("sand:secrets-list", async (event) => {
     guards.assertTrustedSecretsSender(event);
     return { keys: await userSecretsStore.listKeys(), isPersistent: userSecretsStore.isPersistent() };
@@ -139,6 +142,21 @@ export function registerSecretsIpc(deps: {
     const keys = Array.isArray(request.keys) ? request.keys.filter((key: unknown): key is string => typeof key === "string") : [];
     await userSecretsStore.remove(keys);
     return { synced: await pushBoxSecrets() };
+  });
+  ipcMain.handle("sand:cli-proxy-status", async (event, request) => {
+    guards.assertTrustedSecretsSender(event);
+    const status = await cliProxySecretStore.status();
+    if (request?.testConnection !== true) return status;
+    const probe = await fetchCliProxyModels(await cliProxySecretStore.getConnectionConfig());
+    return { ...status, probe };
+  });
+  ipcMain.handle("sand:cli-proxy-save", async (event, request) => {
+    guards.assertTrustedSecretsSender(event);
+    return cliProxySecretStore.save(request);
+  });
+  ipcMain.handle("sand:cli-proxy-delete", async (event) => {
+    guards.assertTrustedSecretsSender(event);
+    return cliProxySecretStore.remove();
   });
   ipcMain.handle(CLIENT_PERSISTENCE_CHANNELS.read, async (event, request) => {
     guards.assertTrustedClientPersistenceSender(event);
@@ -179,6 +197,7 @@ export function createSecretsStores(
 ): {
   readonly userSecretsStore: SandUserSecretsStore;
   readonly clientPersistenceStore: SandClientPersistenceStore;
+  readonly cliProxySecretStore: SandCliProxySecretStore;
   readonly pushBoxSecrets: ReturnType<typeof createBoxSecretsPush>;
   readonly pushTelemetry: ReturnType<typeof createBoxSecretsPushTelemetry>;
 } {
@@ -189,6 +208,7 @@ export function createSecretsStores(
   });
   return {
     userSecretsStore,
+    cliProxySecretStore: new SandCliProxySecretStore(),
     clientPersistenceStore: new SandClientPersistenceStore(clientPersistenceDir, createNodeClientPersistenceFiles()),
     pushBoxSecrets: createBoxSecretsPush({
       userSecretsStore,

@@ -250,6 +250,11 @@ export function createDesktopPreloadBridge(options: {
       upsert: (entries: Record<string, string>) => ipc.invoke("sand:secrets-upsert", { entries }),
       remove: (keys: readonly string[]) => ipc.invoke("sand:secrets-delete", { keys }),
     },
+    cliProxy: {
+      status: (options?: { readonly testConnection?: boolean }) => ipc.invoke("sand:cli-proxy-status", options ?? {}),
+      save: (config: unknown) => ipc.invoke("sand:cli-proxy-save", config),
+      remove: () => ipc.invoke("sand:cli-proxy-delete"),
+    },
     agent: {
       getPinnedAgents: () => edge("getHostPinnedAgents"),
       setPinnedAgents: (pinnedAgentIds: readonly string[]) => edge("setHostPinnedAgents", { pinnedAgentIds }),

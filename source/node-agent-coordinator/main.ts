@@ -214,7 +214,9 @@ export async function composeCoordinator(dependencies: ComposeCoordinatorDepende
   const inferenceRouter = createCoordinatorInferenceRouter({
     dataDir: bootstrap.processConfig.dataDir,
     postEvent: (family, payload) => server.postEvent(family, payload),
-    dispatchRemote: (method, args) => method === "listRoutedMcpTools"
+    dispatchRemote: (method, args) => method === "getCliProxyTurnConfig"
+      ? command(commands, "getCliProxyTurnConfig", args)
+      : method === "listRoutedMcpTools"
       ? command(commands, "listRoutedMcpTools", args)
       : method === "executeRoutedMcpTool"
         ? command(commands, "executeRoutedMcpTool", args)

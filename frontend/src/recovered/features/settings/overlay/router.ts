@@ -1,6 +1,6 @@
 import type { AgentDesktopBridge } from "../../../contracts/desktop-bridge";
 
-export type RouterProviderId = "cursor" | "claude-code" | "codex" | "openrouter";
+export type RouterProviderId = "cursor" | "claude-code" | "codex" | "openrouter" | "cli-proxy";
 
 export interface RouterProvider {
   readonly id: RouterProviderId;
@@ -40,6 +40,13 @@ export const ROUTER_PROVIDERS: readonly RouterProvider[] = [
     label: "OpenRouter",
     description: "Use models and billing from your OpenRouter account.",
     usageDescription: "OpenRouter usage and spend are managed in your OpenRouter account and are not exposed as an in-app meter.",
+    usageSource: "external"
+  },
+  {
+    id: "cli-proxy",
+    label: "OpenAI-compatible / 9Router",
+    description: "Use a local 9Router or another reviewed OpenAI-compatible endpoint.",
+    usageDescription: "Usage and billing are managed by 9Router and its upstream provider.",
     usageSource: "external"
   }
 ];

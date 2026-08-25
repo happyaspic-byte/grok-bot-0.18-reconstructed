@@ -6,6 +6,7 @@
  * opaque return values stay unknown until their producing main-process handler
  * has been recovered with equal confidence.
  */
+import type { CliProxyPublicConfig, CliProxyStatus } from "../../../../source/shared/cli-proxy";
 export type Unsubscribe = () => void;
 export type BridgeListener<Value = unknown> = (value: Value) => void;
 
@@ -364,6 +365,8 @@ export interface AgentDesktopBridge {
   getComputerUseModel(): Promise<AgentModelSelection | null>;
   setComputerUseModel(model: AgentModelSelection | null): Promise<AgentModelSelection | null>;
   getAvailableModels(): Promise<unknown>;
+  getInferenceRouter(): Promise<unknown>;
+  setInferenceRouter(provider: string): Promise<unknown>;
   clientPersistence: {
     read(key: string): Promise<string | null>;
     write(key: string, value: string): Promise<void>;
@@ -385,6 +388,11 @@ export interface DesktopBridge {
   commitStagedAttachments(paths: readonly string[], filenames: readonly string[]): Promise<string[] | null>;
   discardStagedAttachment(path: string): Promise<void>;
   readonly mcp: McpDesktopBridge;
+  readonly cliProxy: {
+    status(options?: { readonly testConnection?: boolean }): Promise<CliProxyStatus>;
+    save(config: CliProxyPublicConfig & { readonly apiKey?: string }): Promise<CliProxyStatus>;
+    remove(): Promise<CliProxyStatus>;
+  };
   forceGatewayReconnect(): Promise<void>;
   pickAvatarSource(): Promise<string | null>;
   pickAvatarFile(): Promise<AvatarFileSelection | null>;
