@@ -1,0 +1,196 @@
+name: Windows owner draft release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/windows-draft-release.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-owner-draft-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-smoke:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out the exact main commit without hydrating every carrier
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          lfs: false
+          persist-credentials: false
+      - name: Hydrate only the pinned Windows carrier
+        shell: pwsh
+        run: git lfs pull --include="research-archives/original/0.18.0/windows-x64/Grok_Bot_0.18.0_Setup.exe" --exclude=""
+      - name: Use the repository-pinned Node.js release
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 26.5.0
+          cache: npm
+      - name: Install and verify the reviewed source tree
+        shell: pwsh
+        run: |
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm run source:typecheck
+          npm test
+          npm run publication:check
+      - name: Build and launch the Windows x64 portable directory
+        shell: pwsh
+        run: |
+          npm run bootstrap:windows
+          npm run package:windows
+          npm run verify:windows
+          npm run smoke:windows
+      - name: Create the owner-only draft release bundle
+        id: bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          $assetName = 'Grok-Bot-0.18.0-reconstructed.1-windows-x64-portable-unsigned.zip'
+          $portable = Join-Path $PWD 'dist/Grok Bot 0.18 Reconstructed-win32-x64'
+          $releaseDirectory = Join-Path $PWD '.release/windows-x64'
+          $zip = Join-Path $releaseDirectory $assetName
+          $executable = Join-Path $portable 'Grok Bot 0.18 Reconstructed.exe'
+          $asar = Join-Path $portable 'resources/app.asar'
+          $portableManifestPath = Join-Path $portable 'RECONSTRUCTED-PORTABLE.json'
+          $portableManifest = Get-Content -LiteralPath $portableManifestPath -Raw | ConvertFrom-Json
+          if ($portableManifest.trust.publicReleaseEligible -ne $false) {
+            throw 'The owner draft workflow accepts only the explicitly non-public portable identity.'
+          }
+          New-Item -ItemType Directory -Force -Path $releaseDirectory | Out-Null
+          Compress-Archive -LiteralPath $portable -DestinationPath $zip -CompressionLevel Optimal
+          $roundTrip = Join-Path $env:RUNNER_TEMP 'grok-bot-release-roundtrip'
+          Remove-Item -LiteralPath $roundTrip -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath $zip -DestinationPath $roundTrip
+          $roundTripPortable = Join-Path $roundTrip 'Grok Bot 0.18 Reconstructed-win32-x64'
+          node scripts/verify-windows.mjs --app $roundTripPortable
+          node scripts/smoke-windows.mjs --app $roundTripPortable
+          npm sbom --sbom-format cyclonedx | Set-Content -LiteralPath (Join-Path $releaseDirectory 'sbom.cdx.json') -Encoding utf8NoBOM
+          $zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          $exeHash = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant()
+          $asarHash = (Get-FileHash -LiteralPath $asar -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifest = [ordered]@{
+            schemaVersion = 1
+            visibility = 'owner-only-draft'
+            releaseTag = 'v0.18.0-reconstructed.1'
+            commit = (git rev-parse HEAD).Trim()
+            tree = (git rev-parse 'HEAD^{tree}').Trim()
+            createdAtUtc = [DateTime]::UtcNow.ToString('o')
+            runner = [ordered]@{
+              os = $env:ImageOS
+              imageVersion = $env:ImageVersion
+              node = (node --version).Trim()
+              npm = (npm --version).Trim()
+            }
+            artifact = [ordered]@{
+              file = $assetName
+              bytes = (Get-Item -LiteralPath $zip).Length
+              sha256 = $zipHash
+            }
+            executable = [ordered]@{
+              file = 'Grok Bot 0.18 Reconstructed.exe'
+              bytes = (Get-Item -LiteralPath $executable).Length
+              sha256 = $exeHash
+            }
+            appAsar = [ordered]@{
+              bytes = (Get-Item -LiteralPath $asar).Length
+              sha256 = $asarHash
+            }
+            validation = [ordered]@{
+              sourceTests = 'passed'
+              windowsPackageVerification = 'passed'
+              freshProfileLaunchSmoke = 'passed'
+              archiveRoundTripVerification = 'passed'
+              archiveRoundTripLaunchSmoke = 'passed'
+            }
+            trust = [ordered]@{
+              official = $false
+              distributionSigned = $false
+              publicReleaseEligible = $false
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $releaseDirectory 'release-manifest.json') -Encoding utf8NoBOM
+          @(
+            "$zipHash *$assetName"
+          ) | Set-Content -LiteralPath (Join-Path $releaseDirectory 'SHA256SUMS.txt') -Encoding ascii
+          @'
+          # Grok Bot 0.18 Reconstructed 1 — Windows x64 Portable (Unsigned)
+
+          This is an owner-only draft, not a public release. The asset is an unofficial,
+          unsigned reconstruction and is not affiliated with Anysphere, Cursor, or xAI.
+
+          The workflow verified the pinned installer and ASAR, ran all source tests,
+          built on Windows x64, launched a fresh isolated profile, reached the 9Router
+          settings surface, then re-extracted and repeated verification and launch smoke.
+
+          Use Windows 10/11 x64 and 9Router 0.4.82 or newer. The default API root is
+          http://127.0.0.1:20128/v1. Windows SmartScreen may warn because the reconstructed
+          distribution is not code-signed. Do not publish this draft without completing
+          the repository's independent rights, trademark, third-party license, and signing review.
+          '@ | Set-Content -LiteralPath (Join-Path $releaseDirectory 'RELEASE_NOTES.md') -Encoding utf8NoBOM
+          "asset=$zip" >> $env:GITHUB_OUTPUT
+      - name: Attest the exact portable ZIP
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: .release/windows-x64/Grok-Bot-0.18.0-reconstructed.1-windows-x64-portable-unsigned.zip
+      - name: Retain a private-to-owner workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-x64-owner-draft-${{ github.sha }}
+          path: .release/windows-x64/*
+          if-no-files-found: error
+          include-hidden-files: true
+          compression-level: 0
+          retention-days: 14
+
+  create-draft-release:
+    if: github.ref == 'refs/heads/main'
+    needs: build-and-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download only the verified release bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: windows-x64-owner-draft-${{ github.sha }}
+          path: release-assets
+      - name: Recheck the ZIP checksum before granting release access
+        shell: bash
+        working-directory: release-assets
+        run: sha256sum --check SHA256SUMS.txt
+      - name: Create or refresh the unpublished owner draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: v0.18.0-reconstructed.1
+          RELEASE_TITLE: Grok Bot 0.18 Reconstructed 1 — Windows x64 Portable (Unsigned Draft)
+        run: |
+          set -euo pipefail
+          assets=(
+            release-assets/Grok-Bot-0.18.0-reconstructed.1-windows-x64-portable-unsigned.zip
+            release-assets/SHA256SUMS.txt
+            release-assets/release-manifest.json
+            release-assets/sbom.cdx.json
+          )
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --draft --prerelease --latest=false --title "$RELEASE_TITLE" --notes-file release-assets/RELEASE_NOTES.md
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" --target "${{ github.sha }}" --draft --prerelease --latest=false --title "$RELEASE_TITLE" --notes-file release-assets/RELEASE_NOTES.md
+          fi

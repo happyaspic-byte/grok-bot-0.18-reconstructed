@@ -220,8 +220,16 @@ dist/Grok Bot 0.18 Reconstructed-win32-x64/
 `package:win` and `package-windows` are aliases for `package:windows`.
 `smoke:windows` launches the packaged executable with a new temporary profile,
 waits for the clean renderer, and verifies that Router settings are reachable.
-CI performs the same bounded launch on `windows-latest` but discards the binary;
-it does not publish a portable ZIP or release.
+The normal repository check performs the same bounded launch on
+`windows-latest` and discards the binary.
+
+Repository owners can run **Windows owner draft release** after explicitly
+enabling Actions on a new fork. That workflow repeats the source, package, and
+fresh-profile launch checks, creates a ZIP, re-extracts it into a clean temporary
+directory, repeats verification and launch smoke, produces checksums and an
+SBOM, and attaches the exact files to an unpublished Draft Release. It never
+publishes a public release automatically. The draft remains subject to the
+rights and signing review described below.
 
 ### Using 9Router or another OpenAI-compatible local API
 
