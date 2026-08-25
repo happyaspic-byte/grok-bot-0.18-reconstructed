@@ -33,7 +33,7 @@ async function readBoundedJson(response: Response, limit: number, signal: AbortS
       if (total > limit) { await reader.cancel().catch(() => undefined); throw new Error("9Router model response exceeded the size limit."); }
       chunks.push(value);
     }
-  } finally { try { reader.releaseLock(); } catch {} }
+  } finally { try { await reader.cancel(); } catch {} try { reader.releaseLock(); } catch {} }
   const result = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.byteLength; }

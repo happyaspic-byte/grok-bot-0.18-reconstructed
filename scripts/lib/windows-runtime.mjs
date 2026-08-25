@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { constants, createReadStream } from "node:fs";
 import { createRequire } from "node:module";
-import { access, cp, lstat, mkdir, open, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, cp, lstat, mkdir, open, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { extractFile, listPackage } from "@electron/asar";
 import { cachedWindowsRuntimeDescriptor, cachedWindowsRuntimeRoot, upstreamVersion, upstreamWindowsAsarSha256, windowsInstallerBytes, windowsInstallerSha256 } from "./config.mjs";
@@ -79,6 +79,17 @@ export async function findSevenZipExecutable(env = process.env) {
   await regular(executable, "Pinned 7-Zip extractor");
   const actualSha256 = await sha256File(executable);
   if (actualSha256 !== expectedSha256) throw new Error(`Pinned 7-Zip extractor checksum mismatch: expected ${expectedSha256}, got ${actualSha256}`);
+  if (process.platform !== "win32") {
+    try { await access(executable, constants.X_OK); }
+    catch {
+      if (configured) throw new Error("Configured pinned 7-Zip extractor is not executable");
+      // Some npm/filesystem combinations unpack 7zip-bin without its execute
+      // bit. Only repair the locked package copy after its bytes match the
+      // immutable SHA-256 policy above.
+      await chmod(executable, 0o500);
+      await access(executable, constants.X_OK);
+    }
+  }
   return executable;
 }
 export async function extractPinnedWindowsInstaller({ installer, destination, sevenZip }) { const artifact = await verifyPinnedWindowsInstaller(installer); await rm(destination, { recursive: true, force: true }); await mkdir(destination, { recursive: true }); await run(sevenZip, ["x", artifact.path, `-o${path.resolve(destination)}`, "-y", "-bd", "-bb0"]); await assertSafeExtractedTree(destination); const roots = await findWindowsRuntimeRoots(destination); if (roots.length !== 1) throw new Error(`Pinned installer yielded ${roots.length} application roots`); return { artifact, runtime: await validateWindowsRuntime(roots[0], { origin: "pinned-installer" }) }; }

@@ -1,10 +1,9 @@
-import { createWriteStream } from "node:fs";
 import { copyFile, mkdir, mkdtemp, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { pipeline } from "node:stream/promises";
-import { Readable } from "node:stream";
 import { archivedWindowsInstaller, cachedWindowsInstaller, cachedWindowsRuntimeDescriptor, cachedWindowsRuntimeRoot, windowsInstallerSha256, windowsInstallerUrl } from "./lib/config.mjs";
+import { windowsInstallerBytes } from "./lib/config.mjs";
+import { downloadExactFile } from "./lib/bounded-download.mjs";
 import { hydrateSourcePayloadFromAsar } from "./lib/runtime.mjs";
 import { cacheWindowsRuntime, discoverInstalledWindowsRuntime, extractPinnedWindowsInstaller, findSevenZipExecutable, pathExists, resolveCachedWindowsRuntime, sha256File, verifyPinnedWindowsInstaller } from "./lib/windows-runtime.mjs";
 
@@ -17,9 +16,7 @@ async function ensureInstaller() {
     return verifyPinnedWindowsInstaller(cachedWindowsInstaller);
   }
   const partial = `${cachedWindowsInstaller}.partial`; await rm(partial, { force: true });
-  const response = await fetch(windowsInstallerUrl, { redirect: "follow" });
-  if (!response.ok || response.body == null) throw new Error(`Windows installer download failed: HTTP ${response.status}`);
-  await pipeline(Readable.fromWeb(response.body), createWriteStream(partial, { mode: 0o600 }));
+  await downloadExactFile({ url: windowsInstallerUrl, destination: partial, expectedBytes: windowsInstallerBytes });
   const digest = await sha256File(partial); if (digest !== windowsInstallerSha256) { await rm(partial, { force: true }); throw new Error(`Downloaded Windows installer checksum mismatch: ${digest}`); }
   await rename(partial, cachedWindowsInstaller); return verifyPinnedWindowsInstaller(cachedWindowsInstaller);
 }

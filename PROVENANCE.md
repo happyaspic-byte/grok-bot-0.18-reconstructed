@@ -14,8 +14,19 @@ The repository preserves the original macOS artifact above and the matching
 Windows x64 installer through Git LFS. The Windows artifact identity is:
 
 - Installer URL: `https://downloads.cursor.com/grokbot/stable/win32-x64/0.18.0/Grok_Bot_0.18.0_Setup.exe`
+- Installer bytes: `125825552`
 - Installer SHA-256: `464079a15ef5fa8b61ccea8fffcc78f63cfcf6df65fb0ad5e725d8b95f7e437e`
+- Windows `app.asar` SHA-256: `38e85c0e5042c0257db7925e1e55709d6d155d90d92fe26ad654127d509766e0`
+- Extractor: `7zip-bin@5.2.0`, Windows x64 executable SHA-256 `b0cfdeaf429f5cc53f85123dd8f5a5feb92c19d31aa34df257edf9a26be05f95`
 - Preservation manifest: `research-archives/original/0.18.0/artifacts.json`
+
+Windows bootstrap validates the exact size/hash before extraction and never
+executes the NSIS carrier. The extracted application identity, ASAR hash,
+unpacked runtime manifest (`win32`/`x64`), Electron executable, WebAuthn signer,
+and each `.node` module are verified before the runtime may be cached. The
+resulting portable directory is an unsigned reconstruction, is not eligible for
+automatic publication, and does not claim that a retained upstream executable
+signature covers the replaced application resources.
 
 The original application was Developer ID signed and notarized by Anysphere Incorporated. Reconstructed builds are intentionally given a different bundle ID and only ad-hoc signed; they do not retain or claim the upstream signature.
 

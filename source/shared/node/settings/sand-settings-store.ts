@@ -157,12 +157,18 @@ export class SandSettingsStore {
   setLocalToolPermission(value: SandLocalToolPermission): void { this.update((s) => ({ ...s, localToolPermission: value })); }
   getInferenceProvider(): SandInferenceProvider { return this.load().inferenceProvider ?? "cursor"; }
   setInferenceProvider(value: SandInferenceProvider): void { this.update((s) => ({ ...s, inferenceProvider: value })); }
-  getInferenceRouterUsage(): SandInferenceRouterUsage { return this.load().inferenceRouterUsage ?? emptySandInferenceRouterUsage(); }
+  getInferenceRouterUsage(): SandInferenceRouterUsage {
+    const empty = emptySandInferenceRouterUsage();
+    const stored = this.load().inferenceRouterUsage;
+    return stored == null ? empty : { schemaVersion: 1, providers: { ...empty.providers, ...stored.providers } };
+  }
   recordInferenceUsage(provider: SandInferenceProvider, usage: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number }): void {
     const safe = (value: number | undefined): number => Number.isFinite(value) && value! >= 0 ? Math.round(value!) : 0;
     this.update((settings) => {
-      const current = settings.inferenceRouterUsage ?? emptySandInferenceRouterUsage();
-      const previous = current.providers[provider];
+      const empty = emptySandInferenceRouterUsage();
+      const stored = settings.inferenceRouterUsage;
+      const current: SandInferenceRouterUsage = stored == null ? empty : { schemaVersion: 1, providers: { ...empty.providers, ...stored.providers } };
+      const previous = current.providers[provider] ?? empty.providers[provider];
       return { ...settings, inferenceRouterUsage: { schemaVersion: 1, providers: { ...current.providers, [provider]: { requests: previous.requests + 1, inputTokens: previous.inputTokens + safe(usage.inputTokens), outputTokens: previous.outputTokens + safe(usage.outputTokens), cacheReadTokens: previous.cacheReadTokens + safe(usage.cacheReadTokens), cacheWriteTokens: previous.cacheWriteTokens + safe(usage.cacheWriteTokens), lastUsedAt: new Date().toISOString() } } } };
     });
   }

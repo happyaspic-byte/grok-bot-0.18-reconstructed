@@ -11,6 +11,7 @@ import {
   type CliProxyStatus,
   type CliProxyTurnConfig,
 } from "../../shared/cli-proxy.js";
+import { hardenWindowsPrivatePath } from "../../shared/node/windows-private-path.js";
 
 export const CLI_PROXY_SECRET_FILENAME = "cli-proxy-provider.json";
 
@@ -30,6 +31,12 @@ interface PersistedDocument {
   readonly config: CliProxyPublicConfig;
   /** A single fixed-purpose ciphertext. This is deliberately not a general secret map. */
   readonly apiKeyCiphertext?: string;
+}
+
+type CliProxyPrivatePathHardener = (target: string) => Promise<unknown>;
+
+async function defaultPrivatePathHardener(target: string): Promise<void> {
+  if (process.platform === "win32") await hardenWindowsPrivatePath(target);
 }
 
 function electronRuntime(): CliProxyStoreRuntime {
@@ -63,6 +70,7 @@ export class SandCliProxySecretStore {
   constructor(
     private readonly storePath = defaultPath(),
     private readonly safeStorage: CliProxySafeStorage = electronRuntime().safeStorage,
+    private readonly hardenPrivatePath: CliProxyPrivatePathHardener = defaultPrivatePathHardener,
   ) {}
 
   isPersistent(): boolean {
@@ -71,9 +79,11 @@ export class SandCliProxySecretStore {
   }
 
   async status(): Promise<CliProxyStatus> {
+    if (this.sessionConfig != null) {
+      return { ...this.sessionConfig, configured: this.sessionApiKey != null, isPersistent: false };
+    }
     if (!this.isPersistent()) {
-      const config = this.sessionConfig ?? CLI_PROXY_DEFAULT_CONFIG;
-      return { ...config, configured: this.sessionConfig != null && this.sessionApiKey != null, isPersistent: false };
+      return { ...CLI_PROXY_DEFAULT_CONFIG, configured: false, isPersistent: false };
     }
     const document = await this.loadDisk();
     return {
@@ -97,9 +107,15 @@ export class SandCliProxySecretStore {
       return this.status();
     }
     const previous = await this.loadDisk();
-    const apiKeyCiphertext = suppliedKey === undefined
-      ? previous?.apiKeyCiphertext
-      : this.safeStorage.encryptString(suppliedKey).toString("base64");
+    const keyToEncrypt = suppliedKey ?? this.sessionApiKey ?? undefined;
+    let apiKeyCiphertext: string | undefined;
+    try {
+      apiKeyCiphertext = keyToEncrypt === undefined ? previous?.apiKeyCiphertext : this.safeStorage.encryptString(keyToEncrypt).toString("base64");
+    } catch {
+      this.sessionConfig = config;
+      this.sessionApiKey = keyToEncrypt ?? null;
+      return this.status();
+    }
     const document: PersistedDocument = { schemaVersion: 1, config, ...(apiKeyCiphertext == null ? {} : { apiKeyCiphertext }) };
     await this.persist(document);
     this.diskCache = document;
@@ -128,9 +144,12 @@ export class SandCliProxySecretStore {
 
   /** Main-process-only connection lease used by the bounded /v1/models probe. */
   async getConnectionConfig(): Promise<CliProxyTurnConfig> {
-    if (!this.isPersistent()) {
-      if (this.sessionConfig == null || this.sessionApiKey == null) throw new Error("9Router is not configured. Open Settings → Router.");
+    if (this.sessionConfig != null) {
+      if (this.sessionApiKey == null) throw new Error("9Router is not configured. Open Settings → Router.");
       return { ...this.sessionConfig, apiKey: this.sessionApiKey };
+    }
+    if (!this.isPersistent()) {
+      throw new Error("9Router is not configured. Open Settings → Router.");
     }
     const document = await this.loadDisk();
     if (document?.apiKeyCiphertext == null) throw new Error("9Router is not configured. Open Settings → Router.");
@@ -154,6 +173,9 @@ export class SandCliProxySecretStore {
     let backupHoldsOldFile = false;
     await fs.writeFile(temporary, `${JSON.stringify(document, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
     try {
+      // Windows ignores POSIX mode bits. Secure and verify the uniquely named
+      // file before its same-directory rename publishes the credential.
+      await this.hardenPrivatePath(temporary);
       try { await fs.rename(temporary, this.storePath); }
       catch (error) {
         const code = typeof error === "object" && error != null && "code" in error ? String(error.code) : "";

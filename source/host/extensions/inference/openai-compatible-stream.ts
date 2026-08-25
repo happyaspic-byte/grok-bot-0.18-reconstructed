@@ -110,10 +110,13 @@ async function boundedRequest(options: OpenAiCompatibleOptions, endpoint: "chat/
 }
 
 async function* sse(response: Response): AsyncGenerator<Loose> {
-  if (response.body == null) throw new Error("9Router response did not include a stream.");
+  const lease = requestLeases.get(response);
+  if (response.body == null) {
+    lease?.cleanup(); requestLeases.delete(response);
+    throw new Error("9Router response did not include a stream.");
+  }
   const reader = response.body.getReader(), decoder = new TextDecoder();
   let buffer = "", bytes = 0;
-  const lease = requestLeases.get(response);
   try {
     while (true) {
       const { done, value } = await readWithLease(reader, lease);
@@ -141,7 +144,7 @@ async function* sse(response: Response): AsyncGenerator<Loose> {
     if (lease?.callerAborted) throw new Error("9Router request was cancelled.");
     if (lease?.timedOut) throw new Error("9Router request timed out.");
     throw error;
-  } finally { lease?.cleanup(); requestLeases.delete(response); try { reader.releaseLock(); } catch {} }
+  } finally { lease?.cleanup(); requestLeases.delete(response); try { await reader.cancel(); } catch {} try { reader.releaseLock(); } catch {} }
 }
 
 type ToolCall = { id: string; name: string; arguments: string };
@@ -183,6 +186,7 @@ async function* streamChat(options: OpenAiCompatibleOptions, irreversible: () =>
     const calls = new Map<number, ToolCall>();
     let stepUsage = zeroUsage();
     for await (const chunk of sse(response)) {
+      if (chunk.error != null) throw new Error("9Router Chat Completions request failed.");
       if (typeof chunk.id === "string") responseId = chunk.id;
       const observedUsage = chatUsage(chunk.usage);
       if (observedUsage.inputTokens + observedUsage.outputTokens + observedUsage.cacheReadTokens > 0) stepUsage = observedUsage;
@@ -190,7 +194,9 @@ async function* streamChat(options: OpenAiCompatibleOptions, irreversible: () =>
       for (const rawChoice of choices) {
         const delta = record(record(rawChoice)?.delta) ?? {};
         if (typeof delta.content === "string" && delta.content.length > 0) { irreversible(); text += delta.content; yield { type: "text-delta", delta: delta.content }; }
-        for (const rawCall of Array.isArray(delta.tool_calls) ? delta.tool_calls : []) {
+        const streamedToolCalls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+        if (streamedToolCalls.length > 0) irreversible();
+        for (const rawCall of streamedToolCalls) {
           const part = record(rawCall) ?? {}, index = Number.isInteger(part.index) ? part.index : calls.size, fn = record(part.function) ?? {};
           const previous = calls.get(index) ?? { id: "", name: "", arguments: "" };
           calls.set(index, { id: typeof part.id === "string" ? part.id : previous.id, name: previous.name + (typeof fn.name === "string" ? fn.name : ""), arguments: previous.arguments + (typeof fn.arguments === "string" ? fn.arguments : "") });
