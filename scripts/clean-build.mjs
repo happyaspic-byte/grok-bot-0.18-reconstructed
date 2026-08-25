@@ -11,9 +11,11 @@ import {
   cleanBuildDir,
   fidelityCleanBuildDir,
   fidelityRuntimeComposition,
+  fidelityRuntimeCompositionForPlatform,
   overlayCleanDistribution,
   packStagedAppWithIntegrity,
   runtimeComposition,
+  runtimeCompositionForPlatform,
 } from "./lib/clean-build.mjs";
 import { buildAsar } from "./lib/build-asar.mjs";
 import {
@@ -241,7 +243,7 @@ export async function buildReconstructedAsar({
     || (existsSync(defaultElectronMainBindingManifestPath) ? defaultElectronMainBindingManifestPath : null),
 } = {}) {
   const built = await buildBaseReconstructedAsar({ pack: false });
-  const prepared = await prepareProductionActivations(built, hostBindingManifest, electronMainBindingManifest, runtimeComposition, { reconstructedPackage: true });
+  const prepared = await prepareProductionActivations(built, hostBindingManifest, electronMainBindingManifest, built.buildManifest.runtimeComposition ?? runtimeCompositionForPlatform(built.runtime?.platform), { reconstructedPackage: true });
   const clean = await attachCompositionAudit(prepared);
   await overlayAuditMetadata(clean);
   await packStagedAppWithIntegrity({ stageRoot: stagedAppDir, archivePath: builtAsar, unpackedRoot: builtAsarUnpacked });
@@ -266,8 +268,9 @@ export async function buildFidelityReconstructedAsar({
     archivePath,
     unpackedRoot,
   });
-  const base = await buildBaseFidelityDistribution({ outputRoot: cleanOutputRoot });
-  const prepared = await prepareProductionActivations(base, hostBindingManifest, electronMainBindingManifest, fidelityRuntimeComposition, { reconstructedPackage: true });
+  const composition = fidelityRuntimeCompositionForPlatform(fallback.runtime.platform);
+  const base = await buildBaseFidelityDistribution({ outputRoot: cleanOutputRoot, composition, upstreamAppAsarSha256: fallback.runtime.appAsarSha256 });
+  const prepared = await prepareProductionActivations(base, hostBindingManifest, electronMainBindingManifest, composition, { reconstructedPackage: true });
   const clean = await attachCompositionAudit(prepared);
   await overlayCleanDistribution(clean.outputRoot, { stageRoot, composition: clean.buildManifest.runtimeComposition });
   await applyOriginalRendererRouterPatch({ stageRoot });

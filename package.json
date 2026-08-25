@@ -9,6 +9,7 @@
   },
   "scripts": {
     "bootstrap": "node scripts/bootstrap-runtime.mjs",
+    "bootstrap:windows": "node scripts/bootstrap-windows-runtime.mjs",
     "build": "node scripts/build.mjs",
     "check": "npm run typecheck && npm run source:typecheck && npm test",
     "frontend:build": "vite build --config frontend/vite.config.ts",
@@ -16,14 +17,20 @@
     "native:patch": "node scripts/apply-third-party-patches.mjs",
     "native:build:electron": "node scripts/build-tree-sitter-electron.mjs",
     "package": "npm run check && node scripts/package-macos.mjs",
+    "package:win": "node scripts/package-windows.mjs",
+    "package:windows": "node scripts/package-windows.mjs",
+    "package-windows": "node scripts/package-windows.mjs",
     "package:diagnostic": "npm run check && node scripts/package-fidelity-diagnostic.mjs",
     "publication:check": "node scripts/verify-publication-tree.mjs",
     "postinstall": "node scripts/apply-third-party-patches.mjs",
     "smoke": "node scripts/smoke.mjs",
+    "smoke:windows": "node scripts/smoke-windows.mjs",
     "test": "node --test tests/*.test.mjs",
+    "test:windows": "node --test tests/windows-*.test.mjs tests/reconstructed-updater-guard.test.mjs tests/research-archives.test.mjs",
     "typecheck": "tsc --project frontend/tsconfig.json",
     "source:typecheck": "tsc --project source/tsconfig.json",
-    "verify": "node scripts/verify.mjs"
+    "verify": "node scripts/verify.mjs",
+    "verify:windows": "node scripts/verify-windows.mjs"
   },
   "devDependencies": {
     "@electron/asar": "4.2.1",
@@ -36,6 +43,7 @@
     "acorn-walk": "8.3.5",
     "electron": "42.1.0",
     "esbuild": "0.28.2",
+    "7zip-bin": "5.2.0",
     "node-addon-api": "8.5.0",
     "node-gyp": "12.1.0",
     "node-gyp-build": "4.8.4",

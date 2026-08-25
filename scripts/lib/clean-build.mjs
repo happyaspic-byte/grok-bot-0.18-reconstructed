@@ -83,6 +83,19 @@ export const fidelityRuntimeComposition = Object.freeze(runtimeComposition.map(r
   }) : runtime
 )));
 
+export function runtimeCompositionForPlatform(platform = process.platform) {
+  return Object.freeze(runtimeComposition.map(runtime => runtime.runtime === "electron-shell" && platform === "win32"
+    ? { ...runtime, path: "Grok Bot.exe", reason: "The Windows portable package reuses the checksum-pinned x64 Electron 0.18 shell extracted from the pinned NSIS carrier without executing it." }
+    : { ...runtime }));
+}
+
+export function fidelityRuntimeCompositionForPlatform(platform = process.platform) {
+  return Object.freeze(runtimeCompositionForPlatform(platform).map(runtime => runtime.runtime === "renderer" ? {
+    runtime: "renderer", path: "dist/renderer", mode: "checksum-pinned-artifact-runtime", artifactRoot: "src/app/dist/renderer", provenance: rendererArtifactProvenance,
+    reason: `The exact shipped 0.18 ${platform === "win32" ? "Windows" : "Mac"} renderer is preserved against its complete SHA-256 inventory.`,
+  } : runtime));
+}
+
 function nodeBuildOptions(outfile) {
   return {
     absWorkingDir: repoRoot,
@@ -163,6 +176,7 @@ async function sha256(target) {
 
 export async function createRendererArtifactProvenance({
   artifactRoot = path.join(repoRoot, "src", "app", "dist", "renderer"),
+  upstreamAppAsarSha256 = officialMacReleaseAsarHash,
 } = {}) {
   const relativeRoot = path.relative(repoRoot, artifactRoot).split(path.sep).join("/");
   if (relativeRoot.startsWith("../") || path.isAbsolute(relativeRoot)) {
@@ -180,7 +194,7 @@ export async function createRendererArtifactProvenance({
   return {
     schemaVersion: 1,
     upstreamVersion: "0.18.0",
-    upstreamAppAsarSha256: officialMacReleaseAsarHash,
+    upstreamAppAsarSha256,
     mode: "checksum-pinned-artifact-runtime",
     artifactRoot: relativeRoot,
     hashAlgorithm: "sha256",
@@ -196,7 +210,7 @@ export function packagedArtifactFallbacks(composition = runtimeComposition) {
     .map(({ sourceBundle }) => sourceBundle);
 }
 
-async function buildRuntimeDistribution({ outputRoot, composition, rendererMode }) {
+async function buildRuntimeDistribution({ outputRoot, composition, rendererMode, upstreamAppAsarSha256 = officialMacReleaseAsarHash }) {
   await rm(outputRoot, { recursive: true, force: true });
   await mkdir(outputRoot, { recursive: true });
   for (const [entry, output] of sourceLibraries) await bundleSource(entry, path.join(outputRoot, output));
@@ -220,7 +234,7 @@ async function buildRuntimeDistribution({ outputRoot, composition, rendererMode 
   if (rendererMode === "clean-source") {
     renderer = await buildProductionRenderer({ outputRoot });
   } else if (rendererMode === "checksum-pinned-artifact-runtime") {
-    renderer = await createRendererArtifactProvenance();
+    renderer = await createRendererArtifactProvenance({ upstreamAppAsarSha256 });
     const provenancePath = path.join(outputRoot, rendererArtifactProvenance);
     await mkdir(path.dirname(provenancePath), { recursive: true });
     await writeFile(provenancePath, `${JSON.stringify(renderer, null, 2)}\n`);
@@ -253,12 +267,12 @@ async function buildRuntimeDistribution({ outputRoot, composition, rendererMode 
   return { outputRoot, manifestPath, buildManifest, renderer };
 }
 
-export async function buildCleanDistribution({ outputRoot = cleanBuildDir } = {}) {
-  return buildRuntimeDistribution({ outputRoot, composition: runtimeComposition, rendererMode: "clean-source" });
+export async function buildCleanDistribution({ outputRoot = cleanBuildDir, composition = runtimeCompositionForPlatform() } = {}) {
+  return buildRuntimeDistribution({ outputRoot, composition, rendererMode: "clean-source" });
 }
 
-export async function buildFidelityDistribution({ outputRoot = fidelityCleanBuildDir } = {}) {
-  return buildRuntimeDistribution({ outputRoot, composition: fidelityRuntimeComposition, rendererMode: "checksum-pinned-artifact-runtime" });
+export async function buildFidelityDistribution({ outputRoot = fidelityCleanBuildDir, composition = fidelityRuntimeCompositionForPlatform(), upstreamAppAsarSha256 = officialMacReleaseAsarHash } = {}) {
+  return buildRuntimeDistribution({ outputRoot, composition, rendererMode: "checksum-pinned-artifact-runtime", upstreamAppAsarSha256 });
 }
 
 export async function overlayCleanDistribution(outputRoot, { stageRoot = stagedAppDir, composition = runtimeComposition } = {}) {
@@ -285,8 +299,9 @@ export async function overlayCleanDistribution(outputRoot, { stageRoot = stagedA
 
 export async function buildReconstructedAsar({ pack = true } = {}) {
   const fallback = await buildAsar({ pack: false });
-  const clean = await buildCleanDistribution();
-  await overlayCleanDistribution(clean.outputRoot);
+  const composition = runtimeCompositionForPlatform(fallback.runtime.platform);
+  const clean = await buildCleanDistribution({ composition });
+  await overlayCleanDistribution(clean.outputRoot, { composition });
   if (pack) {
     await packStagedAppWithIntegrity({ stageRoot: stagedAppDir, archivePath: builtAsar, unpackedRoot: builtAsarUnpacked });
     console.log(`Source-aware ASAR ready: ${builtAsar}`);

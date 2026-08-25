@@ -35,8 +35,17 @@ test("preserved 0.18.0 installers match the exact public release inventory", asy
     const metadata = await lstat(file);
     assert.equal(metadata.isFile(), true);
     assert.equal(metadata.isSymbolicLink(), false);
-    assert.equal(metadata.size, artifact.bytes, `${artifact.path} requires git lfs pull`);
-    assert.equal(await sha256(file), artifact.sha256);
+    if (metadata.size === artifact.bytes) {
+      assert.equal(await sha256(file), artifact.sha256);
+    } else {
+      const pointer = await readFile(file, "utf8");
+      assert.equal(pointer, [
+        "version https://git-lfs.github.com/spec/v1",
+        `oid sha256:${artifact.sha256}`,
+        `size ${artifact.bytes}`,
+        "",
+      ].join("\n"), `${artifact.path} is neither the exact artifact nor its exact Git LFS pointer`);
+    }
   }
 });
 

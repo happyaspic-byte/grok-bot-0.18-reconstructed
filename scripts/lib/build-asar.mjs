@@ -6,17 +6,26 @@ import {
   builtAsar,
   builtAsarUnpacked,
   repoRoot,
+  reconstructedWindowsName,
+  reconstructedWindowsPackageName,
   sourceAppDir,
   stagedAppDir
 } from "./config.mjs";
 import { packStagedAppWithIntegrity } from "./asar-integrity.mjs";
-import { resolveRuntimeApp } from "./runtime.mjs";
+import { resolveRuntime } from "./runtime.mjs";
 
 export const reconstructedUpdaterGuard = [
   "// Reconstructed-build guard: do not consume official update or telemetry services.",
-  "process.env.SAND_DISABLE_UPDATES ??= \"1\";",
+  "process.env.SAND_DISABLE_UPDATES = \"1\";",
   "process.env.SAND_DISABLE_SENTRY ??= \"1\";",
   "process.env.SAND_DISABLE_TELEMETRY ??= \"1\";",
+  "if (process.platform === \"win32\") {",
+  "  const reconstructedPath = require(\"node:path\");",
+  "  const reconstructedProfile = reconstructedPath.join(process.env.APPDATA || require(\"node:os\").homedir(), \"Grok Bot 0.18 Reconstructed\");",
+  "  process.env.SAND_USER_DATA_DIR ??= reconstructedProfile;",
+  "  process.env.SAND_DATA_ROOT ??= reconstructedPath.join(reconstructedProfile, \"sand-data\");",
+  "  process.env.SAND_DISABLE_PROTOCOL_REGISTRATION = \"1\";",
+  "}",
   ""
 ].join("\n");
 
@@ -113,6 +122,12 @@ function enableReconstructedRuntimeSeams(source) {
     }
     patched = patched.replace(from, to);
   }
+  if (patched.includes("setAsDefaultProtocolClient")) {
+    const from = "if (import_electron51.app.isPackaged && !isSandLabBuild2) {\n    import_electron51.app.setAsDefaultProtocolClient(SAND_DEEP_LINK_SCHEME);\n  }";
+    const to = "if (import_electron51.app.isPackaged && !isSandLabBuild2 && process.env.SAND_DISABLE_PROTOCOL_REGISTRATION !== \"1\") {\n    import_electron51.app.setAsDefaultProtocolClient(SAND_DEEP_LINK_SCHEME);\n  }";
+    if (!patched.includes(from)) throw new Error("Cannot disable official protocol inheritance; upstream registration anchor changed");
+    patched = patched.replace(from, to);
+  }
   return patched;
 }
 
@@ -137,8 +152,9 @@ export async function buildAsar({
   archivePath = builtAsar,
   unpackedRoot = builtAsarUnpacked,
 } = {}) {
-  const runtimeApp = await resolveRuntimeApp();
-  const resources = path.join(runtimeApp, "Contents", "Resources");
+  const runtime = await resolveRuntime();
+  const runtimeApp = runtime.root;
+  const resources = runtime.resourcesPath;
   const runtimeUnpacked = path.join(resources, "app.asar.unpacked", "dist");
 
   await rm(buildRoot, { recursive: true, force: true });
@@ -150,6 +166,18 @@ export async function buildAsar({
     const stagedPackage = JSON.parse(await readFile(stagedPackagePath, "utf8"));
     stagedPackage.sandLab = true;
     stagedPackage.productName = "Grok Bot 0.18 Dev";
+    await writeFile(stagedPackagePath, `${JSON.stringify(stagedPackage, null, 2)}\n`);
+  }
+
+  if (process.platform === "win32") {
+    const stagedPackagePath = path.join(stageRoot, "package.json");
+    const stagedPackage = JSON.parse(await readFile(stagedPackagePath, "utf8"));
+    stagedPackage.name = reconstructedWindowsPackageName;
+    stagedPackage.productName = reconstructedWindowsName;
+    stagedPackage.description = "Unofficial Grok Bot 0.18 reconstructed Windows portable build";
+    stagedPackage.author = "Grok Bot reconstruction contributors";
+    stagedPackage.reconstructed = { unofficial: true, platform: "win32-x64", upstreamVersion: "0.18.0", updates: "disabled", protocolRegistration: "disabled" };
+    delete stagedPackage.sandTrack;
     await writeFile(stagedPackagePath, `${JSON.stringify(stagedPackage, null, 2)}\n`);
   }
 
@@ -189,5 +217,5 @@ export async function buildAsar({
   } else {
     console.log(`Base ASAR staging ready: ${stageRoot}`);
   }
-  return { builtAsar: archivePath, builtAsarUnpacked: unpackedRoot, stagedAppDir: stageRoot, runtimeApp };
+  return { builtAsar: archivePath, builtAsarUnpacked: unpackedRoot, stagedAppDir: stageRoot, runtimeApp, runtime };
 }

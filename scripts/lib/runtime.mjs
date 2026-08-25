@@ -5,6 +5,8 @@ import { extractAll } from "@electron/asar";
 import { cacheDir, cachedRuntimeApp, sourceAppDir, upstreamAsarSha256, upstreamVersion } from "./config.mjs";
 import { capture, run } from "./process.mjs";
 import { SYSTEM_TOOLS } from "./system-tools.mjs";
+import { getRuntimePlatformSpec, resolveRuntimeLayout } from "./platform-runtime.mjs";
+import { resolveCachedWindowsRuntime } from "./windows-runtime.mjs";
 
 async function exists(target) {
   try {
@@ -38,6 +40,16 @@ export async function resolveRuntimeApp() {
     return await validateRuntimeApp(cachedRuntimeApp);
   }
   throw new Error("Missing 0.18.0 runtime. Run `npm run bootstrap` first.");
+}
+
+export async function resolveRuntime() {
+  if (process.platform === "win32") return resolveCachedWindowsRuntime();
+  const root = await resolveRuntimeApp();
+  const spec = await getRuntimePlatformSpec("darwin", "arm64");
+  const layout = resolveRuntimeLayout(root, spec);
+  const appAsarSha256 = createHash("sha256").update(await readFile(layout.appAsarPath)).digest("hex");
+  if (appAsarSha256 !== spec.appAsarSha256) throw new Error(`macOS app.asar checksum mismatch: ${appAsarSha256}`);
+  return Object.freeze({ schemaVersion: 1, platform: "darwin", arch: "arm64", upstreamVersion, origin: "pinned-dmg", appAsarSha256, ...layout });
 }
 
 export async function cacheRuntimeFromApp(source) {
