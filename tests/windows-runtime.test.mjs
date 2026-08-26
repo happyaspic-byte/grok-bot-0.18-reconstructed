@@ -76,7 +76,12 @@ test("Windows runtime validation proves PE x64 and unpacked native provenance", 
     await writeFixtureFile(source, "dist/native/sand-webauthn-signer.exe", fakePeX64());
     await mkdir(resources, { recursive: true });
     await writeFile(path.join(runtime, "Grok Bot.exe"), fakePeX64());
-    await createPackageWithOptions(source, asar, { unpackDir: "dist/{deps,native}" });
+    // Keep the ASAR fixture independent of host-specific unpackDir glob
+    // semantics, then materialize the native payload exactly where Electron
+    // expects an unpacked Windows package to place it.
+    await createPackageWithOptions(source, asar, {});
+    await writeFixtureFile(`${asar}.unpacked`, "dist/deps/native.node", fakePeX64());
+    await writeFixtureFile(`${asar}.unpacked`, "dist/native/sand-webauthn-signer.exe", fakePeX64());
     const expectedAsarSha256 = await sha256File(asar);
     const validated = await validateWindowsRuntime(runtime, { origin: "unit-fixture", expectedAsarSha256 });
     assert.equal(validated.platform, "win32");
