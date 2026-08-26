@@ -132,21 +132,27 @@ try {
   );
   await waitForRendererState(
     cdp,
-    `(() => { const candidates = [...document.querySelectorAll('button,a,[role="button"],[role="menuitem"]')]; const settings = candidates.find(node => /settings/i.test([node.textContent, node.getAttribute('aria-label'), node.getAttribute('title')].filter(Boolean).join(' '))); settings?.click(); return settings != null; })()`,
-    value => value === true,
-    "Fresh isolated profile did not expose a Settings control",
+    `(() => { const visible = node => node.isConnected && node.getClientRects().length > 0 && !node.disabled; const candidates = [...document.querySelectorAll('button,[role="button"]')]; const configure = candidates.find(node => visible(node) && (/^configure 9router$/i.test((node.textContent ?? '').trim()) || /^configure 9router$/i.test(node.getAttribute('aria-label') ?? ''))); configure?.click(); return { clicked: configure != null, controls: candidates.filter(visible).map(node => [node.textContent?.trim(), node.getAttribute('aria-label')].filter(Boolean).join(' | ')).filter(Boolean).slice(0, 60) }; })()`,
+    value => value?.clicked === true,
+    "Fresh isolated profile did not expose the credential-independent 9Router setup",
   );
   await waitForRendererState(
     cdp,
-    `(() => { const candidates = [...document.querySelectorAll('button,a,[role="tab"],[role="menuitem"]')]; const router = candidates.find(node => /^router$/i.test((node.textContent ?? '').trim()) || /router/i.test(node.getAttribute('aria-label') ?? '')); router?.click(); return router != null; })()`,
-    value => value === true,
-    "Fresh isolated profile did not expose the Router settings section",
+    `(() => { const visible = node => node.isConnected && node.getClientRects().length > 0 && !node.disabled; const candidates = [...document.querySelectorAll('[aria-label],button,[role="button"]')]; const provider = candidates.find(node => visible(node) && /^router provider$/i.test(node.getAttribute('aria-label') ?? '')); provider?.click(); return { clicked: provider != null, controls: candidates.filter(visible).map(node => [node.textContent?.trim(), node.getAttribute('aria-label')].filter(Boolean).join(' | ')).filter(Boolean).slice(0, 60) }; })()`,
+    value => value?.clicked === true,
+    "Router settings did not expose the provider selector",
   );
   await waitForRendererState(
     cdp,
-    `(() => ({ text: document.body?.innerText ?? "", hasRouterMarker: document.querySelector('[data-router-provider], [data-settings-section="router"], [data-nine-router]') != null }))()`,
-    value => value?.hasRouterMarker === true || /9Router|OpenAI-compatible/i.test(value?.text ?? ""),
-    "Fresh isolated profile cannot reach the 9Router settings surface",
+    `(() => { const visible = node => node.isConnected && node.getClientRects().length > 0 && !node.disabled; const candidates = [...document.querySelectorAll('button,[role="option"],[role="menuitem"],[role="radio"]')]; const option = candidates.find(node => visible(node) && /^openai-compatible \/ 9router$/i.test((node.textContent ?? '').trim())); option?.click(); return { clicked: option != null, controls: candidates.filter(visible).map(node => [node.textContent?.trim(), node.getAttribute('aria-label')].filter(Boolean).join(' | ')).filter(Boolean).slice(0, 60) }; })()`,
+    value => value?.clicked === true,
+    "Router provider selector did not expose the 9Router option",
+  );
+  await waitForRendererState(
+    cdp,
+    `(async () => { const input = document.querySelector('input[aria-label="9Router Base URL"]'); const state = await window.desktop.agent.getInferenceRouter(); return { provider: state?.provider ?? null, hasEditableBaseUrl: input instanceof HTMLInputElement && !input.disabled && !input.readOnly, baseUrl: input instanceof HTMLInputElement ? input.value : null, text: document.body?.innerText ?? "" }; })()`,
+    value => value?.provider === "cli-proxy" && value.hasEditableBaseUrl === true && value.baseUrl === "http://127.0.0.1:20128/v1" && /9Router connection/i.test(value.text ?? ""),
+    "Fresh isolated profile cannot select 9Router or edit its Base URL",
   );
   console.log(`PASS Windows packaged launch smoke: ${verified.executable}`);
   console.log("Fresh isolated profile mounted the clean renderer and reached the 9Router settings surface.");

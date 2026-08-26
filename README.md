@@ -102,8 +102,9 @@ tool execution across routed conversations.
 
 #### 9Router / OpenAI-compatible setup
 
-Use **9Router 0.4.82 or newer**, then open **Settings → Router** and select
-**OpenAI-compatible / 9Router**. The default API root is
+Use **9Router 0.4.82 or newer**. On a fresh Windows portable profile, choose
+**Configure 9Router** on the sign-in screen; otherwise open **Settings →
+Router**. Select **OpenAI-compatible / 9Router**. The default API root is
 `http://127.0.0.1:20128/v1`. Save the 9Router **proxy/client API key** (not its
 management key), use **Test & load models**, and enter or select the exact model
 ID. Manual model entry remains available because 9Router's `/v1/models` result
@@ -234,8 +235,10 @@ rights and signing review described below.
 ### Using 9Router or another OpenAI-compatible local API
 
 Run 9Router separately, create a proxy/client API key in its Dashboard, and use
-the model IDs shown by that Dashboard. In **Settings → Router**, select the
-OpenAI-compatible/9Router provider. The default local endpoint is:
+the model IDs shown by that Dashboard. A fresh Windows portable profile exposes
+**Configure 9Router** before Cursor sign-in; existing profiles can use
+**Settings → Router**. Select the OpenAI-compatible/9Router provider. The
+default local endpoint is:
 
 ```text
 http://127.0.0.1:20128/v1

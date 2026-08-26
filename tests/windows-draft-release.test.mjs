@@ -41,6 +41,26 @@ test("Windows release workflow verifies and launches both the directory and ZIP 
   assert.match(publicationCheck, /process\.platform === "win32" \? "tar" : "\/usr\/bin\/tar"/);
 });
 
+test("Windows launch smoke uses the credential-independent first-run Router entry", async () => {
+  const smoke = await readFile(path.join(repoRoot, "scripts", "smoke-windows.mjs"), "utf8");
+  const renderer = await readFile(path.join(repoRoot, "frontend", "src", "production", "ProductionRenderer.tsx"), "utf8");
+  const panel = await readFile(path.join(repoRoot, "frontend", "src", "recovered", "features", "settings", "overlay", "panels.tsx"), "utf8");
+  const firstRun = smoke.indexOf("configure 9router");
+  const provider = smoke.indexOf("router provider");
+  const option = smoke.indexOf("openai-compatible \\/ 9router");
+  const backend = smoke.indexOf('value?.provider === "cli-proxy"');
+  assert.ok(firstRun !== -1 && firstRun < provider && provider < option && option < backend);
+  assert.match(smoke, /configure\?\.click\(\)/);
+  assert.match(smoke, /provider\?\.click\(\)/);
+  assert.match(smoke, /option\?\.click\(\)/);
+  assert.match(smoke, /input\[aria-label="9Router Base URL"\]/);
+  assert.match(renderer, /aria-label="Configure 9Router"/);
+  assert.match(renderer, /setSettingsSection\("router"\);[\s\S]{0,120}setOverlay\("settings"\)/);
+  assert.match(renderer, /showSignIn && overlay !== "settings"/);
+  assert.match(panel, /ariaLabel="Router provider"/);
+  assert.match(panel, /aria-label="9Router Base URL"/);
+});
+
 test("write permission exists only in the isolated draft creation job", async () => {
   const workflow = await readFile(workflowPath, "utf8");
   const buildJob = workflow.slice(workflow.indexOf("  build-and-smoke:"), workflow.indexOf("  create-draft-release:"));
