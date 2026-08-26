@@ -45,6 +45,7 @@ test("Windows launch smoke uses the credential-independent first-run Router entr
   const smoke = await readFile(path.join(repoRoot, "scripts", "smoke-windows.mjs"), "utf8");
   const renderer = await readFile(path.join(repoRoot, "frontend", "src", "production", "ProductionRenderer.tsx"), "utf8");
   const panel = await readFile(path.join(repoRoot, "frontend", "src", "recovered", "features", "settings", "overlay", "panels.tsx"), "utf8");
+  const surface = await readFile(path.join(repoRoot, "frontend", "src", "recovered", "features", "settings", "overlay", "desktop-surface.tsx"), "utf8");
   const firstRun = smoke.indexOf("configure 9router");
   const provider = smoke.indexOf("router provider");
   const option = smoke.indexOf("openai-compatible \\/ 9router");
@@ -59,6 +60,7 @@ test("Windows launch smoke uses the credential-independent first-run Router entr
   assert.match(renderer, /showSignIn && overlay !== "settings"/);
   assert.match(panel, /ariaLabel="Router provider"/);
   assert.match(panel, /aria-label="9Router Base URL"/);
+  assert.ok(surface.indexOf('section === "router"') < surface.indexOf("snapshot == null"), "Router must render before the signed-in settings snapshot resolves");
 });
 
 test("write permission exists only in the isolated draft creation job", async () => {

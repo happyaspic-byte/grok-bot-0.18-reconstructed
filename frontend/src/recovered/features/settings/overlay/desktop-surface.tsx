@@ -189,6 +189,63 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
       isOpen={isOpen}
       onClose={onClose}
       renderSection={(section: SettingsSectionId) => {
+        // Router configuration is intentionally independent from the signed-in
+        // settings snapshot so a fresh profile can configure 9Router first.
+        if (section === "router") return (
+          <RouterSettingsPanel
+            cliProxy={{
+              status: cliProxyStatus,
+              pending: cliProxyPending,
+              onSave: async (config) => {
+                setCliProxyPending(true);
+                try { setCliProxyStatus(await bridge.cliProxy.save(config)); }
+                catch (reason) {
+                  const message = reason instanceof Error ? reason.message : String(reason);
+                  publishSurfaceNotice({ kind: "error", operation: "settings-router-provider", message }, handleNotice, onStatus);
+                  throw reason;
+                } finally { setCliProxyPending(false); }
+              },
+              onDelete: async () => {
+                setCliProxyPending(true);
+                try { setCliProxyStatus(await bridge.cliProxy.remove()); }
+                catch (reason) {
+                  const message = reason instanceof Error ? reason.message : String(reason);
+                  publishSurfaceNotice({ kind: "error", operation: "settings-router-provider", message }, handleNotice, onStatus);
+                  throw reason;
+                } finally { setCliProxyPending(false); }
+              },
+              onTest: async () => {
+                setCliProxyPending(true);
+                try { setCliProxyStatus(await bridge.cliProxy.status({ testConnection: true })); }
+                catch (reason) {
+                  const message = reason instanceof Error ? reason.message : String(reason);
+                  publishSurfaceNotice({ kind: "error", operation: "settings-router-provider", message }, handleNotice, onStatus);
+                  throw reason;
+                } finally { setCliProxyPending(false); }
+              }
+            }}
+            onChange={async (provider) => {
+              if (routerPending || provider === routerProvider) return;
+              const previous = routerProvider;
+              setRouterProvider(provider);
+              setRouterPending(true);
+              try {
+                const result = await bridge.agent.setInferenceRouter(provider);
+                const applied = typeof result === "object" && result != null && "provider" in result ? result.provider : provider;
+                if (!isRouterProviderId(applied)) throw new Error("Router returned an unknown provider.");
+                setRouterProvider(applied);
+              } catch (reason) {
+                setRouterProvider(previous);
+                const message = reason instanceof Error ? reason.message : String(reason);
+                publishSurfaceNotice({ kind: "error", operation: "settings-router-provider", message }, handleNotice, onStatus);
+              } finally {
+                setRouterPending(false);
+              }
+            }}
+            pending={routerPending}
+            provider={routerProvider}
+          />
+        );
         if (snapshot == null) return (
           <div aria-live="polite" role={error == null ? "status" : "alert"}>
             {error == null ? null : <>
@@ -251,61 +308,6 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
             onRetry={refreshUsage}
             onUpgrade={(action) => runUsageUpgradeActionAndRefresh(bridge, action, refreshUsage)}
             state={snapshot.usage}
-            provider={routerProvider}
-          />
-        );
-        if (section === "router") return (
-          <RouterSettingsPanel
-            cliProxy={{
-              status: cliProxyStatus,
-              pending: cliProxyPending,
-              onSave: async (config) => {
-                setCliProxyPending(true);
-                try { setCliProxyStatus(await bridge.cliProxy.save(config)); }
-                catch (reason) {
-                  const message = reason instanceof Error ? reason.message : String(reason);
-                  publishSurfaceNotice({ kind: "error", operation: "settings-router-provider", message }, handleNotice, onStatus);
-                  throw reason;
-                } finally { setCliProxyPending(false); }
-              },
-              onDelete: async () => {
-                setCliProxyPending(true);
-                try { setCliProxyStatus(await bridge.cliProxy.remove()); }
-                catch (reason) {
-                  const message = reason instanceof Error ? reason.message : String(reason);
-                  publishSurfaceNotice({ kind: "error", operation: "settings-router-provider", message }, handleNotice, onStatus);
-                  throw reason;
-                } finally { setCliProxyPending(false); }
-              },
-              onTest: async () => {
-                setCliProxyPending(true);
-                try { setCliProxyStatus(await bridge.cliProxy.status({ testConnection: true })); }
-                catch (reason) {
-                  const message = reason instanceof Error ? reason.message : String(reason);
-                  publishSurfaceNotice({ kind: "error", operation: "settings-router-provider", message }, handleNotice, onStatus);
-                  throw reason;
-                } finally { setCliProxyPending(false); }
-              }
-            }}
-            onChange={async (provider) => {
-              if (routerPending || provider === routerProvider) return;
-              const previous = routerProvider;
-              setRouterProvider(provider);
-              setRouterPending(true);
-              try {
-                const result = await bridge.agent.setInferenceRouter(provider);
-                const applied = typeof result === "object" && result != null && "provider" in result ? result.provider : provider;
-                if (!isRouterProviderId(applied)) throw new Error("Router returned an unknown provider.");
-                setRouterProvider(applied);
-              } catch (reason) {
-                setRouterProvider(previous);
-                const message = reason instanceof Error ? reason.message : String(reason);
-                publishSurfaceNotice({ kind: "error", operation: "settings-router-provider", message }, handleNotice, onStatus);
-              } finally {
-                setRouterPending(false);
-              }
-            }}
-            pending={routerPending}
             provider={routerProvider}
           />
         );
