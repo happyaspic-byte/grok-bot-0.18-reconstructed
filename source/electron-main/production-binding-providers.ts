@@ -115,7 +115,8 @@ export interface ElectronNotificationsProviderPorts {
     }): DesktopNotificationPort;
     isSupported(): boolean;
   };
-  readonly app: { setBadgeCount(count: number): unknown };
+  readonly app: { setBadgeCount?(count: number): unknown };
+  readonly platform?: NodeJS.Platform;
 }
 
 export interface ElectronStartupProviderPorts {
@@ -411,7 +412,12 @@ export function createProductionNotificationsBinding(
 ): NotificationsBinding {
   requireFunction(ports?.Notification, "electron.Notification constructor.");
   requireFunction(ports?.Notification?.isSupported, "electron.Notification.isSupported().");
-  requireFunction(ports?.app?.setBadgeCount, "electron.app.setBadgeCount().");
+  const platform = ports.platform ?? process.platform;
+  const nativeSetBadgeCount = ports?.app?.setBadgeCount;
+  if (platform !== "win32") requireFunction(nativeSetBadgeCount, "electron.app.setBadgeCount().");
+  const setBadgeCount = typeof nativeSetBadgeCount === "function"
+    ? nativeSetBadgeCount.bind(ports.app)
+    : (_count: number): void => {};
   let created = false;
   return {
     create(context) {
@@ -424,7 +430,7 @@ export function createProductionNotificationsBinding(
         openAgent: (agentId) => context.requireMainEdge().emit("focus-agent", { id: agentId }),
       });
       const dockBadge = new SandDockBadgeManager({
-        setBadgeCount: (count) => { ports.app.setBadgeCount(count); },
+        setBadgeCount,
         reportFailure: (operation, error) => reportDesktopEdgeFailure("dock-badge", operation, error),
       });
       const feed = createAgentsControlFeed({ osNotifications, dockBadge });
@@ -453,6 +459,7 @@ export function createElectronProductionNotificationsBinding(): NotificationsBin
   return createProductionNotificationsBinding({
     Notification: electron.Notification,
     app: electron.app,
+    platform: process.platform,
   });
 }
 
@@ -464,18 +471,20 @@ export function createElectronProductionNotificationsBinding(): NotificationsBin
 export function createProductionStartupBinding(
   ports: ElectronStartupProviderPorts,
 ): ElectronProductionStartupBindings {
+  const platform = ports.platform ?? process.platform;
   for (const [value, label] of [
     [ports?.app?.setPath, "electron.app.setPath()."],
     [ports?.app?.getPath, "electron.app.getPath()."],
-    [ports?.app?.isInApplicationsFolder, "electron.app.isInApplicationsFolder()."],
-    [ports?.app?.moveToApplicationsFolder, "electron.app.moveToApplicationsFolder()."],
     [ports?.app?.relaunch, "electron.app.relaunch()."],
     [ports?.app?.exit, "electron.app.exit()."],
     [ports?.dialog?.showMessageBox, "electron.dialog.showMessageBox()."],
   ] as const) requireFunction(value, label);
+  if (platform === "darwin") {
+    requireFunction(ports?.app?.isInApplicationsFolder, "electron.app.isInApplicationsFolder().");
+    requireFunction(ports?.app?.moveToApplicationsFolder, "electron.app.moveToApplicationsFolder().");
+  }
   const argv = ports.argv ?? process.argv;
   const env = ports.env ?? process.env;
-  const platform = ports.platform ?? process.platform;
   const buffered: Array<{ readonly level: Parameters<ProductionTelemetrySink["reportDesktopStartup"]>[0]; readonly metadata: Parameters<ProductionTelemetrySink["reportDesktopStartup"]>[1] }> = [];
   let telemetry: ProductionTelemetrySink | undefined;
   const report: ElectronProductionStartupBindings["report"] = (level, metadata) => {
