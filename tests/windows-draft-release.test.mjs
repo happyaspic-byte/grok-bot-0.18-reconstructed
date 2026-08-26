@@ -5,6 +5,7 @@ import test from "node:test";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const workflowPath = path.join(repoRoot, ".github", "workflows", "windows-draft-release.yml");
+const checkWorkflowPath = path.join(repoRoot, ".github", "workflows", "check.yml");
 
 test("Windows release workflow is main-only, manual-capable, and draft-only", async () => {
   const workflow = await readFile(workflowPath, "utf8");
@@ -26,6 +27,14 @@ test("Windows release workflow verifies and launches both the directory and ZIP 
     "node scripts/smoke-windows.mjs --app $roundTripPortable",
     "sha256sum --check SHA256SUMS.txt",
   ]) assert.ok(workflow.includes(command), `missing release gate: ${command}`);
+  assert.match(workflow, /\$PSNativeCommandUseErrorActionPreference = \$true/);
+  assert.match(workflow, /bomFormat -ne 'CycloneDX'/);
+
+  const checks = await readFile(checkWorkflowPath, "utf8");
+  const windowsJob = checks.slice(checks.indexOf("  windows-x64-portable:"), checks.indexOf("  full-original-provenance:"));
+  assert.match(windowsJob, /\$PSNativeCommandUseErrorActionPreference = \$true/);
+  assert.match(windowsJob, /npm test/);
+  assert.match(windowsJob, /npm run publication:check/);
 
   const publicationCheck = await readFile(path.join(repoRoot, "scripts", "verify-publication-tree.mjs"), "utf8");
   assert.match(publicationCheck, /process\.platform === "win32" \? "git" : "\/usr\/bin\/git"/);
@@ -38,7 +47,13 @@ test("write permission exists only in the isolated draft creation job", async ()
   const publishJob = workflow.slice(workflow.indexOf("  create-draft-release:"));
   assert.doesNotMatch(buildJob, /contents: write/);
   assert.match(publishJob, /contents: write/);
+  assert.match(publishJob, /actions: write/);
   assert.doesNotMatch(publishJob, /npm |node scripts|git lfs|package:windows/);
+  assert.match(publishJob, /--json isDraft --jq '\.isDraft'/);
+  assert.match(publishJob, /actions\/runs\/\$GITHUB_RUN_ID\/artifacts\?name=\$ARTIFACT_NAME/);
+  assert.match(publishJob, /gh api --method DELETE "repos\/\$GH_REPO\/actions\/artifacts\/\$artifact_id"/);
+  assert.match(buildJob, /retention-days: 1/);
+  assert.doesNotMatch(buildJob, /private-to-owner/);
   for (const pin of [
     "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
     "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",

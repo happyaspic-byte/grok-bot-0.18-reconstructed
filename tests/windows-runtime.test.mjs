@@ -43,11 +43,13 @@ test("Windows x64 runtime manifest pins the NSIS carrier, ASAR, and extractor", 
   assert.equal(path.basename(layout.executablePath), "Grok Bot.exe");
   assert.equal(path.basename(layout.appAsarPath), "app.asar");
 
-  const [bootstrap, packaging, extractor, verifier] = await Promise.all([
+  const [bootstrap, packaging, extractor, verifier, nodeNativeBuild, electronNativeBuild] = await Promise.all([
     readFile(path.join(repoRoot, "scripts/bootstrap-windows-runtime.mjs"), "utf8"),
     readFile(path.join(repoRoot, "scripts/package-windows.mjs"), "utf8"),
     readFile(path.join(repoRoot, "scripts/lib/windows-runtime.mjs"), "utf8"),
     readFile(path.join(repoRoot, "scripts/lib/windows-package.mjs"), "utf8"),
+    readFile(path.join(repoRoot, "scripts/build-tree-sitter-node.mjs"), "utf8"),
+    readFile(path.join(repoRoot, "scripts/build-tree-sitter-electron.mjs"), "utf8"),
   ]);
   assert.match(bootstrap, /extractPinnedWindowsInstaller/);
   assert.match(bootstrap, /never executed/);
@@ -59,6 +61,11 @@ test("Windows x64 runtime manifest pins the NSIS carrier, ASAR, and extractor", 
   assert.match(verifier, /Electron main does not activate the 9Router security boundary/);
   assert.match(verifier, /SAND_9ROUTER_ENABLE_UNREVIEWED_MCP_TOOLS/);
   assert.match(verifier, /Primary preload does not expose the bounded 9Router settings bridge/);
+  for (const nativeBuild of [nodeNativeBuild, electronNativeBuild]) {
+    assert.match(nativeBuild, /spawn\(process\.execPath|run\(process\.execPath/);
+    assert.match(nativeBuild, /node-gyp", "bin", "node-gyp\.js"/);
+    assert.doesNotMatch(nativeBuild, /node-gyp\.cmd/);
+  }
 });
 
 test("ASAR lookups canonicalize both Windows and POSIX archive separators", async () => {
