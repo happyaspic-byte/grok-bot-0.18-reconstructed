@@ -1,8 +1,13 @@
 import { execFile } from "node:child_process";
 import { lstat } from "node:fs/promises";
+import { win32 as windowsPath } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+
+export function windowsPowerShellEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(source).filter(([key]) => key.toLowerCase() !== "psmodulepath"));
+}
 
 export const WINDOWS_PRIVATE_PATH_SIDS = Object.freeze([
   "CURRENT_USER",
@@ -28,6 +33,7 @@ const defaultPowerShellRunner: WindowsPrivatePathPowerShellRunner = async (execu
     maxBuffer: 1024 * 1024,
     timeout: 15_000,
     windowsHide: true,
+    env: windowsPowerShellEnvironment(),
   });
   return { stdout: result.stdout, stderr: result.stderr };
 };
@@ -36,10 +42,17 @@ function encodedPowerShell(script: string): string {
   return Buffer.from(script, "utf16le").toString("base64");
 }
 
+function windowsPowerShellExecutable(): string {
+  const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? process.env.WINDIR ?? "C:\\Windows";
+  return windowsPath.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+}
+
 function aclScript(target: string): string {
   const encodedTarget = Buffer.from(target, "utf16le").toString("base64");
   return String.raw`
 $ErrorActionPreference = 'Stop'
+$env:PSModulePath = [IO.Path]::Combine($PSHOME, 'Modules')
+Import-Module Microsoft.PowerShell.Management, Microsoft.PowerShell.Security, Microsoft.PowerShell.Utility -ErrorAction Stop
 $Target = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedTarget}'))
 $Item = Get-Item -LiteralPath $Target -Force
 if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Refusing to secure a reparse point.' }
@@ -84,7 +97,7 @@ export async function hardenWindowsPrivatePath(
   const state = await lstat(target);
   if (state.isSymbolicLink() || (!state.isFile() && !state.isDirectory())) throw new Error("Refusing to secure a link or special file.");
   const runner = options.powershell ?? defaultPowerShellRunner;
-  const { stdout } = await runner("powershell.exe", [
+  const { stdout } = await runner(windowsPowerShellExecutable(), [
     "-NoLogo",
     "-NoProfile",
     "-NonInteractive",

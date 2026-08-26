@@ -45,7 +45,7 @@ test("Windows CLI discovery rejects directories, unsupported extensions, and lin
   } finally { await loaded.dispose(); await rm(temporary, { recursive: true, force: true }); }
 });
 
-test("POSIX CLI discovery still requires execute permission", async () => {
+test("POSIX CLI discovery still requires execute permission", { skip: process.platform === "win32" ? "POSIX execute bits require a POSIX filesystem" : false }, async () => {
   const loaded = await loadModule(), temporary = await mkdtemp(path.join(os.tmpdir(), "grok-cli-posix-"));
   try {
     const codex = path.join(temporary, "codex");
