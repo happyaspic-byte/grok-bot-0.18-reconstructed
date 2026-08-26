@@ -7,6 +7,7 @@ import test from "node:test";
 import { createPackageWithOptions } from "@electron/asar";
 
 import { canonicalAsarPath, extractAsarFile, nativeAsarPath } from "../scripts/lib/asar-paths.mjs";
+import { withWindowsMsvcNodeGypSettings } from "../scripts/lib/node-gyp-environment.mjs";
 import { getRuntimePlatformSpec, resolveRuntimeLayout } from "../scripts/lib/platform-runtime.mjs";
 import { assertPeX64, sha256File, validateWindowsRuntime, windowsInstalledRuntimeCandidates } from "../scripts/lib/windows-runtime.mjs";
 
@@ -64,6 +65,7 @@ test("Windows x64 runtime manifest pins the NSIS carrier, ASAR, and extractor", 
   for (const nativeBuild of [nodeNativeBuild, electronNativeBuild]) {
     assert.match(nativeBuild, /spawn\(process\.execPath|run\(process\.execPath/);
     assert.match(nativeBuild, /node-gyp", "bin", "node-gyp\.js"/);
+    assert.match(nativeBuild, /withWindowsMsvcNodeGypSettings\(/);
     assert.doesNotMatch(nativeBuild, /node-gyp\.cmd/);
   }
 });
@@ -83,6 +85,30 @@ test("ASAR lookups canonicalize both Windows and POSIX archive separators", asyn
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }
+});
+
+test("Windows node-gyp builds disable inherited Clang LTO settings under MSVC", () => {
+  const inherited = {
+    npm_config_enable_lto: "true",
+    npm_config_enable_thin_lto: "true",
+    npm_package_config_node_gyp_enable_lto: "true",
+    npm_package_config_node_gyp_enable_thin_lto: "true",
+    NPM_CONFIG_ENABLE_THIN_LTO: "true",
+    Npm_Package_Config_Node_Gyp_Enable_Lto: "true",
+    UNRELATED: "preserved",
+  };
+  const windows = withWindowsMsvcNodeGypSettings(inherited, "win32");
+  assert.deepEqual(windows, {
+    npm_config_enable_lto: "false",
+    npm_config_enable_thin_lto: "false",
+    npm_package_config_node_gyp_enable_lto: "false",
+    npm_package_config_node_gyp_enable_thin_lto: "false",
+    UNRELATED: "preserved",
+  });
+  assert.equal(windows.NPM_CONFIG_ENABLE_THIN_LTO, undefined);
+  assert.equal(windows.Npm_Package_Config_Node_Gyp_Enable_Lto, undefined);
+  assert.equal(inherited.npm_config_enable_thin_lto, "true");
+  assert.deepEqual(withWindowsMsvcNodeGypSettings(inherited, "linux"), inherited);
 });
 
 test("Windows runtime validation proves PE x64 and unpacked native provenance", async () => {

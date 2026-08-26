@@ -3,6 +3,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 
 import { repoRoot } from "./lib/config.mjs";
+import { withWindowsMsvcNodeGypSettings } from "./lib/node-gyp-environment.mjs";
 
 const packages = ["tree-sitter", "tree-sitter-bash"];
 const dependencies = ["node-addon-api", "node-gyp-build"];
@@ -13,7 +14,7 @@ function nodeRuntimeCacheRoot() {
 
 function runNodeGyp(target) {
   const nodeGypEntry = path.join(repoRoot, "node_modules", "node-gyp", "bin", "node-gyp.js");
-  const environment = { ...process.env };
+  const environment = withWindowsMsvcNodeGypSettings(process.env);
   for (const key of ["npm_config_runtime", "npm_config_target", "npm_config_disturl", "npm_config_nodedir"]) delete environment[key];
   environment.npm_config_build_from_source = "true";
   return new Promise((resolve, reject) => {
