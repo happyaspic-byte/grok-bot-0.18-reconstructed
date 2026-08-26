@@ -6,6 +6,8 @@ import test from "node:test";
 
 import { createPackageWithOptions } from "@electron/asar";
 
+import { canonicalAsarPath, extractAsarFile, nativeAsarPath } from "../scripts/lib/asar-paths.mjs";
+import { withWindowsMsvcNodeGypSettings } from "../scripts/lib/node-gyp-environment.mjs";
 import { getRuntimePlatformSpec, resolveRuntimeLayout } from "../scripts/lib/platform-runtime.mjs";
 import { assertPeX64, sha256File, validateWindowsRuntime, windowsInstalledRuntimeCandidates } from "../scripts/lib/windows-runtime.mjs";
 
@@ -42,11 +44,13 @@ test("Windows x64 runtime manifest pins the NSIS carrier, ASAR, and extractor", 
   assert.equal(path.basename(layout.executablePath), "Grok Bot.exe");
   assert.equal(path.basename(layout.appAsarPath), "app.asar");
 
-  const [bootstrap, packaging, extractor, verifier] = await Promise.all([
+  const [bootstrap, packaging, extractor, verifier, nodeNativeBuild, electronNativeBuild] = await Promise.all([
     readFile(path.join(repoRoot, "scripts/bootstrap-windows-runtime.mjs"), "utf8"),
     readFile(path.join(repoRoot, "scripts/package-windows.mjs"), "utf8"),
     readFile(path.join(repoRoot, "scripts/lib/windows-runtime.mjs"), "utf8"),
     readFile(path.join(repoRoot, "scripts/lib/windows-package.mjs"), "utf8"),
+    readFile(path.join(repoRoot, "scripts/build-tree-sitter-node.mjs"), "utf8"),
+    readFile(path.join(repoRoot, "scripts/build-tree-sitter-electron.mjs"), "utf8"),
   ]);
   assert.match(bootstrap, /extractPinnedWindowsInstaller/);
   assert.match(bootstrap, /never executed/);
@@ -58,6 +62,53 @@ test("Windows x64 runtime manifest pins the NSIS carrier, ASAR, and extractor", 
   assert.match(verifier, /Electron main does not activate the 9Router security boundary/);
   assert.match(verifier, /SAND_9ROUTER_ENABLE_UNREVIEWED_MCP_TOOLS/);
   assert.match(verifier, /Primary preload does not expose the bounded 9Router settings bridge/);
+  for (const nativeBuild of [nodeNativeBuild, electronNativeBuild]) {
+    assert.match(nativeBuild, /spawn\(process\.execPath|run\(process\.execPath/);
+    assert.match(nativeBuild, /node-gyp", "bin", "node-gyp\.js"/);
+    assert.match(nativeBuild, /withWindowsMsvcNodeGypSettings\(/);
+    assert.doesNotMatch(nativeBuild, /node-gyp\.cmd/);
+  }
+});
+
+test("ASAR lookups canonicalize both Windows and POSIX archive separators", async () => {
+  assert.equal(canonicalAsarPath("\\dist\\deps\\runtime-deps-manifest.json"), "dist/deps/runtime-deps-manifest.json");
+  assert.equal(canonicalAsarPath("/dist/deps/runtime-deps-manifest.json"), "dist/deps/runtime-deps-manifest.json");
+  assert.equal(nativeAsarPath("dist/deps/runtime-deps-manifest.json"), path.join("dist", "deps", "runtime-deps-manifest.json"));
+
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-asar-path-fixture-"));
+  const source = path.join(temporary, "source");
+  const asar = path.join(temporary, "app.asar");
+  try {
+    await writeFixtureFile(source, "dist/deps/runtime-deps-manifest.json", "fixture\n");
+    await createPackageWithOptions(source, asar, {});
+    assert.equal(Buffer.from(extractAsarFile(asar, "dist/deps/runtime-deps-manifest.json")).toString("utf8"), "fixture\n");
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("Windows node-gyp builds disable inherited Clang LTO settings under MSVC", () => {
+  const inherited = {
+    npm_config_enable_lto: "true",
+    npm_config_enable_thin_lto: "true",
+    npm_package_config_node_gyp_enable_lto: "true",
+    npm_package_config_node_gyp_enable_thin_lto: "true",
+    NPM_CONFIG_ENABLE_THIN_LTO: "true",
+    Npm_Package_Config_Node_Gyp_Enable_Lto: "true",
+    UNRELATED: "preserved",
+  };
+  const windows = withWindowsMsvcNodeGypSettings(inherited, "win32");
+  assert.deepEqual(windows, {
+    npm_config_enable_lto: "false",
+    npm_config_enable_thin_lto: "false",
+    npm_package_config_node_gyp_enable_lto: "false",
+    npm_package_config_node_gyp_enable_thin_lto: "false",
+    UNRELATED: "preserved",
+  });
+  assert.equal(windows.NPM_CONFIG_ENABLE_THIN_LTO, undefined);
+  assert.equal(windows.Npm_Package_Config_Node_Gyp_Enable_Lto, undefined);
+  assert.equal(inherited.npm_config_enable_thin_lto, "true");
+  assert.deepEqual(withWindowsMsvcNodeGypSettings(inherited, "linux"), inherited);
 });
 
 test("Windows runtime validation proves PE x64 and unpacked native provenance", async () => {

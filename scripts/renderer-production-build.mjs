@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { cp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -75,9 +75,101 @@ async function readJson(relative) {
   return JSON.parse(await readFile(path.join(repoRoot, relative), "utf8"));
 }
 
-async function validateBootstrapEvidence() {
-  const catalog = await readJson("frontend/manifests/renderer-bootstrap.json");
-  const artifact = await readFile(path.join(repoRoot, catalog.artifact));
+function parseScriptTagAttributes(tag) {
+  if (!/^<script(?=[\t\n\f\r />])/i.test(tag)) throw new Error("Renderer HTML has an invalid script tag");
+  const attributes = new Map();
+  const isWhitespace = value => value != null && /[\t\n\f\r ]/.test(value);
+  let cursor = "<script".length;
+  while (cursor < tag.length) {
+    while (isWhitespace(tag[cursor])) cursor += 1;
+    if (tag[cursor] === ">") return attributes;
+    if (tag[cursor] === "/" && tag[cursor + 1] === ">") return attributes;
+    const nameStart = cursor;
+    while (
+      cursor < tag.length
+      && !isWhitespace(tag[cursor])
+      && !new Set(["=", "/", ">"]).has(tag[cursor])
+    ) cursor += 1;
+    if (cursor === nameStart) throw new Error("Renderer HTML has an invalid script attribute");
+    const name = tag.slice(nameStart, cursor).toLowerCase();
+    while (isWhitespace(tag[cursor])) cursor += 1;
+    let value = null;
+    if (tag[cursor] === "=") {
+      cursor += 1;
+      while (isWhitespace(tag[cursor])) cursor += 1;
+      const quote = tag[cursor];
+      if (quote !== '"' && quote !== "'") throw new Error("Renderer HTML script attributes must be quoted");
+      const valueEnd = tag.indexOf(quote, cursor + 1);
+      if (valueEnd < 0) throw new Error("Renderer HTML has an unterminated script attribute");
+      value = tag.slice(cursor + 1, valueEnd);
+      cursor = valueEnd + 1;
+    }
+    const values = attributes.get(name) ?? [];
+    values.push(value);
+    attributes.set(name, values);
+  }
+  throw new Error("Renderer HTML has an unterminated script tag");
+}
+
+export async function validateBootstrapEvidence({ root = repoRoot } = {}) {
+  const catalog = JSON.parse(await readFile(path.join(root, "frontend/manifests/renderer-bootstrap.json"), "utf8"));
+  if (!Array.isArray(catalog.artifactVariants) || catalog.artifactVariants.length === 0) {
+    throw new Error("Renderer bootstrap catalog has no checksum-pinned artifact variants");
+  }
+  const variants = [];
+  for (const variant of catalog.artifactVariants) {
+    if (
+      typeof variant?.platform !== "string"
+      || typeof variant.path !== "string"
+      || !/^src\/app\/dist\/renderer\/assets\/[A-Za-z0-9_.-]+\.js$/.test(variant.path)
+      || !/^[0-9a-f]{64}$/.test(variant.sha256)
+      || !Number.isSafeInteger(variant.htmlBytes)
+      || variant.htmlBytes < 0
+      || !/^[0-9a-f]{64}$/.test(variant.htmlSha256)
+    ) {
+      throw new Error("Renderer bootstrap catalog has an invalid artifact variant");
+    }
+    let artifact;
+    try {
+      artifact = await readFile(path.join(root, variant.path));
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
+    const digest = sha256(artifact);
+    if (digest !== variant.sha256) {
+      throw new Error(`Renderer bootstrap artifact hash drifted: ${variant.path}`);
+    }
+    variants.push({ artifact, variant });
+  }
+  if (variants.length !== 1) {
+    throw new Error(`Expected exactly one checksum-pinned renderer bootstrap artifact, found ${variants.length}`);
+  }
+  const [{ artifact, variant }] = variants;
+  const htmlPath = "src/app/dist/renderer/index.html";
+  const htmlBytes = await readFile(path.join(root, htmlPath));
+  if (htmlBytes.byteLength !== variant.htmlBytes || sha256(htmlBytes) !== variant.htmlSha256) {
+    throw new Error(`Renderer bootstrap HTML hash drifted: ${htmlPath}`);
+  }
+  const html = htmlBytes.toString("utf8");
+  if (!Buffer.from(html, "utf8").equals(htmlBytes)) {
+    throw new Error(`Renderer bootstrap HTML is not valid UTF-8: ${htmlPath}`);
+  }
+  const moduleScripts = [];
+  for (const [tag] of html.matchAll(/<script(?=[\t\n\f\r />])[^>]*>/gi)) {
+    const attributes = parseScriptTagAttributes(tag);
+    const types = attributes.get("type") ?? [];
+    if (!types.some(type => typeof type === "string" && type.toLowerCase() === "module")) continue;
+    const sources = attributes.get("src") ?? [];
+    moduleScripts.push(types.length === 1 && sources.length === 1 ? sources[0] : null);
+  }
+  if (moduleScripts.length !== 1 || moduleScripts[0] == null) {
+    throw new Error(`Expected exactly one renderer module entry script, found ${moduleScripts.length}`);
+  }
+  const expectedEntry = `./assets/${path.posix.basename(variant.path)}`;
+  if (moduleScripts[0] !== expectedEntry) {
+    throw new Error(`Renderer bootstrap artifact is not the HTML module entry: expected ${expectedEntry}, found ${moduleScripts[0]}`);
+  }
   const anchors = [
     ...catalog.mount.anchors,
     catalog.runtimeAcquisition.desktop,
@@ -86,11 +178,136 @@ async function validateBootstrapEvidence() {
   ];
   for (const anchor of anchors) {
     const actual = artifact.indexOf(Buffer.from(anchor.needle));
-    if (actual !== anchor.byteOffset) {
+    const repeated = actual < 0 ? -1 : artifact.indexOf(Buffer.from(anchor.needle), actual + Buffer.byteLength(anchor.needle));
+    if (actual !== anchor.byteOffset || repeated >= 0) {
       throw new Error(`Renderer bootstrap anchor drifted: ${anchor.needle} (expected ${anchor.byteOffset}, found ${actual})`);
     }
   }
-  return catalog;
+  return {
+    ...catalog,
+    validatedArtifact: {
+      platform: variant.platform,
+      path: variant.path,
+      bytes: artifact.byteLength,
+      sha256: variant.sha256,
+      indexHtml: {
+        path: htmlPath,
+        bytes: htmlBytes.byteLength,
+        sha256: variant.htmlSha256,
+      },
+    },
+  };
+}
+
+function validateAssetFileName(file, label) {
+  if (typeof file !== "string" || file === "." || file === ".." || !/^[A-Za-z0-9_.-]+$/.test(file)) {
+    throw new Error(`${label} has an invalid file name`);
+  }
+}
+
+function validateManifestDirectory(directory, label) {
+  if (
+    typeof directory !== "string"
+    || directory.length === 0
+    || directory.includes("\\")
+    || path.posix.isAbsolute(directory)
+    || path.posix.normalize(directory) !== directory
+    || directory.split("/").some(part => part === "" || part === "..")
+  ) {
+    throw new Error(`${label} has an invalid relative directory`);
+  }
+}
+
+function validateAssetDescriptor(asset, label) {
+  validateAssetFileName(asset?.file, label);
+  if (!/^[0-9a-f]{64}$/.test(asset?.sha256 ?? "")) {
+    throw new Error(`${label} has an invalid SHA-256`);
+  }
+  if (asset.bytes != null && (!Number.isSafeInteger(asset.bytes) || asset.bytes < 0)) {
+    throw new Error(`${label} has an invalid byte length`);
+  }
+}
+
+export async function resolveRuntimeAssetSource(asset, { root = repoRoot, artifactRoot } = {}) {
+  validateAssetDescriptor(asset, "Renderer runtime asset");
+  validateManifestDirectory(artifactRoot, "Renderer runtime artifact root");
+  if (asset.sources != null && !Array.isArray(asset.sources)) {
+    throw new Error(`Renderer runtime asset sources must be an array: ${asset.file}`);
+  }
+  const candidates = [{
+    platform: "canonical",
+    file: asset.file,
+    bytes: asset.bytes,
+    sha256: asset.sha256,
+    transform: "identity",
+  }];
+  const files = new Set([asset.file]);
+  const platforms = new Set(["canonical"]);
+  for (const source of asset.sources ?? []) {
+    validateAssetDescriptor(source, `Renderer runtime asset source for ${asset.file}`);
+    if (typeof source.platform !== "string" || !/^[A-Za-z0-9_.-]+$/.test(source.platform)) {
+      throw new Error(`Renderer runtime asset source has an invalid platform: ${asset.file}`);
+    }
+    if (!new Set(["identity", "crlf-to-lf"]).has(source.transform)) {
+      throw new Error(`Renderer runtime asset source has an invalid transform: ${asset.file}`);
+    }
+    if (files.has(source.file) || platforms.has(source.platform)) {
+      throw new Error(`Renderer runtime asset has a duplicate source: ${asset.file}`);
+    }
+    files.add(source.file);
+    platforms.add(source.platform);
+    candidates.push(source);
+  }
+  const base = path.resolve(root, ...artifactRoot.split("/"));
+  const relativeBase = path.relative(path.resolve(root), base);
+  if (path.isAbsolute(relativeBase) || relativeBase === ".." || relativeBase.startsWith(`..${path.sep}`)) {
+    throw new Error("Renderer runtime artifact root escapes the repository");
+  }
+  const present = [];
+  for (const candidate of candidates) {
+    let bytes;
+    try {
+      bytes = await readFile(path.join(base, candidate.file));
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
+    validateRuntimeAssetBytes(candidate, bytes);
+    present.push({ bytes, source: candidate });
+  }
+  if (present.length !== 1) {
+    throw new Error(`Expected exactly one checksum-pinned source for renderer runtime asset ${asset.file}, found ${present.length}`);
+  }
+  const [{ bytes: sourceBytes, source }] = present;
+  let outputBytes = sourceBytes;
+  if (source.transform === "crlf-to-lf") {
+    if (!sourceBytes.includes(Buffer.from("\r\n"))) {
+      throw new Error(`Renderer runtime asset source has no CRLF bytes to normalize: ${source.file}`);
+    }
+    const text = sourceBytes.toString("utf8");
+    if (!Buffer.from(text, "utf8").equals(sourceBytes)) {
+      throw new Error(`Renderer runtime asset source is not valid UTF-8: ${source.file}`);
+    }
+    outputBytes = Buffer.from(text.replaceAll("\r\n", "\n"), "utf8");
+    if (outputBytes.includes(Buffer.from("\r"))) {
+      throw new Error(`Renderer runtime asset source contains unsupported carriage returns: ${source.file}`);
+    }
+  }
+  const canonicalAsset = { file: asset.file, bytes: asset.bytes, sha256: asset.sha256 };
+  const record = validateRuntimeAssetBytes(canonicalAsset, outputBytes);
+  return {
+    bytes: outputBytes,
+    record: {
+      ...record,
+      source: {
+        platform: source.platform,
+        file: source.file,
+        bytes: sourceBytes.byteLength,
+        sha256: source.sha256,
+        transform: source.transform,
+      },
+    },
+  };
 }
 
 async function validateCleanGraph() {
@@ -181,10 +398,8 @@ export async function copyRuntimeAssets(rendererRoot) {
   await mkdir(outputAssets, { recursive: true });
   const copied = [];
   for (const asset of [...manifest.assets, ...(manifest.immutableAssets ?? [])]) {
-    const source = path.join(repoRoot, manifest.artifactRoot, asset.file);
-    const bytes = await readFile(source);
-    const record = validateRuntimeAssetBytes(asset, bytes);
-    await cp(source, path.join(outputAssets, asset.file), { preserveTimestamps: true });
+    const { bytes, record } = await resolveRuntimeAssetSource(asset, { artifactRoot: manifest.artifactRoot });
+    await writeFile(path.join(outputAssets, asset.file), bytes);
     copied.push(record);
   }
   return copied;

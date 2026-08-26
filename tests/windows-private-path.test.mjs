@@ -23,6 +23,7 @@ test("Windows credential ACL uses an encoded literal path and verifies the exact
   await writeFile(target, "secret");
   let command;
   try {
+    assert.deepEqual(loaded.module.windowsPowerShellEnvironment({ Path: "trusted", PSModulePath: "pwsh-modules", psmodulepath: "shadow" }), { Path: "trusted" });
     const result = await loaded.module.hardenWindowsPrivatePath(target, {
       platform: "win32",
       powershell: async (executable, args) => {
@@ -31,10 +32,13 @@ test("Windows credential ACL uses an encoded literal path and verifies the exact
       },
     });
     assert.equal(result.accessRuleCount, 3);
-    assert.equal(command.executable, "powershell.exe");
+    const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? process.env.WINDIR ?? "C:\\Windows";
+    assert.equal(command.executable, path.win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"));
     assert.deepEqual(command.args.slice(0, -1), ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand"]);
     const script = Buffer.from(command.args.at(-1), "base64").toString("utf16le");
     assert.doesNotMatch(script, /Dashboard API key/);
+    assert.match(script, /PSModulePath = \[IO\.Path\]::Combine\(\$PSHOME, 'Modules'\)/);
+    assert.match(script, /Import-Module Microsoft\.PowerShell\.Management, Microsoft\.PowerShell\.Security, Microsoft\.PowerShell\.Utility/);
     assert.match(script, /S-1-5-18/);
     assert.match(script, /S-1-5-32-544/);
     assert.match(script, /SetAccessRuleProtection\(\$true, \$false\)/);

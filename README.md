@@ -102,8 +102,9 @@ tool execution across routed conversations.
 
 #### 9Router / OpenAI-compatible setup
 
-Use **9Router 0.4.82 or newer**, then open **Settings → Router** and select
-**OpenAI-compatible / 9Router**. The default API root is
+Use **9Router 0.4.82 or newer**. On a fresh Windows portable profile, choose
+**Configure 9Router** on the sign-in screen; otherwise open **Settings →
+Router**. Select **OpenAI-compatible / 9Router**. The default API root is
 `http://127.0.0.1:20128/v1`. Save the 9Router **proxy/client API key** (not its
 management key), use **Test & load models**, and enter or select the exact model
 ID. Manual model entry remains available because 9Router's `/v1/models` result
@@ -220,14 +221,24 @@ dist/Grok Bot 0.18 Reconstructed-win32-x64/
 `package:win` and `package-windows` are aliases for `package:windows`.
 `smoke:windows` launches the packaged executable with a new temporary profile,
 waits for the clean renderer, and verifies that Router settings are reachable.
-CI performs the same bounded launch on `windows-latest` but discards the binary;
-it does not publish a portable ZIP or release.
+The normal repository check performs the same bounded launch on
+`windows-latest` and discards the binary.
+
+Repository owners can run **Windows owner draft release** after explicitly
+enabling Actions on a new fork. That workflow repeats the source, package, and
+fresh-profile launch checks, creates a ZIP, re-extracts it into a clean temporary
+directory, repeats verification and launch smoke, produces checksums and an
+SBOM, and attaches the exact files to an unpublished Draft Release. It never
+publishes a public release automatically. The draft remains subject to the
+rights and signing review described below.
 
 ### Using 9Router or another OpenAI-compatible local API
 
 Run 9Router separately, create a proxy/client API key in its Dashboard, and use
-the model IDs shown by that Dashboard. In **Settings → Router**, select the
-OpenAI-compatible/9Router provider. The default local endpoint is:
+the model IDs shown by that Dashboard. A fresh Windows portable profile exposes
+**Configure 9Router** before Cursor sign-in; existing profiles can use
+**Settings → Router**. Select the OpenAI-compatible/9Router provider. The
+default local endpoint is:
 
 ```text
 http://127.0.0.1:20128/v1

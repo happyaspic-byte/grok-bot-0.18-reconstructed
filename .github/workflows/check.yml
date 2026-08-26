@@ -45,15 +45,24 @@ jobs:
           cache: npm
       - name: Install the locked dependency graph
         run: npm ci --no-audit --no-fund
-      - name: Verify Windows-specific source boundaries
+      - name: Verify Windows source and publication boundaries
+        shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Set-StrictMode -Version Latest
           npm run typecheck
           npm run source:typecheck
-          npm run test:windows
+          npm test
+          npm run publication:check
       - name: Bootstrap without executing the NSIS carrier
         run: npm run bootstrap:windows
       - name: Build and verify the local unsigned portable directory
+        shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Set-StrictMode -Version Latest
           npm run package:windows
           npm run verify:windows
       - name: Launch a fresh isolated profile and reach Router settings

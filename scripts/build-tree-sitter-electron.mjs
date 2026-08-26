@@ -3,6 +3,8 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+import { withWindowsMsvcNodeGypSettings } from "./lib/node-gyp-environment.mjs";
+
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const electronVersion = "42.1.0";
 const electronAbi = "146";
@@ -41,19 +43,17 @@ if (packageJson.devDependencies?.["node-addon-api"] !== "8.5.0" || packageJson.o
   throw new Error("node-addon-api@8.5.0 must remain both the direct build identity and the global override");
 }
 
-const env = {
+const env = withWindowsMsvcNodeGypSettings({
   ...process.env,
   npm_config_runtime: "electron",
   npm_config_target: electronVersion,
   npm_config_disturl: "https://artifacts.electronjs.org/headers/dist",
-};
-const gyp = process.platform === "win32"
-  ? path.join(repoRoot, "node_modules/.bin/node-gyp.cmd")
-  : path.join(repoRoot, "node_modules/.bin/node-gyp");
+});
+const nodeGypEntry = path.join(repoRoot, "node_modules", "node-gyp", "bin", "node-gyp.js");
 
 for (const packageName of packages) {
   const packageRoot = path.join(repoRoot, "node_modules", packageName);
-  await run(gyp, ["rebuild", "--directory", packageRoot, "--release", "--nodedir", headersDir, "--jobs", "max"], env);
+  await run(process.execPath, [nodeGypEntry, "rebuild", "--directory", packageRoot, "--release", "--nodedir", headersDir, "--jobs", "max"], env);
 }
 
 console.log(JSON.stringify({

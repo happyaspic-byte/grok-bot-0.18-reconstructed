@@ -589,7 +589,12 @@ function useStrictModeSafeDisposal(resource: StrictModeDisposable | null | undef
   useEffect(() => guardRef.current!.attach(resource), [resource]);
 }
 
-function SignInLanding({ account, bridge, onStatus }: { account: CursorAuthStatus; bridge: DesktopBridge; onStatus(status: CursorAuthStatus): void }) {
+function SignInLanding({ account, bridge, onOpenRouterSettings, onStatus }: {
+  account: CursorAuthStatus;
+  bridge: DesktopBridge;
+  onOpenRouterSettings(): void;
+  onStatus(status: CursorAuthStatus): void;
+}) {
   if (account.kind === "logged-in") return null;
   return (
     <div aria-label={UI_TEXT.title} className="sand-onboarding" role="main">
@@ -605,6 +610,10 @@ function SignInLanding({ account, bridge, onStatus }: { account: CursorAuthStatu
           reopenLabel={UI_TEXT.reopenLink}
           signInLabel={UI_TEXT.signIn}
         />
+        <div style={{ alignItems: "center", display: "flex", flexDirection: "column", gap: 8 }}>
+          <small>Using 9Router or another OpenAI-compatible endpoint?</small>
+          <SandButton aria-label="Configure 9Router" onClick={onOpenRouterSettings} size="sm" variant="secondary">Configure 9Router</SandButton>
+        </div>
       </section>
     </div>
   );
@@ -3681,7 +3690,12 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
         bridge={bridge}
         isVisible={accessCoverComposition.isVisible}
       /> : null}
-      {showSignIn && bridge != null && account != null ? <SignInLanding account={account} bridge={bridge} onStatus={setAccount} /> : null}
+      {showSignIn && overlay !== "settings" && bridge != null && account != null ? <SignInLanding
+        account={account}
+        bridge={bridge}
+        onOpenRouterSettings={() => { setSettingsSection("router"); setManageSharedRoomId(null); setOverlay("settings"); }}
+        onStatus={setAccount}
+      /> : null}
       {onboardingOpen && account?.kind === "logged-in" && bridge != null ? <SignedInOnboarding
         accountSlot={account.authId ?? account.email ?? "account"}
         bridge={bridge}

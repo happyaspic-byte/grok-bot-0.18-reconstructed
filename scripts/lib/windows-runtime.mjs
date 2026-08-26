@@ -3,7 +3,7 @@ import { constants, createReadStream } from "node:fs";
 import { createRequire } from "node:module";
 import { access, chmod, cp, lstat, mkdir, open, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { extractFile, listPackage } from "@electron/asar";
+import { extractAsarFile, listAsarPackage } from "./asar-paths.mjs";
 import { cachedWindowsRuntimeDescriptor, cachedWindowsRuntimeRoot, upstreamVersion, upstreamWindowsAsarSha256, windowsInstallerBytes, windowsInstallerSha256 } from "./config.mjs";
 import { getRuntimePlatformSpec, resolveRuntimeLayout } from "./platform-runtime.mjs";
 import { run } from "./process.mjs";
@@ -50,7 +50,7 @@ export async function findWindowsRuntimeRoots(root) {
   await walk(path.resolve(root)); return matches.sort();
 }
 
-const asarJson = (archive, relative) => JSON.parse(Buffer.from(extractFile(archive, relative)).toString("utf8"));
+const asarJson = (archive, relative) => JSON.parse(Buffer.from(extractAsarFile(archive, relative)).toString("utf8"));
 export async function validateWindowsRuntime(input, { origin = "unknown", expectedAsarSha256 = upstreamWindowsAsarSha256 } = {}) {
   const spec = await getRuntimePlatformSpec("win32", "x64"), root = await resolveWindowsRuntimeRoot(input), layout = resolveRuntimeLayout(root, spec);
   await Promise.all([regular(layout.executablePath, "Electron executable"), directory(layout.resourcesPath, "resources"), regular(layout.appAsarPath, "app.asar"), directory(layout.appAsarUnpackedPath, "app.asar.unpacked")]);
@@ -59,7 +59,7 @@ export async function validateWindowsRuntime(input, { origin = "unknown", expect
   const app = asarJson(layout.appAsarPath, "package.json"), native = asarJson(layout.appAsarPath, "dist/deps/runtime-deps-manifest.json");
   if (app.version !== upstreamVersion || app.productName !== "Grok Bot" || app.main !== "dist/electron-main/main.cjs") throw new Error("Unexpected Windows application identity");
   if (native.platform !== "win32" || native.arch !== "x64" || !Array.isArray(native.nodeFiles) || native.nodeFiles.length < 1) throw new Error("Unexpected Windows native dependency manifest");
-  const listing = new Set(listPackage(layout.appAsarPath).map(value => value.replace(/^\/+/, "")));
+  const listing = new Set(listAsarPackage(layout.appAsarPath));
   for (const required of ["dist/electron-main/main.cjs", "dist/host/host-main.cjs", "dist/renderer/index.html", "dist/native/sand-webauthn-signer.exe"]) if (!listing.has(required)) throw new Error(`Windows app.asar is missing ${required}`);
   for (const relative of native.nodeFiles) { const target = path.join(layout.appAsarUnpackedPath, "dist", "deps", ...relative.split("/")); await regular(target, relative); await assertPeX64(target, relative); }
   const signer = path.join(layout.appAsarUnpackedPath, "dist", "native", "sand-webauthn-signer.exe"); await regular(signer, "sand-webauthn-signer.exe"); await assertPeX64(signer, "sand-webauthn-signer.exe");
