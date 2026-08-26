@@ -1,14 +1,14 @@
 import { createHash } from "node:crypto";
 import { cp, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { extractFile, listPackage } from "@electron/asar";
 import { reconstructedUpdaterGuard } from "./build-asar.mjs";
+import { extractAsarFile, listAsarPackage } from "./asar-paths.mjs";
 import { reconstructedWindowsExecutableName, reconstructedWindowsName, reconstructedWindowsPackageName, upstreamWindowsAsarSha256, windowsInstallerSha256 } from "./config.mjs";
 import { assertPeX64, pathExists, sha256File } from "./windows-runtime.mjs";
 
 export const windowsPortableManifestName = "RECONSTRUCTED-PORTABLE.json";
-const normalizedListing = archive => new Set(listPackage(archive).map(value => value.replace(/^\/+/, "")));
-const asarJson = (archive, relative) => JSON.parse(Buffer.from(extractFile(archive, relative)).toString("utf8"));
+const normalizedListing = archive => new Set(listAsarPackage(archive));
+const asarJson = (archive, relative) => JSON.parse(Buffer.from(extractAsarFile(archive, relative)).toString("utf8"));
 const hashBytes = bytes => createHash("sha256").update(bytes).digest("hex");
 
 async function removeUpdaterArtifacts(root) {
@@ -55,13 +55,13 @@ export async function verifyWindowsPortable(root) {
   for (const required of ["package.json", "dist/electron-main/main.cjs", "dist/host/host-main.cjs", "dist/renderer/index.html", "dist/reconstruction-build.json", "dist/runtime-composition-audit.json"]) if (!listing.has(required)) throw new Error(`Reconstructed ASAR is missing ${required}`);
   const packageJson = asarJson(asar, "package.json");
   if (packageJson.name !== reconstructedWindowsPackageName || packageJson.productName !== reconstructedWindowsName || packageJson.sandTrack != null || packageJson.reconstructed?.updates !== "disabled" || packageJson.reconstructed?.protocolRegistration !== "disabled") throw new Error("Windows reconstructed package identity is invalid");
-  const main = Buffer.from(extractFile(asar, "dist/electron-main/main.cjs")).toString("utf8");
+  const main = Buffer.from(extractAsarFile(asar, "dist/electron-main/main.cjs")).toString("utf8");
   for (const marker of ["process.env.SAND_DISABLE_UPDATES = \"1\";", "SAND_DISABLE_PROTOCOL_REGISTRATION = \"1\"", "Grok Bot 0.18 Reconstructed"]) if (!main.includes(marker)) throw new Error(`Electron main lacks Windows safety boundary: ${marker}`);
   for (const marker of ["sand:cli-proxy-status", "cli-proxy-provider.json", "getCliProxyTurnConfig", "hardenWindowsPrivatePath"]) if (!main.includes(marker)) throw new Error(`Electron main does not activate the 9Router security boundary: ${marker}`);
   if (!main.startsWith(reconstructedUpdaterGuard)) throw new Error("Electron main does not start at the reconstructed service boundary");
-  const coordinator = Buffer.from(extractFile(asar, "dist/node-agent-coordinator/main.cjs")).toString("utf8");
+  const coordinator = Buffer.from(extractAsarFile(asar, "dist/node-agent-coordinator/main.cjs")).toString("utf8");
   for (const marker of ["getCliProxyTurnConfig", "SAND_9ROUTER_ENABLE_UNREVIEWED_MCP_TOOLS", "chat/completions"]) if (!coordinator.includes(marker)) throw new Error(`Coordinator does not activate the 9Router route: ${marker}`);
-  const preload = Buffer.from(extractFile(asar, "dist/electron-preload/preload.cjs")).toString("utf8");
+  const preload = Buffer.from(extractAsarFile(asar, "dist/electron-preload/preload.cjs")).toString("utf8");
   if (!preload.includes("sand:cli-proxy-status") || !preload.includes("sand:cli-proxy-save") || !preload.includes("sand:cli-proxy-delete")) throw new Error("Primary preload does not expose the bounded 9Router settings bridge");
   const native = asarJson(asar, "dist/deps/runtime-deps-manifest.json");
   if (native.platform !== "win32" || native.arch !== "x64" || !Array.isArray(native.nodeFiles) || native.nodeFiles.length < 1) throw new Error("Packaged native manifest is not Windows x64");
@@ -77,10 +77,10 @@ export async function verifyWindowsPortable(root) {
   if (provenance.mode !== "clean-source" || provenance.entrypoint !== "frontend/src/main.tsx" || provenance.graph?.forbiddenInputs?.length !== 0 || !Array.isArray(provenance.outputs) || provenance.outputs.length < 1) throw new Error("Windows clean renderer provenance is invalid");
   for (const output of buildManifest.outputs ?? []) {
     if (typeof output.path !== "string" || typeof output.sha256 !== "string") throw new Error("Clean build output provenance is malformed");
-    const bytes = Buffer.from(extractFile(asar, output.path));
+    const bytes = Buffer.from(extractAsarFile(asar, output.path));
     if (bytes.byteLength !== output.bytes || hashBytes(bytes) !== output.sha256) throw new Error(`Clean build output differs from its manifest: ${output.path}`);
   }
-  const rendererIndex = Buffer.from(extractFile(asar, "dist/renderer/index.html")).toString("utf8");
+  const rendererIndex = Buffer.from(extractAsarFile(asar, "dist/renderer/index.html")).toString("utf8");
   if (!/src="\.\/assets\//.test(rendererIndex)) throw new Error("Clean renderer index is not file-relative");
   return { outputRoot, executable, asar, unpacked, manifest, nativeModules: native.nodeFiles.length, rendererFiles: provenance.outputs.length };
 }

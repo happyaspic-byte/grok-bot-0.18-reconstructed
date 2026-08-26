@@ -26,6 +26,10 @@ test("Windows release workflow verifies and launches both the directory and ZIP 
     "node scripts/smoke-windows.mjs --app $roundTripPortable",
     "sha256sum --check SHA256SUMS.txt",
   ]) assert.ok(workflow.includes(command), `missing release gate: ${command}`);
+
+  const publicationCheck = await readFile(path.join(repoRoot, "scripts", "verify-publication-tree.mjs"), "utf8");
+  assert.match(publicationCheck, /process\.platform === "win32" \? "git" : "\/usr\/bin\/git"/);
+  assert.match(publicationCheck, /process\.platform === "win32" \? "tar" : "\/usr\/bin\/tar"/);
 });
 
 test("write permission exists only in the isolated draft creation job", async () => {

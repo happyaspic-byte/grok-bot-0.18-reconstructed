@@ -2,9 +2,8 @@ import { createHash } from "node:crypto";
 import { mkdtemp, readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
 
-import { listPackage, statFile } from "@electron/asar";
-
 import { repoRoot } from "./config.mjs";
+import { listAsarPackage, statAsarFile } from "./asar-paths.mjs";
 import { run } from "./process.mjs";
 
 const unpackedPrefixes = ["dist/deps/", "dist/native/", "dist/node-deps/"];
@@ -48,10 +47,9 @@ function snapshotDiff(before, after) {
 
 async function archiveFileEntries(archivePath) {
   const entries = new Map();
-  for (const raw of listPackage(archivePath)) {
-    const relative = raw.replace(/^\//, "");
+  for (const relative of listAsarPackage(archivePath)) {
     try {
-      const entry = statFile(archivePath, relative);
+      const entry = statAsarFile(archivePath, relative);
       if (typeof entry.size === "number") entries.set(relative, entry);
     } catch {
       // listPackage includes directories; statFile is the file boundary.

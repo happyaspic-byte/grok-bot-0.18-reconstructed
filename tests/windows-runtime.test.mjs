@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { createPackageWithOptions } from "@electron/asar";
 
+import { canonicalAsarPath, extractAsarFile, nativeAsarPath } from "../scripts/lib/asar-paths.mjs";
 import { getRuntimePlatformSpec, resolveRuntimeLayout } from "../scripts/lib/platform-runtime.mjs";
 import { assertPeX64, sha256File, validateWindowsRuntime, windowsInstalledRuntimeCandidates } from "../scripts/lib/windows-runtime.mjs";
 
@@ -60,6 +61,23 @@ test("Windows x64 runtime manifest pins the NSIS carrier, ASAR, and extractor", 
   assert.match(verifier, /Primary preload does not expose the bounded 9Router settings bridge/);
 });
 
+test("ASAR lookups canonicalize both Windows and POSIX archive separators", async () => {
+  assert.equal(canonicalAsarPath("\\dist\\deps\\runtime-deps-manifest.json"), "dist/deps/runtime-deps-manifest.json");
+  assert.equal(canonicalAsarPath("/dist/deps/runtime-deps-manifest.json"), "dist/deps/runtime-deps-manifest.json");
+  assert.equal(nativeAsarPath("dist/deps/runtime-deps-manifest.json"), path.join("dist", "deps", "runtime-deps-manifest.json"));
+
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-asar-path-fixture-"));
+  const source = path.join(temporary, "source");
+  const asar = path.join(temporary, "app.asar");
+  try {
+    await writeFixtureFile(source, "dist/deps/runtime-deps-manifest.json", "fixture\n");
+    await createPackageWithOptions(source, asar, {});
+    assert.equal(Buffer.from(extractAsarFile(asar, "dist/deps/runtime-deps-manifest.json")).toString("utf8"), "fixture\n");
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test("Windows runtime validation proves PE x64 and unpacked native provenance", async () => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-win-runtime-fixture-"));
   const source = path.join(temporary, "source");
@@ -76,12 +94,7 @@ test("Windows runtime validation proves PE x64 and unpacked native provenance", 
     await writeFixtureFile(source, "dist/native/sand-webauthn-signer.exe", fakePeX64());
     await mkdir(resources, { recursive: true });
     await writeFile(path.join(runtime, "Grok Bot.exe"), fakePeX64());
-    // Keep the ASAR fixture independent of host-specific unpackDir glob
-    // semantics, then materialize the native payload exactly where Electron
-    // expects an unpacked Windows package to place it.
-    await createPackageWithOptions(source, asar, {});
-    await writeFixtureFile(`${asar}.unpacked`, "dist/deps/native.node", fakePeX64());
-    await writeFixtureFile(`${asar}.unpacked`, "dist/native/sand-webauthn-signer.exe", fakePeX64());
+    await createPackageWithOptions(source, asar, { unpackDir: "dist/{deps,native}" });
     const expectedAsarSha256 = await sha256File(asar);
     const validated = await validateWindowsRuntime(runtime, { origin: "unit-fixture", expectedAsarSha256 });
     assert.equal(validated.platform, "win32");
