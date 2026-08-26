@@ -48,12 +48,18 @@ test("Windows launch smoke uses the credential-independent first-run Router entr
   const surface = await readFile(path.join(repoRoot, "frontend", "src", "recovered", "features", "settings", "overlay", "desktop-surface.tsx"), "utf8");
   const firstRun = smoke.indexOf("configure 9router");
   const provider = smoke.indexOf("router provider");
-  const option = smoke.indexOf("openai-compatible \\/ 9router");
+  const option = smoke.indexOf("openai-compatible / 9router");
   const backend = smoke.indexOf('value?.provider === "cli-proxy"');
+  const rendererExpressions = [...smoke.matchAll(/await waitForRendererState\(\s*cdp,\s*`([^`]*)`,/g)].map((match) => match[1]);
   assert.ok(firstRun !== -1 && firstRun < provider && provider < option && option < backend);
+  assert.ok(rendererExpressions.length >= 5);
+  for (const expression of rendererExpressions) {
+    assert.doesNotThrow(() => Function(`"use strict"; return (${expression});`), `invalid CDP expression: ${expression}`);
+  }
   assert.match(smoke, /configure\?\.click\(\)/);
   assert.match(smoke, /provider\?\.click\(\)/);
   assert.match(smoke, /option\?\.click\(\)/);
+  assert.match(smoke, /\.trim\(\)\.toLowerCase\(\) === 'openai-compatible \/ 9router'/);
   assert.match(smoke, /input\[aria-label="9Router Base URL"\]/);
   assert.match(renderer, /aria-label="Configure 9Router"/);
   assert.match(renderer, /setSettingsSection\("router"\);[\s\S]{0,120}setOverlay\("settings"\)/);
