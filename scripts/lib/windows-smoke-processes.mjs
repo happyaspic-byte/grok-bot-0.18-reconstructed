@@ -70,10 +70,16 @@ function generationFingerprint(value) {
     : null;
 }
 
+export function redactLocalExecGeneration(value) {
+  return String(value).replace(
+    /--sand-local-exec-generation=(?:"[^"\r\n]*"|'[^'\r\n]*'|[A-Za-z0-9._:-]+)/gi,
+    "--sand-local-exec-generation=[REDACTED]",
+  );
+}
+
 function sanitizeCommandLine(value) {
   if (typeof value !== "string") return null;
-  return value
-    .replace(/--sand-local-exec-generation=(?:"[^"]*"|'[^']*'|\S+)/gi, "--sand-local-exec-generation=[REDACTED]")
+  return redactLocalExecGeneration(value)
     .replace(/[\r\n\u0000-\u001f\u007f]+/g, " ")
     .slice(0, 4_096);
 }

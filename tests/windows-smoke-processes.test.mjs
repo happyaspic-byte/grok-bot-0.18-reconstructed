@@ -6,6 +6,7 @@ import {
   classifyRelatedWindowsProcesses,
   parsePowerShellProcessJson,
   parseWindowsProcessCreationDate,
+  redactLocalExecGeneration,
   terminateVerifiedLocalExecDaemon,
 } from "../scripts/lib/windows-smoke-processes.mjs";
 
@@ -102,6 +103,21 @@ test("only an exact discovery-bound local-exec daemon is an allowed post-exit su
   assert.equal("generationToken" in result.localExecDiscovery, false);
   assert.equal(JSON.stringify(result).includes(generationToken), false);
   assert.match(result.relevantProcesses[0].commandLine, /--sand-local-exec-generation=\[REDACTED\]/);
+});
+
+test("local-exec generation redaction is JSON-safe and idempotent", () => {
+  const raw = JSON.stringify({
+    commandLine: `app.exe --sand-local-exec-generation=${generationToken}`,
+    next: "Grok Bot process",
+  });
+  const redacted = redactLocalExecGeneration(raw);
+  const twice = redactLocalExecGeneration(redacted);
+  assert.equal(twice, redacted);
+  assert.deepEqual(JSON.parse(redacted), {
+    commandLine: "app.exe --sand-local-exec-generation=[REDACTED]",
+    next: "Grok Bot process",
+  });
+  assert.equal(redacted.includes(generationToken), false);
 });
 
 test("out-of-order descendants and any unknown survivor fail the quit classification", () => {

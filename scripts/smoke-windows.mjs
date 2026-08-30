@@ -13,6 +13,7 @@ import { pathExists } from "./lib/windows-runtime.mjs";
 import { verifyWindowsPortable } from "./lib/windows-package.mjs";
 import {
   inspectRelatedWindowsProcesses,
+  redactLocalExecGeneration,
   terminateVerifiedLocalExecDaemon,
 } from "./lib/windows-smoke-processes.mjs";
 
@@ -844,10 +845,9 @@ async function assertCredentialPersistence(temporary, secretCanary, expectedBase
 }
 
 function redactSensitive(value, secretCanary) {
-  return String(value)
+  return redactLocalExecGeneration(value)
     .split(secretCanary).join("[REDACTED-9ROUTER-KEY]")
     .replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]")
-    .replace(/--sand-local-exec-generation=(?:"[^"]*"|'[^']*'|\S+)/gi, "--sand-local-exec-generation=[REDACTED]")
     .replace(/("apiKey"\s*:\s*")[^"]+("?)/gi, "$1[REDACTED]$2");
 }
 

@@ -184,7 +184,7 @@ test("Windows smoke scans persistence for UTF-8 and UTF-16 key canaries and reda
   assert.match(source, /Expected exactly one encrypted 9Router credential document/);
   assert.match(source, /Page\.captureScreenshot/);
   assert.match(source, /\[REDACTED-9ROUTER-KEY\]/);
-  assert.match(source, /--sand-local-exec-generation=\[REDACTED\]/);
+  assert.match(source, /redactLocalExecGeneration\(value\)/);
   assert.match(processSource, /local-exec-daemon\.json/);
   assert.match(processSource, /--sand-local-exec-generation=\[REDACTED\]/);
   assert.doesNotMatch(processSource, /console\.(?:log|error)|process\.stderr\.write/);

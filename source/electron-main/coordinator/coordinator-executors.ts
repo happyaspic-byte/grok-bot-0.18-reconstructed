@@ -452,14 +452,11 @@ export function createCoordinatorControlExecutors(
   };
   const stopUnidentifiedSpawn = async (child: Awaited<ReturnType<typeof native.spawnLocalExecDaemon>>["child"]): Promise<void> => {
     if (child.exitCode !== null || child.signalCode !== null) return;
-    await new Promise<void>((resolve, reject) => {
-      let settled = false;
-      const finish = () => { if (settled) return; settled = true; clearTimeout(forceTimer); clearTimeout(giveUpTimer); resolve(); };
-      child.once("exit", finish);
-      const forceTimer = setTimeout(() => { if (!settled && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); }, 2_000);
-      const giveUpTimer = setTimeout(() => { if (settled) return; settled = true; clearTimeout(forceTimer); reject(new Error(`local-exec child ${child.pid ?? "unknown"} did not exit after owned-handle termination`)); }, 4_000);
-      child.kill("SIGTERM");
-    });
+    if (child.pid === undefined) throw new Error("local-exec unidentified child had no pid for owned-handle termination");
+    await native.terminateProcess(child.pid);
+    if (native.isProcessAlive(child.pid)) {
+      throw new Error(`local-exec child ${child.pid} remained alive after owned-handle termination`);
+    }
   };
 
   return {

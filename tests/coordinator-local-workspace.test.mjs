@@ -1693,3 +1693,118 @@ test("local-exec replacement spawns a new generation only after confirmed predec
   }
 });
 
+test("Windows local-exec identity parsing handles PowerShell dates with an absolute UTF-8 query", async () => {
+  const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
+  try {
+    assert.equal(loaded.module.parseWindowsProcessStartEpochMs("/Date(1788123741538)/"), 1_788_123_741_538);
+    assert.equal(
+      loaded.module.parseWindowsProcessStartEpochMs("2026-08-30T21:02:21.538Z"),
+      Date.parse("2026-08-30T21:02:21.538Z"),
+    );
+
+    let invocation;
+    const commandLine = '"C:\\app\\Grok Bot.exe" "C:\\app\\main.cjs" --sand-local-exec-generation=test-generation';
+    const identity = loaded.module.readProcessIdentity(5_208, "win32", {
+      environment: { SystemRoot: "D:\\Windows" },
+      execFileSync(file, args, options) {
+        invocation = { file, args, options };
+        return JSON.stringify({
+          CreationDate: "2026-08-30T21:02:21.538Z",
+          CommandLine: commandLine,
+        });
+      },
+    });
+    assert.deepEqual(identity, {
+      pid: 5_208,
+      startEpochMs: Date.parse("2026-08-30T21:02:21.538Z"),
+      command: commandLine,
+    });
+    assert.equal(invocation.file, "D:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    assert.deepEqual(invocation.args.slice(0, 4), ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
+    assert.match(invocation.args[4], /OutputEncoding/);
+    assert.match(invocation.args[4], /ToUniversalTime\(\)\.ToString\('o'\)/);
+    assert.equal(invocation.options.encoding, "utf8");
+    assert.equal(invocation.options.windowsHide, true);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("Windows local-exec termination uses absolute taskkill tree force and then verifies exit", async () => {
+  const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
+  try {
+    let invocation;
+    let waitedPid;
+    await loaded.module.terminateProcess(5_208, {
+      platform: "win32",
+      environment: { SystemRoot: "D:\\Windows" },
+      execFileSync(file, args, options) {
+        invocation = { file, args, options };
+        return "";
+      },
+      async waitForExit(pid) { waitedPid = pid; },
+    });
+    assert.deepEqual(invocation, {
+      file: "D:\\Windows\\System32\\taskkill.exe",
+      args: ["/PID", "5208", "/T", "/F"],
+      options: { encoding: "utf8", timeout: 10_000, windowsHide: true },
+    });
+    assert.equal(waitedPid, 5_208);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("Windows local-exec exit verification requires both PID signalling and CIM identity to disappear", async () => {
+  const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
+  try {
+    let identityReads = 0;
+    let delays = 0;
+    await loaded.module.waitForWindowsProcessExit(5_208, {
+      isAlive: () => false,
+      readIdentity: () => {
+        identityReads += 1;
+        return identityReads === 1
+          ? { pid: 5_208, startEpochMs: 1, command: "still present" }
+          : null;
+      },
+      delay: async milliseconds => {
+        assert.equal(milliseconds, 100);
+        delays += 1;
+      },
+    });
+    assert.equal(identityReads, 2);
+    assert.equal(delays, 1);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("unidentified local-exec spawns use the native bounded termination path", async () => {
+  const source = await readFile(
+    path.join(repoRoot, "source/electron-main/coordinator/coordinator-executors.ts"),
+    "utf8",
+  );
+  const helper = source.indexOf("const stopUnidentifiedSpawn = async");
+  const next = source.indexOf("\n  };", helper);
+  assert.ok(helper >= 0 && next > helper);
+  const body = source.slice(helper, next);
+  assert.match(body, /await native\.terminateProcess\(child\.pid\)/);
+  assert.match(body, /native\.isProcessAlive\(child\.pid\)/);
+  assert.doesNotMatch(body, /child\.kill\(/);
+});
+
+test("local-exec process identity accepts a quoted Windows entrypoint without prefix collisions", async () => {
+  const loaded = await loadModule("source/shared/local-exec-process-identity.ts");
+  try {
+    const entry = "C:\\Program Files\\Grok Bot\\local-exec-daemon\\main.cjs";
+    const token = "generation-token";
+    const command = `"C:\\Program Files\\Grok Bot\\Grok Bot.exe" "${entry}" --sand-local-exec-generation=${token}`;
+    assert.equal(loaded.module.commandCarriesLocalExecGeneration(command, entry, token), true);
+    assert.equal(loaded.module.commandCarriesLocalExecGeneration(command, `${entry}-other`, token), false);
+    assert.equal(loaded.module.commandCarriesLocalExecGeneration(command, entry, `${token}-other`), false);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
