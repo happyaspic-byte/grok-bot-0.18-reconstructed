@@ -140,6 +140,7 @@ test("failed unidentified cleanup persists before signalling and blocks a new ex
   let firstSpawnCalls = 0;
   let secondSpawnCalls = 0;
   let terminationCalls = 0;
+  let identityReads = 0;
   try {
     const first = loaded.module.createCoordinatorControlExecutors(controlDependencies({
       ledger,
@@ -156,7 +157,10 @@ test("failed unidentified cleanup persists before signalling and blocks a new ex
           throw new Error("simulated owned-child termination failure");
         },
         isProcessAlive(pid) { return pid === 4_301; },
-        readProcessIdentity() { return null; },
+        readProcessIdentity(pid) {
+          identityReads += 1;
+          return identityReads > 40 ? matchingIdentity(pid, entryRealpath, generationToken) : null;
+        },
         resolveLocalExecDaemonEntryRealpath() { return entryRealpath; },
       },
     }));

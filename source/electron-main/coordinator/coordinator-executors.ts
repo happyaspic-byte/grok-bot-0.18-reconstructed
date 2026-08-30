@@ -565,12 +565,10 @@ export function createCoordinatorControlExecutors(
         await release();
         return;
       }
-      await native.terminateProcess(
-        pid,
-        observed == null
-          ? { allowUnidentifiedOwnedEscalation: true, isUnidentifiedProcessStillOwned: isStillOwned }
-          : { expectedIdentity: observed },
-      );
+      if (observed == null) {
+        throw new Error(`${LOCAL_EXEC_STARTUP_QUARANTINE_REASON}: child ${pid} identity is not readable, so PID-only termination is forbidden`);
+      }
+      await native.terminateProcess(pid, { expectedIdentity: observed });
       if (!isStillOwned() || !native.isProcessAlive(pid) || await inspectAfterFailure()) {
         await release();
         return;

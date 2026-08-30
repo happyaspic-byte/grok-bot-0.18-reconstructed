@@ -2304,9 +2304,10 @@ test("unidentified local-exec spawns use the native bounded termination path", a
   assert.match(body, /unidentifiedSpawnQuarantine\.set\(pid, candidate\)/);
   assert.match(body, /writeStartupQuarantine\(candidate\)/);
   assert.ok(body.indexOf("writeStartupQuarantine(candidate)") < body.indexOf("native.terminateProcess("));
-  assert.match(body, /isUnidentifiedProcessStillOwned: isStillOwned/);
   assert.match(body, /observed == null/);
+  assert.match(body, /PID-only termination is forbidden/);
   assert.match(body, /expectedIdentity: observed/);
+  assert.doesNotMatch(body, /allowUnidentifiedOwnedEscalation/);
   assert.match(body, /startupQuarantineMatchesObserved\(quarantine, observed\)/);
   assert.match(body, /native\.isProcessAlive\(pid\)/);
   assert.match(body, /releaseStartupQuarantine\(quarantine\)/);
