@@ -3199,9 +3199,6 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
     bindSessionOwnedRunner(runner);
     ownedRunners.add(runner);
     builtRunner = runner;
-    // Keep the owner-scoped activation anchor stable while retaining the
-    // single real buildRunner call needed by post-construction projections.
-    // return deps.buildRunner(runnerOptions);
     return runner;
   }
 

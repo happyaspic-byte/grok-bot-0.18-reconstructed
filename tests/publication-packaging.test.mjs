@@ -55,6 +55,31 @@ test("default packaging keeps the polished checksum-pinned renderer", async () =
   assert.match(source, /await buildFidelityReconstructedAsar\(\)/);
 });
 
+test("runtime composition audit tracks the synchronous runner shutdown fence", async () => {
+  const [audit, activation, host, runnerComposition, agentRunner] = await Promise.all([
+    readFile(path.join(repoRoot, "scripts", "audit-runtime-composition.mjs"), "utf8"),
+    readFile(path.join(repoRoot, "scripts", "host-production-activation.mjs"), "utf8"),
+    readFile(path.join(repoRoot, "source", "host", "sand-host.ts"), "utf8"),
+    readFile(path.join(repoRoot, "source", "host", "host-runner-composition.ts"), "utf8"),
+    readFile(path.join(repoRoot, "source", "host", "runner", "sand-agent-runner.ts"), "utf8"),
+  ]);
+  assert.match(host, /const runnerDisposal = runnerComposition\?\.dispose\(\) \?\? Promise\.resolve\(\);/);
+  assert.match(host, /const runnerDisposal = runnerComposition\?\.dispose\(\) \?\? Promise\.resolve\(\);[\s\S]*await optionalMethod\(extensions\.api\("automations"\), "suspendWakes"\)\?\.\(\);[\s\S]*await runnerDisposal;[\s\S]*await optionalMethod\(this\.transcript, "dispose"\)\?\.\(\);[\s\S]*await extensions\.stop\(\);/);
+  assert.match(audit, /const cleanRunnerDisposalStart = anchorFor\(sandHostText, sandHostSource, "const runnerDisposal = runnerComposition\?\.dispose\(\) \?\? Promise\.resolve\(\);"\);/);
+  assert.match(audit, /\{ step: "begin-runner-disposal-before-extension-awaits", anchor: cleanRunnerDisposalStart \}/);
+  assert.match(audit, /const cleanRunnerDisposalDrain = anchorFor\(sandHostText, sandHostSource, "await runnerDisposal;"\);/);
+  assert.match(audit, /\{ step: "dispose-runner-before-extension-stop", anchor: cleanRunnerDisposalDrain \}/);
+  assert.match(audit, /Clean host runner shutdown no longer starts synchronously and drains before transcript and extension disposal/);
+  assert.match(audit, /construct-runner-on-demand[\s\S]*const runner = deps\.buildRunner\(runnerOptions\);/);
+  assert.equal(runnerComposition.match(/const runner = deps\.buildRunner\(runnerOptions\);/g)?.length, 1);
+  assert.doesNotMatch(runnerComposition, /return deps\.buildRunner\(runnerOptions\);/);
+  assert.doesNotMatch(audit, /anchorFor\(sandHostText, sandHostSource, "await this\.runnerComposition\?\.dispose\(\);"\)/);
+  assert.match(activation, /Runner activation evidence is ambiguous/);
+  assert.match(activation, /return this\.#productionTurnRunShell\.run\(prompt, runOptions\);/);
+  assert.doesNotMatch(activation, /sourceNeedleAnchor\("source\/host\/runner\/sand-agent-runner\.ts", "if \(this\.#productionTurnRunShell !== undefined\) \{"\)/);
+  assert.equal(agentRunner.match(/return this\.#productionTurnRunShell\.run\(prompt, runOptions\);/g)?.length, 1);
+});
+
 test("Router settings use the trusted backend and display recorded inference usage", async () => {
   const rendererPatch = await readFile(path.join(repoRoot, "scripts", "lib", "router-renderer-patch.mjs"), "utf8");
   const preload = await readFile(path.join(repoRoot, "source", "electron-preload", "preload.ts"), "utf8");

@@ -387,6 +387,9 @@ async function sourceNeedleAnchor(source, needle) {
   const text = await readFile(path.join(repoRoot, source), "utf8");
   const offset = text.indexOf(needle);
   if (offset < 0) throw new Error(`Runner activation evidence drifted at ${source}: ${needle}`);
+  if (text.indexOf(needle, offset + needle.length) >= 0) {
+    throw new Error(`Runner activation evidence is ambiguous at ${source}: ${needle}`);
+  }
   return { source, line: text.slice(0, offset).split("\n").length, needle };
 }
 
@@ -427,7 +430,7 @@ async function assembleRunnerActivationEvidence(inventory) {
   const providerAnchors = [
     await sourceNeedleAnchor("source/host/runner/turn-agent-composition.ts", "export function createTurnAgentComposition("),
     await sourceNeedleAnchor("source/host/runner/tools/turn-toolset.ts", "export function buildTurnTools("),
-    await sourceNeedleAnchor("source/host/runner/sand-agent-runner.ts", "if (this.#productionTurnRunShell !== undefined) {"),
+    await sourceNeedleAnchor("source/host/runner/sand-agent-runner.ts", "return this.#productionTurnRunShell.run(prompt, runOptions);"),
   ];
   const providerModules = providerAnchors.map(anchor => anchor.source);
   const recoveredProvidersReachable = providerModules.every(source => hostInputs.has(source));
