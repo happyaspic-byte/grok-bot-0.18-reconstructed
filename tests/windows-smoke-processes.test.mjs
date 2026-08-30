@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
   classifyRelatedWindowsProcesses,
   parsePowerShellProcessJson,
   parseWindowsProcessCreationDate,
+  terminateVerifiedLocalExecDaemon,
 } from "../scripts/lib/windows-smoke-processes.mjs";
 
 const launchStartedAtMs = Date.parse("2026-08-30T20:28:35.000Z");
@@ -14,6 +16,7 @@ const userDataDir = "C:\\smoke\\user-data";
 const dataRoot = "C:\\smoke\\sand-data";
 const entryRealpath = "C:\\app\\resources\\app.asar\\dist\\local-exec-daemon\\main.cjs";
 const generationToken = "generation-token";
+const generationFingerprint = createHash("sha256").update(generationToken, "utf8").digest("hex");
 const daemonStartedAt = launchStartedAtMs + 2_000;
 
 function processEntry({
@@ -92,10 +95,13 @@ test("only an exact discovery-bound local-exec daemon is an allowed post-exit su
     startedAt: daemonStartedAt,
     entryRealpath,
     generationTokenPresent: true,
+    generationFingerprint,
     inflightCount: 0,
     identityVerified: true,
   });
   assert.equal("generationToken" in result.localExecDiscovery, false);
+  assert.equal(JSON.stringify(result).includes(generationToken), false);
+  assert.match(result.relevantProcesses[0].commandLine, /--sand-local-exec-generation=\[REDACTED\]/);
 });
 
 test("out-of-order descendants and any unknown survivor fail the quit classification", () => {
@@ -160,3 +166,93 @@ test("PID-only, wrong-generation, stale, and profile-prefix matches never author
   });
   assert.deepEqual(prefixCollision.relevantProcesses, []);
 });
+
+function createTerminationHarness({ snapshots, discoveryValue = discovery() }) {
+  let processSnapshotIndex = 0;
+  let taskkillCalls = 0;
+  const execFileImpl = async executablePath => {
+    if (/powershell\.exe$/i.test(executablePath)) {
+      const snapshot = snapshots[Math.min(processSnapshotIndex, snapshots.length - 1)];
+      processSnapshotIndex += 1;
+      if (snapshot instanceof Error) throw snapshot;
+      return { stdout: JSON.stringify(snapshot), stderr: "" };
+    }
+    if (/taskkill\.exe$/i.test(executablePath)) {
+      taskkillCalls += 1;
+      return { stdout: "", stderr: "" };
+    }
+    throw new Error(`Unexpected executable: ${executablePath}`);
+  };
+  return {
+    options: {
+      rootPid: 8_676,
+      executable,
+      userDataDir,
+      dataRoot,
+      launchStartedAtMs,
+      observedAtMs,
+      execFileImpl,
+      readFileImpl: async () => JSON.stringify(discoveryValue),
+      environment: { SystemRoot: "C:\\Windows" },
+    },
+    taskkillCalls: () => taskkillCalls,
+  };
+}
+
+test("verified daemon termination confirms identity twice and requires an empty post-kill inventory", async () => {
+  const harness = createTerminationHarness({
+    snapshots: [[daemonEntry()], [daemonEntry()], []],
+  });
+  assert.deepEqual(await terminateVerifiedLocalExecDaemon(harness.options), {
+    terminated: true,
+    pid: 1_380,
+  });
+  assert.equal(harness.taskkillCalls(), 1);
+});
+
+test("daemon termination fails closed on inventory errors and missing discovery identity", async () => {
+  const inventoryFailure = createTerminationHarness({
+    snapshots: [new Error("CIM unavailable")],
+  });
+  await assert.rejects(
+    terminateVerifiedLocalExecDaemon(inventoryFailure.options),
+    /Windows process inventory failed: CIM unavailable/,
+  );
+  assert.equal(inventoryFailure.taskkillCalls(), 0);
+
+  const missingDiscovery = createTerminationHarness({
+    snapshots: [[daemonEntry()]],
+    discoveryValue: null,
+  });
+  await assert.rejects(
+    terminateVerifiedLocalExecDaemon(missingDiscovery.options),
+    /refusing an unverified or ambiguously related Windows process/,
+  );
+  assert.equal(missingDiscovery.taskkillCalls(), 0);
+});
+
+test("daemon termination never treats a failed post-kill inventory or another survivor as success", async () => {
+  const postKillInventoryFailure = createTerminationHarness({
+    snapshots: [[daemonEntry()], [daemonEntry()], new Error("post-kill CIM unavailable")],
+  });
+  await assert.rejects(
+    terminateVerifiedLocalExecDaemon(postKillInventoryFailure.options),
+    /After local-exec termination: Windows process inventory failed/,
+  );
+  assert.equal(postKillInventoryFailure.taskkillCalls(), 1);
+
+  const replacement = processEntry({
+    pid: 2_000,
+    parentPid: 1,
+    commandLine: `"${executable}" --type=utility`,
+  });
+  const otherSurvivor = createTerminationHarness({
+    snapshots: [[daemonEntry()], [daemonEntry()], [replacement]],
+  });
+  await assert.rejects(
+    terminateVerifiedLocalExecDaemon(otherSurvivor.options),
+    /exited but other related Windows processes remained/,
+  );
+  assert.equal(otherSurvivor.taskkillCalls(), 1);
+});
+

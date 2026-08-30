@@ -165,13 +165,16 @@ async function settleExitedPortableProcess(launched) {
   let closeError;
   try { await waitForProcessClose(launched.child); }
   catch (error) { closeError = error; }
+  if (!processHasExited(launched.child)) {
+    throw new Error(`${closeError instanceof Error ? `${closeError.message}; ` : ""}packaged root process remained alive`);
+  }
 
   const processState = await inspectRelatedWindowsProcesses({
     rootPid: launched.child?.pid,
     executable: launched.executable,
     userDataDir: launched.userDataDir,
     dataRoot: launched.dataRoot,
-    launchStartedAtMs: launched.launchStartedAtMs,
+    launchStartedAtMs: launched.processInventoryStartedAtMs ?? launched.launchStartedAtMs,
   });
   if (!processState.cleanExitSurvivors) {
     const detail = processState.inventoryError != null
@@ -236,7 +239,7 @@ function appendBoundedLog(logs, chunk) {
   if (currentSize < 1024 * 1024) logs.push(value.slice(0, 1024 * 1024 - currentSize));
 }
 
-async function launchPortable(verified, environment, userDataDir, logs, onLaunch = () => {}) {
+async function launchPortable(verified, environment, userDataDir, logs, onLaunch = () => {}, processInventoryStartedAtMs) {
   await rm(path.join(userDataDir, "DevToolsActivePort"), { force: true }).catch(() => undefined);
   const launchStartedAtMs = Date.now();
   const child = spawn(verified.executable, [
@@ -260,6 +263,9 @@ async function launchPortable(verified, environment, userDataDir, logs, onLaunch
     userDataDir,
     dataRoot: environment.SAND_DATA_ROOT,
     launchStartedAtMs,
+    processInventoryStartedAtMs: Number.isFinite(processInventoryStartedAtMs)
+      ? processInventoryStartedAtMs
+      : launchStartedAtMs,
   };
   // Publish ownership immediately: failures while discovering or mounting the
   // renderer must not orphan an Electron process that still owns this profile.
@@ -898,7 +904,7 @@ async function runBasicSmoke(verified, environment, userDataDir, logs) {
   let launched;
   let failure;
   try {
-    launched = await launchPortable(verified, environment, userDataDir, logs, handle => { launched = handle; });
+    launched = await launchPortable(verified, environment, userDataDir, logs, handle => { launched = handle; }, smokeStartedAtMs);
     await openRouterSettings(launched.cdp);
     await select9RouterProvider(launched.cdp);
     await waitForRendererState(
@@ -927,7 +933,7 @@ async function runBasicSmoke(verified, environment, userDataDir, logs) {
         executable: verified.executable,
         userDataDir,
         dataRoot: environment.SAND_DATA_ROOT,
-        launchStartedAtMs: launched?.launchStartedAtMs ?? smokeStartedAtMs,
+        launchStartedAtMs: launched?.processInventoryStartedAtMs ?? smokeStartedAtMs,
         environment,
       });
     } catch (error) { cleanupErrors.push(error); }
@@ -962,7 +968,7 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     };
 
     phase = "fresh-profile-launch";
-    launched = await launchPortable(verified, environment, userDataDir, logs, handle => { launched = handle; });
+    launched = await launchPortable(verified, environment, userDataDir, logs, handle => { launched = handle; }, smokeStartedAtMs);
     await assertSignedOutLanding(launched.cdp, "Fresh profile did not begin at the real signed-out landing");
     const initial = await launched.cdp.evaluate(`(async () => { const [credential, router, runtime] = await Promise.all([window.desktop.cliProxy.status(), window.desktop.agent.getInferenceRouter(), window.desktop.agent.getBoxRuntime()]); return { configured: credential?.configured === true, provider: router?.provider ?? null, mode: runtime?.mode ?? null }; })()`);
     if (initial?.configured || initial?.provider !== "cursor" || initial?.mode !== "remote") throw new Error(`Fresh profile inherited router state: ${JSON.stringify(initial)}`);
@@ -1100,6 +1106,10 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
       throw new Error("First graceful quit did not leave exactly one identity-verified local-exec daemon");
     }
     const firstDaemonPid = firstExitState.verifiedLocalExecDaemonPid;
+    const firstDaemonGeneration = firstExitState.localExecDiscovery?.generationFingerprint;
+    if (firstDaemonGeneration == null) {
+      throw new Error("First graceful quit did not expose a non-secret local-exec generation fingerprint");
+    }
     launched = undefined;
     phase = "first-container-stopped";
     await assertFakeDockerContainerState(
@@ -1110,7 +1120,7 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     await assertCredentialPersistence(temporary, secretCanary, servers.routerBaseUrl);
 
     phase = "persistent-profile-relaunch";
-    launched = await launchPortable(verified, environment, userDataDir, logs, handle => { launched = handle; });
+    launched = await launchPortable(verified, environment, userDataDir, logs, handle => { launched = handle; }, smokeStartedAtMs);
     await assertLoginFreeWorkspace(launched.cdp, servers.routerBaseUrl, { probe: true });
     const daemonRotationDeadline = Date.now() + 10_000;
     let relaunchedProcessState;
@@ -1122,16 +1132,29 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
         dataRoot: launched.dataRoot,
         launchStartedAtMs: smokeStartedAtMs,
       });
+      const nextDaemonPid = relaunchedProcessState.verifiedLocalExecDaemonPid;
+      const nextDaemonGeneration = relaunchedProcessState.localExecDiscovery?.generationFingerprint;
+      const previousDaemonStillPresent = relaunchedProcessState.relevantProcesses
+        .some(process => process.pid === firstDaemonPid);
       if (
-        relaunchedProcessState.verifiedLocalExecDaemonPid != null
-        && relaunchedProcessState.verifiedLocalExecDaemonPid !== firstDaemonPid
+        nextDaemonPid != null
+        && nextDaemonPid !== firstDaemonPid
+        && nextDaemonGeneration != null
+        && nextDaemonGeneration !== firstDaemonGeneration
+        && !previousDaemonStillPresent
       ) break;
       await delay(250);
     }
     if (relaunchedProcessState?.verifiedLocalExecDaemonPid == null) {
       throw new Error("Persistent relaunch did not publish an identity-verified local-exec daemon");
     }
-    if (relaunchedProcessState.verifiedLocalExecDaemonPid === firstDaemonPid) {
+    if (relaunchedProcessState.relevantProcesses.some(process => process.pid === firstDaemonPid)) {
+      throw new Error("Persistent relaunch did not retire the previous local-exec daemon");
+    }
+    if (
+      relaunchedProcessState.verifiedLocalExecDaemonPid === firstDaemonPid
+      || relaunchedProcessState.localExecDiscovery?.generationFingerprint === firstDaemonGeneration
+    ) {
       throw new Error("Persistent relaunch reused an idle local-exec daemon instead of rotating its generation");
     }
     phase = "persistent-container-recovered";
@@ -1151,8 +1174,8 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
         .slice(finalQuitRequestIndex)
         .some(request => request.url === "/api/setHostSettings" && request.clearedCliProxyLease === true),
     });
-    if (!finalExitState.onlyExpectedPersistentDaemon) {
-      throw new Error("Final graceful quit did not leave exactly one identity-verified local-exec daemon");
+    if (!finalExitState.cleanExitSurvivors) {
+      throw new Error("Final graceful quit left an unverified related Windows process");
     }
     launched = undefined;
     phase = "final-container-stopped";
@@ -1217,7 +1240,7 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
       executable: verified.executable,
       userDataDir,
       dataRoot: environment.SAND_DATA_ROOT,
-      launchStartedAtMs: launched?.launchStartedAtMs,
+      launchStartedAtMs: launched?.processInventoryStartedAtMs ?? smokeStartedAtMs,
       error,
       harness: servers,
       logs,
@@ -1246,7 +1269,7 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
       executable: verified.executable,
       userDataDir,
       dataRoot: environment.SAND_DATA_ROOT,
-      launchStartedAtMs: launched?.launchStartedAtMs ?? smokeStartedAtMs,
+      launchStartedAtMs: smokeStartedAtMs,
       environment,
     }));
     await cleanup("close gateway harness", async () => closeServer(servers?.gateway, "gateway harness"));

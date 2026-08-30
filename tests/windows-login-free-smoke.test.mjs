@@ -63,7 +63,10 @@ test("Windows packaged smoke exercises the complete signed-out 9Router setup in 
   assert.match(source, /process exited before its final 9Router credential lease revocation was acknowledged/);
   assert.match(source, /forced process cleanup was used only after failure/);
   assert.match(source, /firstExitState\.onlyExpectedPersistentDaemon/);
-  assert.match(source, /finalExitState\.onlyExpectedPersistentDaemon/);
+  assert.match(source, /finalExitState\.cleanExitSurvivors/);
+  assert.match(source, /previousDaemonStillPresent/);
+  assert.match(source, /generationFingerprint/);
+  assert.match(source, /Persistent relaunch did not retire the previous local-exec daemon/);
   assert.match(source, /Persistent relaunch reused an idle local-exec daemon/);
 });
 
@@ -154,9 +157,14 @@ test("Windows smoke preserves the basic and --app entrypoints while defaulting C
   assert.match(source, /await waitForProcessClose\(launched\.child\)/);
   assert.match(source, /setTimeout\([\s\S]{0,180}Timed out waiting for packaged process close[\s\S]{0,180}closed\.then\(\(\) => \{ clearTimeout\(timeout\); resolve\(\); \}\)/);
   assert.match(source, /Timed out waiting for packaged process close/);
+  assert.match(source, /packaged root process remained alive/);
   assert.match(processSource, /Get-CimInstance Win32_Process/);
   assert.match(processSource, /const relatedPids = new Set/);
   assert.match(processSource, /onlyExpectedPersistentDaemon/);
+  assert.match(processSource, /assertUsableInventory/);
+  assert.match(processSource, /Immediately before local-exec termination/);
+  assert.match(processSource, /observed\.relevantProcesses\.length === 0/);
+  assert.match(source, /processInventoryStartedAtMs/);
   assert.match(source, /settleExitedPortableProcess/);
   assert.match(source, /terminateVerifiedLocalExecDaemon/);
   assert.match(source, /Basic Windows smoke cleanup also failed/);
@@ -178,6 +186,7 @@ test("Windows smoke scans persistence for UTF-8 and UTF-16 key canaries and reda
   assert.match(source, /\[REDACTED-9ROUTER-KEY\]/);
   assert.match(source, /--sand-local-exec-generation=\[REDACTED\]/);
   assert.match(processSource, /local-exec-daemon\.json/);
+  assert.match(processSource, /--sand-local-exec-generation=\[REDACTED\]/);
   assert.doesNotMatch(processSource, /console\.(?:log|error)|process\.stderr\.write/);
   assert.match(source, /Windows smoke relevant process inventory \(redacted\)/);
   assert.match(source, /Refusing to write an unredacted Windows smoke failure artifact/);

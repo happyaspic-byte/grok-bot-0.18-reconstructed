@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -63,6 +64,32 @@ function normalizeProcess(entry) {
   };
 }
 
+function generationFingerprint(value) {
+  return typeof value === "string" && value.length > 0
+    ? createHash("sha256").update(value, "utf8").digest("hex")
+    : null;
+}
+
+function sanitizeCommandLine(value) {
+  if (typeof value !== "string") return null;
+  return value
+    .replace(/--sand-local-exec-generation=(?:"[^"]*"|'[^']*'|\S+)/gi, "--sand-local-exec-generation=[REDACTED]")
+    .replace(/[\r\n\u0000-\u001f\u007f]+/g, " ")
+    .slice(0, 4_096);
+}
+
+function sanitizeProcess(entry) {
+  return {
+    pid: entry.pid,
+    parentPid: entry.parentPid,
+    name: entry.name,
+    executablePath: entry.executablePath,
+    commandLine: sanitizeCommandLine(entry.commandLine),
+    creationDate: entry.creationDate,
+    creationEpochMs: entry.creationEpochMs,
+  };
+}
+
 function sanitizeDiscovery(discovery, identityVerified) {
   if (discovery == null || !Number.isInteger(discovery.pid) || discovery.pid <= 0) return null;
   return {
@@ -70,6 +97,7 @@ function sanitizeDiscovery(discovery, identityVerified) {
     startedAt: typeof discovery.startedAt === "number" ? discovery.startedAt : null,
     entryRealpath: typeof discovery.entryRealpath === "string" ? discovery.entryRealpath : null,
     generationTokenPresent: typeof discovery.generationToken === "string" && discovery.generationToken.length > 0,
+    generationFingerprint: generationFingerprint(discovery.generationToken),
     inflightCount: Number.isInteger(discovery.inflightCount) ? discovery.inflightCount : null,
     identityVerified,
   };
@@ -107,7 +135,7 @@ export function classifyRelatedWindowsProcesses({
 
   const executableKey = normalizeWindowsPath(executable);
   const profileArgument = typeof userDataDir === "string" && userDataDir.length > 0
-    ? `--user-data-dir=${userDataDir}`
+    ? `--user-data-dir=${userDataDir}`.toLowerCase()
     : null;
   const discoveryPid = Number.isInteger(localExecDiscovery?.pid) ? localExecDiscovery.pid : null;
   const relevantProcesses = rows.filter(entry =>
@@ -118,7 +146,7 @@ export function classifyRelatedWindowsProcesses({
         && normalizeWindowsPath(entry.executablePath) === executableKey)
       || (inLaunchWindow(entry)
         && profileArgument != null
-        && commandContainsExactArgument(entry.commandLine, profileArgument))
+        && commandContainsExactArgument(entry.commandLine?.toLowerCase(), profileArgument))
   ).sort((left, right) => left.pid - right.pid);
 
   let verifiedDaemon = null;
@@ -142,7 +170,7 @@ export function classifyRelatedWindowsProcesses({
       candidate != null
       && normalizeWindowsPath(candidate.executablePath) === executableKey
       && entryKey.length > 0
-      && commandKey.includes(entryKey)
+      && commandContainsExactArgument(commandKey, entryKey)
       && commandContainsExactArgument(
         candidate.commandLine,
         `${LOCAL_EXEC_GENERATION_TOKEN_ARG}${localExecDiscovery.generationToken}`,
@@ -151,15 +179,15 @@ export function classifyRelatedWindowsProcesses({
     ) verifiedDaemon = candidate;
   }
 
-  const unexpectedProcesses = relevantProcesses.filter(entry => entry.pid !== verifiedDaemon?.pid);
+  const unexpectedProcessRows = relevantProcesses.filter(entry => entry.pid !== verifiedDaemon?.pid);
   const onlyExpectedPersistentDaemon = verifiedDaemon != null
     && relevantProcesses.length === 1
-    && unexpectedProcesses.length === 0;
+    && unexpectedProcessRows.length === 0;
   return {
     rootPid: Number.isInteger(rootPid) ? rootPid : null,
     localExecDiscovery: sanitizeDiscovery(localExecDiscovery, verifiedDaemon != null),
-    relevantProcesses,
-    unexpectedProcesses,
+    relevantProcesses: relevantProcesses.map(sanitizeProcess),
+    unexpectedProcesses: unexpectedProcessRows.map(sanitizeProcess),
     verifiedLocalExecDaemonPid: verifiedDaemon?.pid ?? null,
     onlyExpectedPersistentDaemon,
     cleanExitSurvivors: relevantProcesses.length === 0 || onlyExpectedPersistentDaemon,
@@ -227,31 +255,67 @@ export async function inspectRelatedWindowsProcesses({
   }
 }
 
+function assertUsableInventory(state, operation) {
+  if (state.inventoryError != null) {
+    throw new Error(`${operation}: Windows process inventory failed: ${state.inventoryError}`);
+  }
+}
+
+function assertOnlyVerifiedDaemon(state, operation) {
+  assertUsableInventory(state, operation);
+  if (
+    state.localExecDiscovery == null
+    || state.verifiedLocalExecDaemonPid == null
+    || !state.onlyExpectedPersistentDaemon
+    || state.unexpectedProcesses.length > 0
+  ) throw new Error(`${operation}: refusing an unverified or ambiguously related Windows process`);
+}
+
 export async function terminateVerifiedLocalExecDaemon(options) {
   const state = await inspectRelatedWindowsProcesses(options);
-  if (state.localExecDiscovery == null || state.relevantProcesses.length === 0) return { terminated: false };
-  if (
-    state.inventoryError != null
-    || state.verifiedLocalExecDaemonPid == null
-    || state.unexpectedProcesses.length > 0
-  ) throw new Error("Refusing to terminate an unverified or ambiguously related Windows process");
+  assertUsableInventory(state, "Before local-exec cleanup");
+  if (state.relevantProcesses.length === 0) return { terminated: false };
+  assertOnlyVerifiedDaemon(state, "Before local-exec cleanup");
+
+  const targetPid = state.verifiedLocalExecDaemonPid;
+  const confirmed = await inspectRelatedWindowsProcesses(options);
+  assertUsableInventory(confirmed, "Immediately before local-exec termination");
+  if (confirmed.relevantProcesses.length === 0) return { terminated: false };
+  assertOnlyVerifiedDaemon(confirmed, "Immediately before local-exec termination");
+  if (confirmed.verifiedLocalExecDaemonPid !== targetPid) {
+    throw new Error("Refusing local-exec termination because the verified PID changed");
+  }
+
   const taskkill = path.win32.join(
     options.environment?.SystemRoot ?? options.environment?.SYSTEMROOT ?? process.env.SystemRoot ?? "C:\\Windows",
     "System32",
     "taskkill.exe",
   );
-  const targetPid = state.verifiedLocalExecDaemonPid;
-  await (options.execFileImpl ?? execFileAsync)(
-    taskkill,
-    ["/PID", String(targetPid), "/T", "/F"],
-    { timeout: 10_000, windowsHide: true },
-  );
+  let taskkillError;
+  try {
+    await (options.execFileImpl ?? execFileAsync)(
+      taskkill,
+      ["/PID", String(targetPid), "/T", "/F"],
+      { timeout: 10_000, windowsHide: true },
+    );
+  } catch (error) {
+    taskkillError = error;
+  }
+
   for (let attempt = 0; attempt < 10; attempt += 1) {
     const observed = await inspectRelatedWindowsProcesses(options);
-    if (!observed.relevantProcesses.some(process => process.pid === targetPid)) {
+    assertUsableInventory(observed, "After local-exec termination");
+    if (observed.relevantProcesses.length === 0) {
       return { terminated: true, pid: targetPid };
     }
-    await new Promise(resolve => setTimeout(resolve, 250));
+    const targetStillPresent = observed.relevantProcesses.some(process => process.pid === targetPid);
+    if (!targetStillPresent) {
+      throw new Error(`Verified local-exec daemon ${targetPid} exited but other related Windows processes remained`);
+    }
+    if (attempt < 9) await new Promise(resolve => setTimeout(resolve, 250));
   }
-  throw new Error(`Verified local-exec daemon ${targetPid} remained alive after taskkill`);
+  const suffix = taskkillError == null
+    ? ""
+    : `: taskkill failed: ${taskkillError instanceof Error ? taskkillError.message : String(taskkillError)}`;
+  throw new Error(`Verified local-exec daemon ${targetPid} remained alive after taskkill${suffix}`);
 }

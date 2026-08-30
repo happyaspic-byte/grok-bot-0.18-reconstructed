@@ -1544,3 +1544,152 @@ test("native Computer daemon wrapper is valid bash and non-root terminal paths f
     await rm(temporary, { recursive: true, force: true });
   }
 });
+
+function inertLocalExecPollingPolicy() {
+  return { start() { return { dispose() {} }; } };
+}
+
+function localExecIdentity(pid, startEpochMs, entryRealpath, generationToken) {
+  return {
+    pid,
+    startEpochMs,
+    entryRealpath,
+    generationToken,
+    command: `${entryRealpath} --sand-local-exec-generation=${generationToken}`,
+  };
+}
+
+test("local-exec replacement fails closed when a verified predecessor refuses termination", async () => {
+  const loaded = await loadModule("source/node-agent-coordinator/local-exec/supervisor.ts");
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-supervisor-"));
+  const discoveryPath = path.join(temporary, "local-exec-daemon.json");
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const predecessor = localExecIdentity(4_101, 1_000, entryRealpath, "old-generation");
+  const descriptor = {
+    pid: predecessor.pid,
+    startedAt: 2_000,
+    entryRealpath,
+    generationToken: predecessor.generationToken,
+    inflightCount: 0,
+  };
+  let spawnCalls = 0;
+  let terminationCalls = 0;
+  try {
+    await writeFile(discoveryPath, JSON.stringify(descriptor), "utf8");
+    const supervisor = loaded.module.createLocalExecDaemonSupervisor({
+      dataDir: temporary,
+      isPackaged: true,
+      refreshPolicy: inertLocalExecPollingPolicy(),
+      livenessPolicy: inertLocalExecPollingPolicy(),
+      now: () => 3_000,
+      control: {
+        async resolveGatewayConnection() { return { endpoint: "loopback" }; },
+        async mintLocalExecDaemonCredential() { return null; },
+        async spawnLocalExecDaemon() {
+          spawnCalls += 1;
+          assert.fail("a live unretired predecessor must block replacement spawn");
+        },
+        async getProcessIdentity({ pid }) { return pid === predecessor.pid ? predecessor : null; },
+        async isProcessAlive({ pid }) { return pid === predecessor.pid; },
+        async terminateProcess({ identity }) {
+          assert.deepEqual(identity, predecessor);
+          terminationCalls += 1;
+          return { terminated: false };
+        },
+        async waitLocalExecDaemonExit() { return await new Promise(() => {}); },
+      },
+    });
+
+    await supervisor.start();
+    assert.equal(spawnCalls, 0);
+    assert.equal(terminationCalls, 1);
+    assert.equal(supervisor.state().phase, "failed");
+    assert.match(supervisor.state().reason, /remained alive after identity-verified termination was refused/);
+    assert.deepEqual(JSON.parse(await readFile(discoveryPath, "utf8")), descriptor);
+    await supervisor.dispose();
+  } finally {
+    await loaded.dispose();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("local-exec replacement spawns a new generation only after confirmed predecessor termination", async () => {
+  const loaded = await loadModule("source/node-agent-coordinator/local-exec/supervisor.ts");
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-supervisor-"));
+  const discoveryPath = path.join(temporary, "local-exec-daemon.json");
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const predecessor = localExecIdentity(4_201, 1_000, entryRealpath, "old-generation");
+  const successor = localExecIdentity(4_202, 3_000, entryRealpath, "new-generation");
+  const predecessorDescriptor = {
+    pid: predecessor.pid,
+    startedAt: 2_000,
+    entryRealpath,
+    generationToken: predecessor.generationToken,
+    inflightCount: 0,
+  };
+  const successorDescriptor = {
+    pid: successor.pid,
+    startedAt: 3_500,
+    entryRealpath,
+    generationToken: successor.generationToken,
+    inflightCount: 0,
+  };
+  const alive = new Set([predecessor.pid]);
+  let spawnCalls = 0;
+  try {
+    await writeFile(discoveryPath, JSON.stringify(predecessorDescriptor), "utf8");
+    const supervisor = loaded.module.createLocalExecDaemonSupervisor({
+      dataDir: temporary,
+      isPackaged: true,
+      refreshPolicy: inertLocalExecPollingPolicy(),
+      livenessPolicy: inertLocalExecPollingPolicy(),
+      now: () => 4_000,
+      delay: async () => {},
+      control: {
+        async resolveGatewayConnection() { return { endpoint: "loopback" }; },
+        async mintLocalExecDaemonCredential() { return null; },
+        async spawnLocalExecDaemon() {
+          assert.equal(alive.has(predecessor.pid), false);
+          spawnCalls += 1;
+          alive.add(successor.pid);
+          await writeFile(discoveryPath, JSON.stringify(successorDescriptor), "utf8");
+          return successor;
+        },
+        async getProcessIdentity({ pid }) {
+          if (!alive.has(pid)) return null;
+          if (pid === predecessor.pid) return predecessor;
+          if (pid === successor.pid) return successor;
+          return null;
+        },
+        async isProcessAlive({ pid }) { return alive.has(pid); },
+        async terminateProcess({ identity }) {
+          assert.deepEqual(identity, predecessor);
+          alive.delete(identity.pid);
+          return { terminated: true };
+        },
+        async waitLocalExecDaemonExit() { return await new Promise(() => {}); },
+      },
+    });
+
+    await supervisor.start();
+    assert.equal(spawnCalls, 1);
+    assert.deepEqual(supervisor.state(), {
+      phase: "active",
+      daemon: {
+        origin: "spawned",
+        pid: successor.pid,
+        startedAt: successorDescriptor.startedAt,
+        processStartEpochMs: successor.startEpochMs,
+        command: successor.command,
+        entryRealpath,
+        generationToken: successor.generationToken,
+      },
+    });
+    assert.deepEqual(JSON.parse(await readFile(discoveryPath, "utf8")), successorDescriptor);
+    await supervisor.dispose();
+  } finally {
+    await loaded.dispose();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+

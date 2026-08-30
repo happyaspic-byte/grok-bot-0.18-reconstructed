@@ -110,7 +110,19 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
   const enqueue = async <T>(work: () => Promise<T>): Promise<T> => { const run = reconciliation.then(work); reconciliation = run.then(() => undefined, () => undefined); return run; };
 
   const currentIdentity = async (expected: ExpectedLocalExecProcessIdentity): Promise<LocalExecProcessIdentity | null> => { const identity = await options.control.getProcessIdentity(expected); return isProcessIdentity(identity) ? identity : null; };
-  const terminateIfStillOwned = async (expected: LocalExecProcessIdentity): Promise<boolean> => (await options.control.terminateProcess({ identity: expected })).terminated;
+  const terminateIfStillOwned = async (expected: LocalExecProcessIdentity): Promise<boolean> => {
+    const result = await options.control.terminateProcess({ identity: expected });
+    if (result.terminated) return true;
+    const observed = await currentIdentity(expected);
+    if (
+      (observed != null && sameLocalExecProcessIdentity(observed, expected))
+      || await options.control.isProcessAlive({ pid: expected.pid })
+    ) {
+      quarantinedIdentity = expected;
+      throw new Error(`local-exec daemon ${expected.pid} remained alive after identity-verified termination was refused`);
+    }
+    return false;
+  };
   const quarantineBlocksSpawn = async (): Promise<boolean> => {
     if (quarantinedIdentity == null) return false;
     const quarantined = quarantinedIdentity;
