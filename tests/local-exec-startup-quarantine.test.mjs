@@ -371,6 +371,7 @@ test("restart reconciliation accepts a matching ready discovery and adopts it wi
     const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
       ledger,
       overrides: {
+        platform: "win32",
         async readLocalExecDaemonDiscovery() {
           return {
             pid: quarantined.pid,
@@ -403,7 +404,7 @@ test("restart reconciliation accepts a matching ready discovery and adopts it wi
       {
         status: "matching",
         identity: { ...exactIdentity, entryRealpath: quarantined.entryRealpath, generationToken: quarantined.generationToken },
-        terminationMode: "none",
+        terminationMode: "win32-stable-handle",
       },
     );
   } finally {
@@ -513,6 +514,7 @@ test("restart readiness confirmation clears an exact disk fence without an inher
     const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
       ledger,
       overrides: {
+        platform: "win32",
         async readLocalExecDaemonDiscovery() {
           return {
             pid: quarantined.pid,
@@ -539,7 +541,7 @@ test("restart readiness confirmation clears an exact disk fence without an inher
     assert.deepEqual(ledger.records, []);
     assert.deepEqual(
       await executors.inspectLocalExecProcessIdentity(identity),
-      { status: "matching", identity, terminationMode: "none" },
+      { status: "matching", identity, terminationMode: "win32-stable-handle" },
     );
   } finally {
     await loaded.dispose();
@@ -700,7 +702,7 @@ test("startup fence write failure cleans the unrecorded child only through its r
   }
 });
 
-test("a live prior-version discovery is retired through a Windows stable handle without a durable fence", async () => {
+test("a live prior-version daemon needs exact main-process discovery before Windows stable-handle retirement", async () => {
   const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
   const oldEntry = "C:\\old-app\\local-exec-daemon\\main.cjs";
   const currentEntry = "C:\\current-app\\local-exec-daemon\\main.cjs";
@@ -711,13 +713,18 @@ test("a live prior-version discovery is retired through a Windows stable handle 
     entryRealpath: oldEntry,
     generationToken,
   };
+  const expected = { ...identity, discoveryStartedAt: 9_950 };
   const ledger = { records: [] };
+  let discovery = null;
   let alive = true;
   let terminationCalls = 0;
   try {
     const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
       ledger,
-      overrides: { platform: "win32" },
+      overrides: {
+        platform: "win32",
+        async readLocalExecDaemonDiscovery() { return discovery; },
+      },
       native: {
         async spawnLocalExecDaemon() { assert.fail("inspection and retirement only"); },
         async terminateProcess(pid, options) {
@@ -735,7 +742,24 @@ test("a live prior-version discovery is retired through a Windows stable handle 
     }));
 
     assert.deepEqual(
-      await executors.inspectLocalExecProcessIdentity(identity),
+      await executors.inspectLocalExecProcessIdentity(expected),
+      { status: "unreadable" },
+    );
+    assert.deepEqual(
+      await executors.terminateProcess({ identity }),
+      { terminated: false },
+    );
+    assert.equal(terminationCalls, 0);
+
+    discovery = {
+      pid: identity.pid,
+      startedAt: expected.discoveryStartedAt,
+      entryRealpath: oldEntry,
+      generationToken,
+      inflightCount: 0,
+    };
+    assert.deepEqual(
+      await executors.inspectLocalExecProcessIdentity(expected),
       {
         status: "matching",
         identity,

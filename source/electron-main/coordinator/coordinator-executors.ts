@@ -672,9 +672,9 @@ export function createCoordinatorControlExecutors(
     }
   };
 
-  const inspectExpectedProcessIdentity = (
+  const inspectExpectedProcessIdentity = async (
     expected: ExpectedLocalExecProcessIdentity,
-  ): ExpectedProcessInspection => {
+  ): Promise<ExpectedProcessInspection> => {
     let observed: NativeLocalExecProcessIdentity | null = null;
     try { observed = native.readProcessIdentity(expected.pid); }
     catch { return { status: "unreadable" }; }
@@ -689,8 +689,31 @@ export function createCoordinatorControlExecutors(
     };
     if (!commandCarriesLocalExecGeneration(observed.command, expected.entryRealpath, expected.generationToken)
       || !expectedMatches(expected, identity)) return { status: "different" };
-    // An exact prior-version entry is not adoptable as the current daemon, but
-    // on Windows its verified stable process handle can retire it before spawn.
+
+    let canonicalEntryRealpath: string;
+    try {
+      canonicalEntryRealpath = (native.resolveLocalExecDaemonEntryRealpath ?? resolveLocalExecDaemonEntryRealpath)();
+    } catch {
+      return { status: "unreadable" };
+    }
+    if (expected.entryRealpath !== canonicalEntryRealpath) {
+      let discovery: LocalExecDiscovery | null;
+      try { discovery = await readDaemonDiscovery(); }
+      catch { return { status: "unreadable" }; }
+      if (discovery == null
+        || expected.discoveryStartedAt === undefined
+        || expected.discoveryStartedAt !== discovery.startedAt
+        || discovery.pid !== expected.pid
+        || discovery.entryRealpath !== expected.entryRealpath
+        || discovery.generationToken !== expected.generationToken
+        || !localExecDiscoveryTimeMatchesProcess(discovery.startedAt, observed.startEpochMs, now())) {
+        return { status: "unreadable" };
+      }
+    }
+
+    // A prior-version entry is not adoptable as the current daemon. Only an
+    // exact main-process discovery record can lend it a Windows stable-handle
+    // termination capability; arbitrary caller-supplied identities cannot.
     ownedDaemonIdentities.set(identity.pid, identity);
     return {
       status: "matching",
