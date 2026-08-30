@@ -263,7 +263,8 @@ test("production renderer unlocks local core while keeping account-only surfaces
   assert.match(renderer, /activateLocalWorkspaceThroughQueue\(\{/);
   assert.match(renderer, /forceFresh,[\s\S]{0,120}queue: localWorkspaceActivationQueueRef\.current/);
   assert.match(renderer, /const claimed = await bridge\.forceGatewayReconnect\(\)/);
-  assert.match(renderer, /await client\.waitForTransportConnected\(20_000\)/);
+  assert.match(renderer, /const portGeneration = client\.getPortGeneration\(\)/);
+  assert.match(renderer, /await client\.waitForTransportConnectedAfterPortGeneration\(portGeneration, 20_000\)/);
   assert.match(renderer, /client\?\.getTransportState\(\) \?\? "down"/);
   assert.match(renderer, /localWorkspaceActivationStateEqual\(observedActivation, activationState\(\)\)/);
   assert.match(renderer, /overlay === "settings" \|\| !localWorkspaceConfigurationReady\(next\)/);
