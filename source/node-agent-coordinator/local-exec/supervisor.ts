@@ -58,7 +58,11 @@ interface LocalExecControl {
   isProcessAlive(args: { readonly pid: number }): Promise<boolean>;
   getProcessIdentity(args: ExpectedLocalExecProcessIdentity): Promise<LocalExecProcessIdentity | null>;
   inspectLocalExecProcessIdentity?(args: ExpectedLocalExecProcessIdentity): Promise<
-    | { readonly status: "matching"; readonly identity: LocalExecProcessIdentity; readonly hasRetainedHandle?: boolean }
+    | {
+        readonly status: "matching";
+        readonly identity: LocalExecProcessIdentity;
+        readonly terminationMode?: "retained-child" | "win32-stable-handle" | "none";
+      }
     | { readonly status: "different" | "absent" | "unreadable" }
   >;
   waitLocalExecDaemonExit(identity: LocalExecProcessIdentity): Promise<{ readonly identity: LocalExecProcessIdentity; readonly exitCode: number | null; readonly signal: string | null }>;
@@ -159,7 +163,11 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
   const inspectQuarantinedProcess = async (
     expected: ExpectedLocalExecProcessIdentity,
   ): Promise<
-    | { readonly status: "matching"; readonly identity: LocalExecProcessIdentity; readonly hasRetainedHandle: boolean }
+    | {
+        readonly status: "matching";
+        readonly identity: LocalExecProcessIdentity;
+        readonly terminationMode: "retained-child" | "win32-stable-handle" | "none";
+      }
     | { readonly status: "different" | "absent" | "unreadable" }
   > => {
     if (options.control.inspectLocalExecProcessIdentity != null) {
@@ -169,7 +177,10 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
           return {
             status: "matching",
             identity: inspected.identity,
-            hasRetainedHandle: inspected.hasRetainedHandle === true,
+            terminationMode: inspected.terminationMode === "retained-child"
+              || inspected.terminationMode === "win32-stable-handle"
+              ? inspected.terminationMode
+              : "none",
           };
         }
         if (inspected.status === "different" || inspected.status === "absent" || inspected.status === "unreadable") return inspected;
@@ -177,7 +188,7 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
       return { status: "unreadable" };
     }
     const observed = await currentIdentity(expected);
-    if (observed != null) return { status: "matching", identity: observed, hasRetainedHandle: true };
+    if (observed != null) return { status: "matching", identity: observed, terminationMode: "retained-child" };
     try { return await options.control.isProcessAlive({ pid: expected.pid }) ? { status: "unreadable" } : { status: "absent" }; }
     catch { return { status: "unreadable" }; }
   };
@@ -347,18 +358,18 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
           ? { ...existing, discoveryStartedAt: existing.startedAt }
           : undefined;
         let identity = expected == null ? null : await currentIdentity(expected);
-        let hasRetainedHandle = true;
+        let terminationMode: "retained-child" | "win32-stable-handle" | "none" = "retained-child";
         if (expected != null) {
           const inspected = await inspectQuarantinedProcess(expected);
           if (inspected.status === "matching") {
             identity = inspected.identity;
-            hasRetainedHandle = inspected.hasRetainedHandle;
+            terminationMode = inspected.terminationMode;
           } else if (inspected.status === "different" || inspected.status === "absent") {
             await removeLocalExecDaemonDiscoveryIfMatches(paths.discoveryPath, existing);
             await spawnDaemon();
             return;
           } else if (identity != null) {
-            hasRetainedHandle = false;
+            terminationMode = "none";
           }
         }
         if (identity == null || !descriptorMatchesProcess(existing, identity, now())) {
@@ -370,7 +381,7 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
           await spawnDaemon();
           return;
         }
-        if ((existing.inflightCount ?? 0) > 0 || !hasRetainedHandle) {
+        if ((existing.inflightCount ?? 0) > 0 || terminationMode === "none") {
           await confirmReadyIdentity(identity);
           clearQuarantine();
           state = { phase: "adopting", pid: existing.pid };
@@ -422,7 +433,25 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
       && discovery.entryRealpath === active.daemon.entryRealpath
       && discovery.generationToken === active.daemon.generationToken) {
       const observed = await currentIdentity(activeIdentity);
-      if (observed != null && sameLocalExecProcessIdentity(observed, activeIdentity)) { missingDiscoveryTicks = 0; consecutiveRespawns = 0; return; }
+      if (observed != null && sameLocalExecProcessIdentity(observed, activeIdentity)) {
+        missingDiscoveryTicks = 0;
+        consecutiveRespawns = 0;
+        if (active.daemon.origin === "adopted" && (discovery.inflightCount ?? 0) === 0) {
+          const inspected = await inspectQuarantinedProcess(activeIdentity);
+          if (inspected.status === "matching" && inspected.terminationMode !== "none") {
+            state = { phase: "replacing", pid: activeIdentity.pid };
+            await terminateIfStillOwned(activeIdentity);
+            const removed = await removeLocalExecDaemonDiscoveryIfMatches(paths.discoveryPath, discovery);
+            state = { phase: "absent" };
+            if (removed) await spawnDaemon();
+          } else if (inspected.status === "different" || inspected.status === "absent") {
+            const removed = await removeLocalExecDaemonDiscoveryIfMatches(paths.discoveryPath, discovery);
+            state = { phase: "absent" };
+            if (removed) await spawnDaemon();
+          }
+        }
+        return;
+      }
       if (await options.control.isProcessAlive({ pid: activeIdentity.pid })) {
         quarantine(activeIdentity.pid, activeIdentity, true);
         missingDiscoveryTicks = 0;

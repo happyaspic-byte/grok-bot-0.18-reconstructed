@@ -17,6 +17,7 @@ async function loadModules() {
     legs: "source/electron-main/coordinator/coordinator-main-legs.ts",
     resync: "source/electron-main/coordinator/coordinator-resync.ts",
     docker: "source/electron-main/box/local-docker-host-connector.ts",
+    stagedUpdateGuard: "source/electron-main/update/staged-update-local-exec-guard.ts",
   };
   await Promise.all(Object.entries(entries).map(async ([name, relative]) => {
     await build({
@@ -301,6 +302,106 @@ test("partial-startup quit bounds a stuck graph disposal after closing Docker in
   } finally {
     await loaded.dispose();
   }
+});
+
+test("staged update waits for verified local-exec shutdown before apply", async () => {
+  const loaded = await loadModules();
+  try {
+    const order = [];
+    const canApply = await loaded.modules.stagedUpdateGuard.settleStagedUpdateLocalExecShutdown({
+      willRunStagedInstallerOnQuit: true,
+      async killLocalExecDaemon() {
+        order.push("kill:start");
+        await Promise.resolve();
+        order.push("kill:done");
+      },
+      reportFailure() { assert.fail("successful shutdown must not report failure"); },
+    });
+    if (canApply) order.push("apply");
+    assert.deepEqual(order, ["kill:start", "kill:done", "apply"]);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("staged update is not applied when local-exec shutdown rejects", async () => {
+  const loaded = await loadModules();
+  try {
+    const reports = [];
+    let applyCount = 0;
+    const canApply = await loaded.modules.stagedUpdateGuard.settleStagedUpdateLocalExecShutdown({
+      willRunStagedInstallerOnQuit: true,
+      async killLocalExecDaemon() { throw new Error("identity verification failed"); },
+      reportFailure(area, leg, error) { reports.push({ area, leg, message: error.message }); },
+    });
+    if (canApply) applyCount += 1;
+    assert.equal(applyCount, 0);
+    assert.deepEqual(reports, [{
+      area: "update",
+      leg: "local-exec-stop",
+      message: "identity verification failed",
+    }]);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("staged update is not applied when local-exec shutdown exceeds the quit deadline", async () => {
+  const loaded = await loadModules();
+  try {
+    const reports = [];
+    let applyCount = 0;
+    const canApply = await loaded.modules.stagedUpdateGuard.settleStagedUpdateLocalExecShutdown({
+      willRunStagedInstallerOnQuit: true,
+      async killLocalExecDaemon() { return await new Promise(() => undefined); },
+      reportFailure(area, leg, error) { reports.push({ area, leg, name: error.name }); },
+      deadline: (step, pending) => loaded.modules.deadline.withDesktopQuitDeadline(step, pending, 5),
+    });
+    if (canApply) applyCount += 1;
+    assert.equal(applyCount, 0);
+    assert.deepEqual(reports, [{
+      area: "update",
+      leg: "local-exec-stop",
+      name: "DesktopQuitDeadlineError",
+    }]);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("staged update is not applied when local-exec shutdown wiring is unavailable", async () => {
+  const loaded = await loadModules();
+  try {
+    const reports = [];
+    const canApply = await loaded.modules.stagedUpdateGuard.settleStagedUpdateLocalExecShutdown({
+      willRunStagedInstallerOnQuit: true,
+      reportFailure(area, leg, error) { reports.push({ area, leg, message: error.message }); },
+    });
+    assert.equal(canApply, false);
+    assert.equal(reports.length, 1);
+    assert.deepEqual({ area: reports[0].area, leg: reports[0].leg }, {
+      area: "update",
+      leg: "local-exec-stop",
+    });
+    assert.match(reports[0].message, /shutdown is unavailable/);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("main quit wiring gates staged apply on successful local-exec shutdown", async () => {
+  const source = await readFile(
+    path.join(repoRoot, "source/electron-main/main-production-services.ts"),
+    "utf8",
+  );
+  assert.match(source, /const canApplyStagedUpdate = await settleStagedUpdateLocalExecShutdown/);
+  assert.match(source, /willRunStagedInstallerOnQuit: update\?\.willRunStagedInstallerOnQuit\?\.\(\) === true/);
+  assert.match(source, /killLocalExecDaemon: bindings\.services\.killLocalExecDaemon/);
+  assert.match(source, /if \(canApplyStagedUpdate\) update\?\.applyStagedOnQuit\?\.\(\)/);
+  assert.doesNotMatch(
+    source,
+    /settleQuitPhase\([\s\S]{0,180}"local-exec-stop"/,
+  );
 });
 
 test("main quit wiring fail-closes the singleton Docker lifecycle during partial startup", async () => {

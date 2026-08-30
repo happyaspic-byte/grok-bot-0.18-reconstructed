@@ -32,6 +32,7 @@ import { wireDesktopUncleanExitSettlement } from "./telemetry/desktop-unclean-ex
 import { settleUncleanExitOnSessionEnd } from "./telemetry/desktop-unclean-exit-telemetry.js";
 import { COORDINATOR_SERVICE_NAME } from "./coordinator/coordinator-launcher.js";
 import { settlePartialDesktopQuit, withDesktopQuitDeadline } from "./quit-deadline.js";
+import { settleStagedUpdateLocalExecShutdown } from "./update/staged-update-local-exec-guard.js";
 import { createWindowChromeEdgePort, type WindowChromeBrowserWindow } from "./window-chrome.js";
 import { createProductionWindowBroadcaster } from "./window-broadcast.js";
 import type { SandUpdateService } from "./update/sand-update-service.js";
@@ -999,15 +1000,14 @@ export function createElectronMainProductionComposition(bindings: ElectronMainPr
           Promise.all([telemetry!.flushBeforeQuit(), numericMetrics?.flush() ?? Promise.resolve()]),
         );
         numericMetrics?.dispose();
-        if (update?.willRunStagedInstallerOnQuit?.() === true) {
-          await settleQuitPhase(
-            "update",
-            "local-exec-stop",
-            "local-exec shutdown",
-            bindings.services.killLocalExecDaemon?.(),
-          );
-        }
-        update?.applyStagedOnQuit?.();
+        const canApplyStagedUpdate = await settleStagedUpdateLocalExecShutdown({
+          willRunStagedInstallerOnQuit: update?.willRunStagedInstallerOnQuit?.() === true,
+          ...(bindings.services.killLocalExecDaemon == null
+            ? {}
+            : { killLocalExecDaemon: bindings.services.killLocalExecDaemon }),
+          reportFailure: bindings.reportFailure,
+        });
+        if (canApplyStagedUpdate) update?.applyStagedOnQuit?.();
         await disposeQuitPhase(telemetry, "telemetry");
         await disposeQuitPhase(productAnalytics, "product-analytics");
         await disposeQuitPhase(update, "update");

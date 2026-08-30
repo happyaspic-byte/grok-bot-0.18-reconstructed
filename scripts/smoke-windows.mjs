@@ -1393,12 +1393,6 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     if (firstDaemonGeneration == null) {
       throw new Error("First graceful quit did not expose a non-secret local-exec generation fingerprint");
     }
-    const firstDaemonProcess = firstExitState.relevantProcesses
-      .find(process => process.pid === firstDaemonPid);
-    const firstDaemonCreationEpochMs = firstDaemonProcess?.creationEpochMs;
-    if (!Number.isFinite(firstDaemonCreationEpochMs)) {
-      throw new Error("First graceful quit did not expose the verified local-exec process creation time");
-    }
     launched = undefined;
     phase = "first-container-stopped";
     await assertFakeDockerContainerState(
@@ -1411,9 +1405,9 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     phase = "persistent-profile-relaunch";
     launched = await launchPortable(verified, environment, userDataDir, logs, handle => { launched = handle; }, smokeStartedAtMs);
     await assertLoginFreeWorkspace(launched.cdp, servers.routerBaseUrl, { probe: true });
-    const daemonAdoptionDeadline = Date.now() + 10_000;
+    const daemonRotationDeadline = Date.now() + 10_000;
     let relaunchedProcessState;
-    while (Date.now() < daemonAdoptionDeadline) {
+    while (Date.now() < daemonRotationDeadline) {
       relaunchedProcessState = await inspectRelatedWindowsProcesses({
         rootPid: launched.child.pid,
         executable: launched.executable,
@@ -1421,32 +1415,30 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
         dataRoot: launched.dataRoot,
         launchStartedAtMs: smokeStartedAtMs,
       });
-      const adoptedDaemon = relaunchedProcessState.relevantProcesses
-        .find(process => process.pid === relaunchedProcessState.verifiedLocalExecDaemonPid);
-      const daemonProcesses = relaunchedProcessState.relevantProcesses
-        .filter(process => process.commandLine?.includes("--sand-local-exec-generation="));
+      const nextDaemonPid = relaunchedProcessState.verifiedLocalExecDaemonPid;
+      const nextDaemonGeneration = relaunchedProcessState.localExecDiscovery?.generationFingerprint;
+      const previousDaemonStillPresent = relaunchedProcessState.relevantProcesses
+        .some(process => process.pid === firstDaemonPid);
       if (
-        relaunchedProcessState.verifiedLocalExecDaemonPid === firstDaemonPid
-        && relaunchedProcessState.localExecDiscovery?.generationFingerprint === firstDaemonGeneration
-        && adoptedDaemon?.creationEpochMs === firstDaemonCreationEpochMs
-        && daemonProcesses.length === 1
+        nextDaemonPid != null
+        && nextDaemonPid !== firstDaemonPid
+        && nextDaemonGeneration != null
+        && nextDaemonGeneration !== firstDaemonGeneration
+        && !previousDaemonStillPresent
       ) break;
       await delay(250);
     }
     if (relaunchedProcessState?.verifiedLocalExecDaemonPid == null) {
       throw new Error("Persistent relaunch did not publish an identity-verified local-exec daemon");
     }
-    const adoptedDaemon = relaunchedProcessState.relevantProcesses
-      .find(process => process.pid === relaunchedProcessState.verifiedLocalExecDaemonPid);
-    const daemonProcesses = relaunchedProcessState.relevantProcesses
-      .filter(process => process.commandLine?.includes("--sand-local-exec-generation="));
+    if (relaunchedProcessState.relevantProcesses.some(process => process.pid === firstDaemonPid)) {
+      throw new Error("Persistent relaunch did not retire the previous local-exec daemon");
+    }
     if (
-      relaunchedProcessState.verifiedLocalExecDaemonPid !== firstDaemonPid
-      || relaunchedProcessState.localExecDiscovery?.generationFingerprint !== firstDaemonGeneration
-      || adoptedDaemon?.creationEpochMs !== firstDaemonCreationEpochMs
-      || daemonProcesses.length !== 1
+      relaunchedProcessState.verifiedLocalExecDaemonPid === firstDaemonPid
+      || relaunchedProcessState.localExecDiscovery?.generationFingerprint === firstDaemonGeneration
     ) {
-      throw new Error("Persistent relaunch did not safely adopt the one exact identity-verified local-exec daemon");
+      throw new Error("Persistent relaunch reused an idle local-exec daemon instead of rotating its generation");
     }
     phase = "relaunch-provider-reconnect";
     const relaunchProviderBaseline = {
@@ -1477,17 +1469,8 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
         .slice(finalQuitRequestIndex)
         .some(request => request.url === "/api/setHostSettings" && request.clearedCliProxyLease === true),
     });
-    if (!finalExitState.onlyExpectedPersistentDaemon) {
-      throw new Error("Final graceful quit did not leave exactly one identity-verified local-exec daemon");
-    }
-    const finalDaemonProcess = finalExitState.relevantProcesses
-      .find(process => process.pid === finalExitState.verifiedLocalExecDaemonPid);
-    if (
-      finalExitState.verifiedLocalExecDaemonPid !== firstDaemonPid
-      || finalExitState.localExecDiscovery?.generationFingerprint !== firstDaemonGeneration
-      || finalDaemonProcess?.creationEpochMs !== firstDaemonCreationEpochMs
-    ) {
-      throw new Error("Final graceful quit changed the safely adopted local-exec daemon identity");
+    if (!finalExitState.cleanExitSurvivors) {
+      throw new Error("Final graceful quit left an unverified related Windows process");
     }
     launched = undefined;
     phase = "final-container-stopped";
@@ -1514,7 +1497,7 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
       throw new Error(`Mock gateway observed an unauthorized or unsupported coordinator request: ${JSON.stringify(servers.gatewayRequests)}`);
     }
     if (servers.gatewayState.localExecRequestConnections < 2 || servers.gatewayState.localExecResponseBatches < 2 || servers.gatewayState.localExecHelloProviders.length < 2) {
-      throw new Error("Persistent local-exec daemon did not complete distinct authenticated provider handshakes across relaunch");
+      throw new Error("Fresh and recovered local-exec daemons did not complete distinct authenticated provider handshakes");
     }
     if (servers.gatewayState.webauthnRequestConnections < 2 || servers.gatewayState.webauthnResponseBatches < 2 || servers.gatewayState.webauthnHelloProviders.length < 2) {
       throw new Error("Fresh and recovered coordinators did not complete distinct authenticated WebAuthn provider handshakes");
@@ -1555,7 +1538,7 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     assertFakeDockerQuitRecoveryLifecycle(dockerCommands);
 
     console.log(`PASS Windows packaged login-free 9Router smoke: ${verified.executable}`);
-    console.log("Fresh profile saved an OS-encrypted credential, loaded models, enforced both readiness blockers, used Save & continue without sign-in, safely adopted its exact persistent local-exec daemon on relaunch, restarted its owned container, and stopped the container again on final quit.");
+    console.log("Fresh profile saved an OS-encrypted credential, loaded models, enforced both readiness blockers, used Save & continue without sign-in, stopped its owned container on quit, restarted it on persistent relaunch, and stopped it again on final quit.");
     console.log("Docker and the bounded gateway control/roster protocol were simulated; live Docker Desktop, Tailscale, VNC, inference turns, and native tool execution remain separate environment tests.");
   } catch (error) {
     await writeFailureArtifacts({

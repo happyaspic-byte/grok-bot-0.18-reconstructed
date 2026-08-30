@@ -135,16 +135,27 @@ export function terminateVerifiedWindowsProcessByHandle(
     readonly environment?: NodeJS.ProcessEnv;
   } = {},
 ): void {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    throw new LocalExecTerminationIdentityError(pid, "is not a positive safe Windows process ID");
+  }
   if (expected.pid !== pid) {
     throw new LocalExecTerminationIdentityError(pid, "does not match the expected Windows process identity");
   }
+  if (!Number.isSafeInteger(expected.startEpochMs) || expected.startEpochMs <= 0) {
+    throw new LocalExecTerminationIdentityError(pid, "has an invalid expected Windows process start time");
+  }
+  if (typeof expected.command !== "string" || expected.command.length === 0) {
+    throw new LocalExecTerminationIdentityError(pid, "has an invalid expected Windows command line");
+  }
   const execute = dependencies.execFileSync ?? execFileSync;
-  const expectedCommandBase64 = Buffer.from(expected.command, "utf8").toString("base64");
   const script = [
     "$ErrorActionPreference = 'Stop'",
     "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
-    `$expectedStart = [Int64]${Math.trunc(expected.startEpochMs)}`,
-    `$expectedCommand = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${expectedCommandBase64}'))`,
+    "$payloadBase64 = [Console]::In.ReadToEnd()",
+    "$expectedJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payloadBase64))",
+    "$expected = $expectedJson | ConvertFrom-Json",
+    "$expectedStart = [Int64]$expected.startEpochMs",
+    "$expectedCommand = [string]$expected.command",
     `$cim = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'`,
     "if ($null -eq $cim) { exit 0 }",
     "$cimStart = [DateTimeOffset]::new($cim.CreationDate.ToUniversalTime()).ToUnixTimeMilliseconds()",
@@ -155,14 +166,26 @@ export function terminateVerifiedWindowsProcessByHandle(
     "  $null = $target.Handle",
     "  $handleStart = [DateTimeOffset]::new($target.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()",
     "  if ($handleStart -ne $expectedStart) { throw 'local-exec identity changed during Windows handle acquisition' }",
+    `  $heldCim = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'`,
+    "  if ($null -eq $heldCim) { throw 'local-exec process exited while its Windows handle was held' }",
+    "  $heldCimStart = [DateTimeOffset]::new($heldCim.CreationDate.ToUniversalTime()).ToUnixTimeMilliseconds()",
+    "  if ($heldCimStart -ne $expectedStart -or [string]$heldCim.CommandLine -cne $expectedCommand) { throw 'local-exec identity changed while its Windows handle was held' }",
     "  $target.Kill()",
     "  if (-not $target.WaitForExit(5000)) { throw 'local-exec process remained alive after Windows handle termination' }",
     "} finally { if ($null -ne $target) { $target.Dispose() } }",
-  ].join("; ");
+  ].join("\n");
   execute(
     resolveWindowsPowerShellPath(dependencies.environment),
     ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
-    { encoding: "utf8", timeout: 10_000, windowsHide: true },
+    {
+      encoding: "utf8",
+      input: Buffer.from(JSON.stringify({
+        startEpochMs: expected.startEpochMs,
+        command: expected.command,
+      }), "utf8").toString("base64"),
+      timeout: 10_000,
+      windowsHide: true,
+    },
   );
 }
 
@@ -209,6 +232,7 @@ export async function terminateProcess(
         ...(deps.environment === undefined ? {} : { environment: deps.environment }),
       });
     } catch (error) {
+      if (error instanceof LocalExecTerminationIdentityError) throw error;
       let observed: LocalExecProcessIdentity | null = null;
       try { observed = readIdentity(pid); } catch {}
       if (observed != null && !sameNativeProcessIdentity(observed, expected)) return;
@@ -324,6 +348,7 @@ export async function killLocalExecDaemon(
     readonly expectedPid?: number;
     readonly expectedEntryRealpath?: string;
     readonly readIdentity?: typeof readProcessIdentity;
+    readonly isAlive?: typeof isProcessAlive;
     readonly terminate?: (
       pid: number,
       options: {
@@ -335,18 +360,66 @@ export async function killLocalExecDaemon(
   } = {},
 ): Promise<void> {
   const existing = await readLocalExecDaemonDiscovery(discoveryPath);
-  if (existing == null || existing.entryRealpath == null || existing.generationToken == null) return;
-  if (deps.expectedPid != null && existing.pid !== deps.expectedPid) return;
+  if (existing == null) return;
+  const alive = deps.isAlive ?? isProcessAlive;
+  const requireAbsent = (reason: string): void => {
+    let processAlive: boolean;
+    try { processAlive = alive(existing.pid); }
+    catch (error) {
+      throw new LocalExecTerminationIdentityError(
+        existing.pid,
+        `${reason}; liveness could not be verified: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (processAlive) throw new LocalExecTerminationIdentityError(existing.pid, reason);
+  };
+  if (existing.entryRealpath == null || existing.generationToken == null) {
+    requireAbsent("has incomplete discovery identity during staged shutdown");
+    return;
+  }
+  if (deps.expectedPid != null && existing.pid !== deps.expectedPid) {
+    requireAbsent(`changed from expected PID ${deps.expectedPid} during staged shutdown`);
+    return;
+  }
   const expectedEntryRealpath = deps.expectedEntryRealpath ?? realpathSync(daemonMainPath());
-  if (existing.entryRealpath !== expectedEntryRealpath) return;
-  const observed = (deps.readIdentity ?? readProcessIdentity)(existing.pid);
-  if (observed == null
-    || !localExecDiscoveryTimeMatchesProcess(existing.startedAt, observed.startEpochMs, (deps.now ?? Date.now)())
-    || !commandCarriesLocalExecGeneration(observed.command, expectedEntryRealpath, existing.generationToken)) return;
+  if (existing.entryRealpath !== expectedEntryRealpath) {
+    requireAbsent("changed daemon entrypoint during staged shutdown");
+    return;
+  }
+  const readIdentity = deps.readIdentity ?? readProcessIdentity;
+  let observed: LocalExecProcessIdentity | null;
+  try { observed = readIdentity(existing.pid); }
+  catch (error) {
+    requireAbsent(`identity was unreadable during staged shutdown: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  if (observed == null) {
+    requireAbsent("remained live without a readable identity during staged shutdown");
+    return;
+  }
+  if (!localExecDiscoveryTimeMatchesProcess(existing.startedAt, observed.startEpochMs, (deps.now ?? Date.now)())
+    || !commandCarriesLocalExecGeneration(observed.command, expectedEntryRealpath, existing.generationToken)) {
+    throw new LocalExecTerminationIdentityError(existing.pid, "changed identity during staged shutdown");
+  }
   const terminationOptions = {
     expectedIdentity: observed,
     allowVerifiedWindowsHandleAcquisition: true as const,
   };
   if (deps.terminate != null) await deps.terminate(existing.pid, terminationOptions);
   else await terminateProcess(existing.pid, terminationOptions);
+
+  let after: LocalExecProcessIdentity | null;
+  try { after = readIdentity(existing.pid); }
+  catch (error) {
+    requireAbsent(`post-termination identity was unreadable: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  if (after != null && sameNativeProcessIdentity(after, observed)) {
+    throw new LocalExecTerminationSignalError(
+      existing.pid,
+      undefined,
+      new Error("the exact local-exec daemon remained live after staged shutdown"),
+    );
+  }
+  if (after == null) requireAbsent("remained live after staged shutdown");
 }

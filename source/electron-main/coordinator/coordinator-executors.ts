@@ -128,6 +128,7 @@ export interface CoordinatorControlExecutorDependencies {
   readonly readLocalExecStartupQuarantines?: () => Promise<readonly LocalExecStartupQuarantine[]>;
   readonly writeLocalExecStartupQuarantine?: (info: LocalExecStartupQuarantine) => Promise<LocalExecStartupQuarantine>;
   readonly clearLocalExecStartupQuarantineIfMatches?: (expected: LocalExecStartupQuarantine) => Promise<boolean>;
+  readonly platform?: NodeJS.Platform;
   readonly now?: () => number;
   readonly delay?: (milliseconds: number) => Promise<void>;
   readonly native?: {
@@ -435,8 +436,23 @@ export function createCoordinatorControlExecutors(
   };
   const daemonExitSettlements = new Map<string, Promise<{ readonly identity: LocalExecProcessIdentity; readonly exitCode: number | null; readonly signal: NodeJS.Signals | null }>>();
   const ownedDaemonIdentities = new Map<number, LocalExecProcessIdentity>();
-  const ownedDaemonChildren = new Map<number, Awaited<ReturnType<typeof spawnLocalExecDaemon>>["child"]>();
+  type OwnedDaemonChild = {
+    readonly identity: LocalExecProcessIdentity;
+    readonly child: Awaited<ReturnType<typeof spawnLocalExecDaemon>>["child"];
+  };
+  const ownedDaemonChildren = new Map<number, OwnedDaemonChild>();
+  const retainedOwnedChild = (
+    identity: LocalExecProcessIdentity,
+  ): OwnedDaemonChild["child"] | undefined => {
+    const registration = ownedDaemonChildren.get(identity.pid);
+    if (registration == null
+      || !sameLocalExecProcessIdentity(registration.identity, identity)
+      || registration.child.exitCode !== null
+      || registration.child.signalCode !== null) return undefined;
+    return registration.child;
+  };
   const unidentifiedSpawnQuarantine = new Map<number, LocalExecStartupQuarantine>();
+  const platform = dependencies.platform ?? process.platform;
   const now = dependencies.now ?? Date.now;
   const delay = dependencies.delay ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
   const startupQuarantineDirectory = getLocalExecStartupQuarantineDirectory();
@@ -457,27 +473,30 @@ export function createCoordinatorControlExecutors(
     && (expected.discoveryStartedAt === undefined || localExecDiscoveryTimeMatchesProcess(expected.discoveryStartedAt, identity.startEpochMs, now()));
   const readOwnedIdentity = (expected: ExpectedLocalExecProcessIdentity): LocalExecProcessIdentity | null => {
     const registered = ownedDaemonIdentities.get(expected.pid);
-    if (registered != null && !expectedMatches(expected, registered)) return null;
-    if (registered == null) {
-      let canonicalEntryRealpath: string;
-      try { canonicalEntryRealpath = (native.resolveLocalExecDaemonEntryRealpath ?? resolveLocalExecDaemonEntryRealpath)(); }
-      catch { return null; }
-      if (expected.entryRealpath !== canonicalEntryRealpath) return null;
+    if (registered != null && expectedMatches(expected, registered)) {
       const observed = native.readProcessIdentity(expected.pid);
-      if (observed == null || !commandCarriesLocalExecGeneration(observed.command, canonicalEntryRealpath, expected.generationToken)) return null;
-      const adopted: LocalExecProcessIdentity = { ...observed, entryRealpath: canonicalEntryRealpath, generationToken: expected.generationToken };
-      if (!expectedMatches(expected, adopted)) return null;
-      ownedDaemonIdentities.set(adopted.pid, adopted);
-      return adopted;
+      if (observed == null || observed.startEpochMs !== registered.startEpochMs || observed.command !== registered.command) return null;
+      if (!commandCarriesLocalExecGeneration(observed.command, registered.entryRealpath, registered.generationToken)) return null;
+      return registered;
     }
+    let canonicalEntryRealpath: string;
+    try { canonicalEntryRealpath = (native.resolveLocalExecDaemonEntryRealpath ?? resolveLocalExecDaemonEntryRealpath)(); }
+    catch { return null; }
+    if (expected.entryRealpath !== canonicalEntryRealpath) return null;
     const observed = native.readProcessIdentity(expected.pid);
-    if (observed == null || observed.startEpochMs !== registered.startEpochMs || observed.command !== registered.command) return null;
-    if (!commandCarriesLocalExecGeneration(observed.command, registered.entryRealpath, registered.generationToken)) return null;
-    return registered;
+    if (observed == null || !commandCarriesLocalExecGeneration(observed.command, canonicalEntryRealpath, expected.generationToken)) return null;
+    const adopted: LocalExecProcessIdentity = { ...observed, entryRealpath: canonicalEntryRealpath, generationToken: expected.generationToken };
+    if (!expectedMatches(expected, adopted)) return null;
+    ownedDaemonIdentities.set(adopted.pid, adopted);
+    return adopted;
   };
   type StartupQuarantineProcessClassification = "match" | "reused" | "ambiguous";
   type ExpectedProcessInspection =
-    | { readonly status: "matching"; readonly identity: LocalExecProcessIdentity; readonly hasRetainedHandle: boolean }
+    | {
+        readonly status: "matching";
+        readonly identity: LocalExecProcessIdentity;
+        readonly terminationMode: "retained-child" | "win32-stable-handle" | "none";
+      }
     | { readonly status: "different" | "absent" | "unreadable" };
   const classifyStartupQuarantineProcess = (
     entry: LocalExecStartupQuarantine,
@@ -494,6 +513,7 @@ export function createCoordinatorControlExecutors(
     unidentifiedSpawnQuarantine.delete(entry.pid);
   };
   const reconcileStartupQuarantine = async (): Promise<void> => {
+    const canonicalEntryRealpath = (native.resolveLocalExecDaemonEntryRealpath ?? resolveLocalExecDaemonEntryRealpath)();
     const blocked: LocalExecStartupQuarantine[] = [];
     for (const entry of await readStartupQuarantines()) {
       let observed: NativeLocalExecProcessIdentity | null = null;
@@ -517,7 +537,8 @@ export function createCoordinatorControlExecutors(
         continue;
       }
       const discovery = await readDaemonDiscovery();
-      if (discovery != null
+      if (entry.entryRealpath === canonicalEntryRealpath
+        && discovery != null
         && discovery.pid === entry.pid
         && discovery.entryRealpath === entry.entryRealpath
         && discovery.generationToken === entry.generationToken
@@ -531,10 +552,19 @@ export function createCoordinatorControlExecutors(
         continue;
       }
       try {
-        const ownedChild = ownedDaemonChildren.get(entry.pid);
+        const startupIdentity: LocalExecProcessIdentity = {
+          ...observed,
+          entryRealpath: entry.entryRealpath,
+          generationToken: entry.generationToken,
+        };
+        const ownedChild = retainedOwnedChild(startupIdentity);
         await native.terminateProcess(entry.pid, {
           expectedIdentity: observed,
-          ...(ownedChild === undefined ? {} : { ownedChild }),
+          ...(ownedChild === undefined
+            ? platform === "win32"
+              ? { allowVerifiedWindowsHandleAcquisition: true as const }
+              : {}
+            : { ownedChild }),
         });
       } catch {}
       let after: NativeLocalExecProcessIdentity | null = null;
@@ -667,7 +697,11 @@ export function createCoordinatorControlExecutors(
     return {
       status: "matching",
       identity,
-      hasRetainedHandle: ownedDaemonChildren.has(identity.pid),
+      terminationMode: retainedOwnedChild(identity) !== undefined
+        ? "retained-child"
+        : platform === "win32"
+          ? "win32-stable-handle"
+          : "none",
     };
   };
 
@@ -753,13 +787,14 @@ export function createCoordinatorControlExecutors(
             && classifyStartupQuarantineProcess(startupQuarantine, observed) === "match") {
             const identity: LocalExecProcessIdentity = { ...observed, entryRealpath, generationToken };
             ownedDaemonIdentities.set(identity.pid, identity);
-            ownedDaemonChildren.set(identity.pid, child);
+            const ownedChildRegistration: OwnedDaemonChild = { identity, child };
+            ownedDaemonChildren.set(identity.pid, ownedChildRegistration);
             const exit = new Promise<{ readonly identity: typeof identity; readonly exitCode: number | null; readonly signal: NodeJS.Signals | null }>((resolve) => {
               if (child.exitCode !== null || child.signalCode !== null) { resolve({ identity, exitCode: child.exitCode, signal: child.signalCode }); return; }
               child.once("exit", (exitCode, signal) => resolve({ identity, exitCode, signal }));
             }).finally(() => {
               if (ownedDaemonIdentities.get(identity.pid) === identity) ownedDaemonIdentities.delete(identity.pid);
-              if (ownedDaemonChildren.get(identity.pid) === child) ownedDaemonChildren.delete(identity.pid);
+              if (ownedDaemonChildren.get(identity.pid) === ownedChildRegistration) ownedDaemonChildren.delete(identity.pid);
             });
             daemonExitSettlements.set(identityKey(identity), exit);
             return identity;
@@ -824,9 +859,14 @@ export function createCoordinatorControlExecutors(
     async terminateProcess({ identity }: { readonly identity: LocalExecProcessIdentity }) {
       const observed = readOwnedIdentity(identity);
       if (observed == null || !sameLocalExecProcessIdentity(observed, identity)) return { terminated: false };
-      const ownedChild = ownedDaemonChildren.get(identity.pid);
-      if (ownedChild === undefined) return { terminated: false };
-      await native.terminateProcess(identity.pid, { expectedIdentity: identity, ownedChild });
+      const ownedChild = retainedOwnedChild(identity);
+      if (ownedChild === undefined && platform !== "win32") return { terminated: false };
+      await native.terminateProcess(identity.pid, {
+        expectedIdentity: identity,
+        ...(ownedChild === undefined
+          ? { allowVerifiedWindowsHandleAcquisition: true as const }
+          : { ownedChild }),
+      });
       const quarantine = unidentifiedSpawnQuarantine.get(identity.pid);
       if (quarantine != null
         && classifyStartupQuarantineProcess(quarantine, identity) === "match") {

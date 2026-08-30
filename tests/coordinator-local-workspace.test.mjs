@@ -1779,7 +1779,7 @@ test("local-exec safely adopts an exact idle predecessor when no retained handle
         async getProcessIdentity({ pid }) { return pid === predecessor.pid ? predecessor : null; },
         async inspectLocalExecProcessIdentity({ pid }) {
           return pid === predecessor.pid
-            ? { status: "matching", identity: predecessor, hasRetainedHandle: false }
+            ? { status: "matching", identity: predecessor, terminationMode: "none" }
             : { status: "absent" };
         },
         async isProcessAlive({ pid }) { return pid === predecessor.pid; },
@@ -1869,9 +1869,9 @@ test("local-exec quarantine releases an unrelated reused PID and recovers withou
           if (pid === predecessor.pid) {
             return predecessorReused
               ? { status: "different" }
-              : { status: "matching", identity: predecessor, hasRetainedHandle: true };
+              : { status: "matching", identity: predecessor, terminationMode: "retained-child" };
           }
-          if (pid === successor.pid && successorAlive) return { status: "matching", identity: successor, hasRetainedHandle: true };
+          if (pid === successor.pid && successorAlive) return { status: "matching", identity: successor, terminationMode: "retained-child" };
           return { status: "absent" };
         },
         async isProcessAlive({ pid }) {
@@ -2072,6 +2072,283 @@ test("local-exec active healing never replaces a live process after a transient 
   }
 });
 
+test("an inflight Windows stable-handle adoption can be paused, retired, and resumed fresh", async () => {
+  const loaded = await loadModule("source/node-agent-coordinator/local-exec/supervisor.ts");
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-supervisor-"));
+  const discoveryPath = path.join(temporary, "local-exec-daemon.json");
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const adopted = localExecIdentity(4_176, 1_000, entryRealpath, "adopted-pause-generation");
+  const successor = localExecIdentity(4_179, 4_000, entryRealpath, "pause-resume-generation");
+  const descriptor = {
+    pid: adopted.pid,
+    startedAt: 2_000,
+    entryRealpath,
+    generationToken: adopted.generationToken,
+    inflightCount: 1,
+  };
+  const successorDescriptor = {
+    pid: successor.pid,
+    startedAt: 4_500,
+    entryRealpath,
+    generationToken: successor.generationToken,
+    inflightCount: 0,
+  };
+  let adoptedAlive = true;
+  let successorAlive = false;
+  let spawnCalls = 0;
+  let terminationCalls = 0;
+  try {
+    await writeFile(discoveryPath, JSON.stringify(descriptor), "utf8");
+    const supervisor = loaded.module.createLocalExecDaemonSupervisor({
+      dataDir: temporary,
+      isPackaged: true,
+      refreshPolicy: inertLocalExecPollingPolicy(),
+      livenessPolicy: inertLocalExecPollingPolicy(),
+      now: () => 5_000,
+      control: {
+        async resolveGatewayConnection() { return { endpoint: "loopback" }; },
+        async mintLocalExecDaemonCredential() { return null; },
+        async reconcileLocalExecStartupQuarantine() { return { blocked: false, reason: null }; },
+        async confirmLocalExecDaemonReady() { return { confirmed: true }; },
+        async spawnLocalExecDaemon() {
+          assert.equal(adoptedAlive, false, "resume must not spawn until the adopted daemon exits");
+          spawnCalls += 1;
+          successorAlive = true;
+          await writeFile(discoveryPath, JSON.stringify(successorDescriptor), "utf8");
+          return successor;
+        },
+        async getProcessIdentity({ pid }) {
+          if (pid === adopted.pid && adoptedAlive) return adopted;
+          if (pid === successor.pid && successorAlive) return successor;
+          return null;
+        },
+        async inspectLocalExecProcessIdentity({ pid }) {
+          if (pid === adopted.pid && adoptedAlive) {
+            return { status: "matching", identity: adopted, terminationMode: "win32-stable-handle" };
+          }
+          if (pid === successor.pid && successorAlive) {
+            return { status: "matching", identity: successor, terminationMode: "retained-child" };
+          }
+          return { status: "absent" };
+        },
+        async isProcessAlive({ pid }) {
+          return (pid === adopted.pid && adoptedAlive) || (pid === successor.pid && successorAlive);
+        },
+        async terminateProcess({ identity }) {
+          terminationCalls += 1;
+          assert.deepEqual(identity, adopted);
+          adoptedAlive = false;
+          return { terminated: true };
+        },
+        async waitLocalExecDaemonExit() { return await new Promise(() => {}); },
+      },
+    });
+
+    await supervisor.start();
+    assert.equal(supervisor.state().phase, "active");
+    assert.equal(supervisor.state().daemon.origin, "adopted");
+    await supervisor.setPaused(true);
+    assert.deepEqual(supervisor.state(), { phase: "absent" });
+    assert.equal(terminationCalls, 1);
+    await assert.rejects(readFile(discoveryPath, "utf8"), error => error?.code === "ENOENT");
+    await supervisor.setPaused(false);
+    assert.equal(spawnCalls, 1);
+    assert.equal(supervisor.state().phase, "active");
+    assert.equal(supervisor.state().daemon.origin, "spawned");
+    assert.equal(supervisor.state().daemon.pid, successor.pid);
+    await supervisor.dispose();
+  } finally {
+    await loaded.dispose();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("an inflight Windows adoption rotates after its published work drains", async () => {
+  const loaded = await loadModule("source/node-agent-coordinator/local-exec/supervisor.ts");
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-supervisor-"));
+  const discoveryPath = path.join(temporary, "local-exec-daemon.json");
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const adopted = localExecIdentity(4_174, 1_000, entryRealpath, "adopted-drain-generation");
+  const successor = localExecIdentity(4_175, 4_000, entryRealpath, "drained-successor-generation");
+  const adoptedDescriptor = {
+    pid: adopted.pid,
+    startedAt: 2_000,
+    entryRealpath,
+    generationToken: adopted.generationToken,
+    inflightCount: 1,
+  };
+  const successorDescriptor = {
+    pid: successor.pid,
+    startedAt: 4_500,
+    entryRealpath,
+    generationToken: successor.generationToken,
+    inflightCount: 0,
+  };
+  const liveness = controlledLocalExecPollingPolicy();
+  let adoptedAlive = true;
+  let successorAlive = false;
+  let spawnCalls = 0;
+  let terminationCalls = 0;
+  try {
+    await writeFile(discoveryPath, JSON.stringify(adoptedDescriptor), "utf8");
+    const supervisor = loaded.module.createLocalExecDaemonSupervisor({
+      dataDir: temporary,
+      isPackaged: true,
+      refreshPolicy: inertLocalExecPollingPolicy(),
+      livenessPolicy: liveness.policy,
+      now: () => 5_000,
+      control: {
+        async resolveGatewayConnection() { return { endpoint: "loopback" }; },
+        async mintLocalExecDaemonCredential() { return null; },
+        async reconcileLocalExecStartupQuarantine() { return { blocked: false, reason: null }; },
+        async confirmLocalExecDaemonReady() { return { confirmed: true }; },
+        async spawnLocalExecDaemon() {
+          assert.equal(adoptedAlive, false, "drained predecessor must exit before successor spawn");
+          spawnCalls += 1;
+          successorAlive = true;
+          await writeFile(discoveryPath, JSON.stringify(successorDescriptor), "utf8");
+          return successor;
+        },
+        async getProcessIdentity({ pid }) {
+          if (pid === adopted.pid && adoptedAlive) return adopted;
+          if (pid === successor.pid && successorAlive) return successor;
+          return null;
+        },
+        async inspectLocalExecProcessIdentity({ pid }) {
+          if (pid === adopted.pid && adoptedAlive) {
+            return { status: "matching", identity: adopted, terminationMode: "win32-stable-handle" };
+          }
+          if (pid === successor.pid && successorAlive) {
+            return { status: "matching", identity: successor, terminationMode: "retained-child" };
+          }
+          return { status: "absent" };
+        },
+        async isProcessAlive({ pid }) {
+          return (pid === adopted.pid && adoptedAlive) || (pid === successor.pid && successorAlive);
+        },
+        async terminateProcess({ identity }) {
+          terminationCalls += 1;
+          assert.deepEqual(identity, adopted);
+          adoptedAlive = false;
+          return { terminated: true };
+        },
+        async waitLocalExecDaemonExit() { return await new Promise(() => {}); },
+      },
+    });
+
+    await supervisor.start();
+    assert.equal(supervisor.state().daemon.origin, "adopted");
+    await writeFile(discoveryPath, JSON.stringify({
+      ...adoptedDescriptor,
+      inflightCount: 0,
+    }), "utf8");
+    await liveness.tick();
+    await liveness.tick();
+    assert.equal(terminationCalls, 1);
+    assert.equal(spawnCalls, 1);
+    assert.equal(supervisor.state().phase, "active");
+    assert.equal(supervisor.state().daemon.origin, "spawned");
+    assert.equal(supervisor.state().daemon.pid, successor.pid);
+    await supervisor.dispose();
+  } finally {
+    await loaded.dispose();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("missing discovery retires an inflight Windows adoption before spawning its successor", async () => {
+  const loaded = await loadModule("source/node-agent-coordinator/local-exec/supervisor.ts");
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-supervisor-"));
+  const discoveryPath = path.join(temporary, "local-exec-daemon.json");
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const adopted = localExecIdentity(4_177, 1_000, entryRealpath, "adopted-missing-generation");
+  const successor = localExecIdentity(4_178, 4_000, entryRealpath, "successor-generation");
+  const adoptedDescriptor = {
+    pid: adopted.pid,
+    startedAt: 2_000,
+    entryRealpath,
+    generationToken: adopted.generationToken,
+    inflightCount: 1,
+  };
+  const successorDescriptor = {
+    pid: successor.pid,
+    startedAt: 4_500,
+    entryRealpath,
+    generationToken: successor.generationToken,
+    inflightCount: 0,
+  };
+  const liveness = controlledLocalExecPollingPolicy();
+  let adoptedAlive = true;
+  let successorAlive = false;
+  let spawnCalls = 0;
+  let terminationCalls = 0;
+  try {
+    await writeFile(discoveryPath, JSON.stringify(adoptedDescriptor), "utf8");
+    const supervisor = loaded.module.createLocalExecDaemonSupervisor({
+      dataDir: temporary,
+      isPackaged: true,
+      refreshPolicy: inertLocalExecPollingPolicy(),
+      livenessPolicy: liveness.policy,
+      now: () => 5_000,
+      control: {
+        async resolveGatewayConnection() { return { endpoint: "loopback" }; },
+        async mintLocalExecDaemonCredential() { return null; },
+        async reconcileLocalExecStartupQuarantine() { return { blocked: false, reason: null }; },
+        async confirmLocalExecDaemonReady() { return { confirmed: true }; },
+        async spawnLocalExecDaemon() {
+          assert.equal(adoptedAlive, false, "the old daemon must be gone before replacement spawn");
+          spawnCalls += 1;
+          successorAlive = true;
+          await writeFile(discoveryPath, JSON.stringify(successorDescriptor), "utf8");
+          return successor;
+        },
+        async getProcessIdentity({ pid }) {
+          if (pid === adopted.pid && adoptedAlive) return adopted;
+          if (pid === successor.pid && successorAlive) return successor;
+          return null;
+        },
+        async inspectLocalExecProcessIdentity({ pid }) {
+          if (pid === adopted.pid && adoptedAlive) {
+            return { status: "matching", identity: adopted, terminationMode: "win32-stable-handle" };
+          }
+          if (pid === successor.pid && successorAlive) {
+            return { status: "matching", identity: successor, terminationMode: "retained-child" };
+          }
+          return { status: "absent" };
+        },
+        async isProcessAlive({ pid }) {
+          return (pid === adopted.pid && adoptedAlive) || (pid === successor.pid && successorAlive);
+        },
+        async terminateProcess({ identity }) {
+          terminationCalls += 1;
+          assert.deepEqual(identity, adopted);
+          adoptedAlive = false;
+          return { terminated: true };
+        },
+        async waitLocalExecDaemonExit() { return await new Promise(() => {}); },
+      },
+    });
+
+    await supervisor.start();
+    assert.equal(supervisor.state().daemon.origin, "adopted");
+    await rm(discoveryPath, { force: true });
+    await liveness.tick();
+    await liveness.tick();
+    await liveness.tick();
+    assert.deepEqual(supervisor.state(), { phase: "absent" });
+    assert.equal(terminationCalls, 1);
+    assert.equal(spawnCalls, 0);
+    await liveness.tick();
+    assert.equal(spawnCalls, 1);
+    assert.equal(supervisor.state().phase, "active");
+    assert.equal(supervisor.state().daemon.origin, "spawned");
+    assert.equal(supervisor.state().daemon.pid, successor.pid);
+    await supervisor.dispose();
+  } finally {
+    await loaded.dispose();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
 test("local-exec pause and resume preserve an unreadable live discovery without spawning", async () => {
   const loaded = await loadModule("source/node-agent-coordinator/local-exec/supervisor.ts");
   const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-supervisor-"));
@@ -2189,7 +2466,7 @@ test("local-exec healing quarantines both generations when successor identity lo
   }
 });
 
-test("local-exec replacement spawns a new generation only after confirmed predecessor termination", async () => {
+test("Windows stable-handle capability rotates an idle predecessor before spawning a new generation", async () => {
   const loaded = await loadModule("source/node-agent-coordinator/local-exec/supervisor.ts");
   const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-supervisor-"));
   const discoveryPath = path.join(temporary, "local-exec-daemon.json");
@@ -2236,6 +2513,24 @@ test("local-exec replacement spawns a new generation only after confirmed predec
           if (pid === predecessor.pid) return predecessor;
           if (pid === successor.pid) return successor;
           return null;
+        },
+        async inspectLocalExecProcessIdentity({ pid }) {
+          if (!alive.has(pid)) return { status: "absent" };
+          if (pid === predecessor.pid) {
+            return {
+              status: "matching",
+              identity: predecessor,
+              terminationMode: "win32-stable-handle",
+            };
+          }
+          if (pid === successor.pid) {
+            return {
+              status: "matching",
+              identity: successor,
+              terminationMode: "retained-child",
+            };
+          }
+          return { status: "different" };
         },
         async isProcessAlive({ pid }) { return alive.has(pid); },
         async terminateProcess({ identity }) {
@@ -2369,13 +2664,44 @@ test("Windows handleless expected-identity termination requires stable-handle op
   }
 });
 
+test("Windows stable-handle termination rejects invalid runtime identities before PowerShell", async () => {
+  const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
+  try {
+    const invalid = [
+      { pid: 5_210.5, startEpochMs: 10, command: "daemon" },
+      { pid: 5_210, startEpochMs: 10.5, command: "daemon" },
+      { pid: 5_210, startEpochMs: 10, command: "" },
+    ];
+    let powershellCalls = 0;
+    for (const expected of invalid) {
+      await assert.rejects(
+        loaded.module.terminateProcess(expected.pid, {
+          platform: "win32",
+          expectedIdentity: expected,
+          allowVerifiedWindowsHandleAcquisition: true,
+          execFileSync() {
+            powershellCalls += 1;
+            return "";
+          },
+          readIdentity: () => expected,
+          isAlive: () => true,
+        }),
+        error => error instanceof loaded.module.LocalExecTerminationIdentityError,
+      );
+    }
+    assert.equal(powershellCalls, 0);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
 test("Windows updater termination acquires and validates a stable process handle in one PowerShell lane", async () => {
   const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
   try {
     const expected = {
       pid: 5_210,
       startEpochMs: 1_788_123_741_538,
-      command: '"C:\\app\\Grok Bot.exe" "C:\\app\\main.cjs" --sand-local-exec-generation=update-generation',
+      command: '"C:\\사용자\\Grok Bot.exe" "C:\\사용자\\main.cjs" --sand-local-exec-generation=update-generation',
     };
     let invocation;
     let waited = false;
@@ -2398,16 +2724,70 @@ test("Windows updater termination acquires and validates a stable process handle
     assert.equal(invocation.file, "D:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
     assert.deepEqual(invocation.args.slice(0, 4), ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
     const script = invocation.args[4];
-    assert.match(script, /Get-CimInstance Win32_Process/);
+    assert.equal((script.match(/Get-CimInstance Win32_Process/g) ?? []).length, 2);
     assert.match(script, /GetProcessById\(5210\)/);
     assert.match(script, /\$null = \$target\.Handle/);
     assert.match(script, /\$target\.StartTime/);
+    assert.match(script, /\$heldCim = Get-CimInstance/);
+    assert.match(script, /\$heldCimStart/);
     assert.match(script, /\$target\.Kill\(\)/);
     assert.match(script, /WaitForExit\(5000\)/);
+    assert.match(script, /\[Console\]::In\.ReadToEnd\(\)/);
+    assert.match(script, /FromBase64String\(\$payloadBase64\)/);
     assert.doesNotMatch(script, /taskkill|Stop-Process|process\.kill/i);
+    assert.doesNotMatch(script, /update-generation/);
+    assert.doesNotMatch(invocation.args.join(" "), /update-generation/);
+    assert.doesNotMatch(script, /try \{;/);
+    assert.deepEqual(
+      JSON.parse(Buffer.from(invocation.options.input, "base64").toString("utf8")),
+      {
+        startEpochMs: expected.startEpochMs,
+        command: expected.command,
+      },
+    );
     assert.equal(invocation.options.windowsHide, true);
+    assert.equal(invocation.options.timeout, 10_000);
     assert.equal(waited, true);
   } finally {
+    await loaded.dispose();
+  }
+});
+
+test("Windows stable-handle termination kills the exact live process without a retained ChildProcess object", {
+  skip: process.platform !== "win32",
+}, async () => {
+  const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 60000)"], {
+    windowsHide: true,
+    stdio: "ignore",
+  });
+  const closed = new Promise((resolve) => child.once("close", (code, signal) => resolve({ code, signal })));
+  try {
+    await new Promise((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    let identity = null;
+    for (let attempt = 0; attempt < 20 && identity == null; attempt += 1) {
+      identity = loaded.module.readProcessIdentity(child.pid, "win32");
+      if (identity == null) await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.ok(identity != null, "Windows could not inspect the exact child identity");
+    await loaded.module.terminateProcess(child.pid, {
+      platform: "win32",
+      expectedIdentity: identity,
+      allowVerifiedWindowsHandleAcquisition: true,
+    });
+    const settlement = await Promise.race([
+      closed,
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error("stable Windows handle termination did not close the child")),
+        10_000,
+      )),
+    ]);
+    assert.ok(settlement.code !== null || settlement.signal !== null);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
     await loaded.dispose();
   }
 });
@@ -2661,6 +3041,7 @@ test("staged-update daemon shutdown forwards an exact identity into stable Windo
     command: `node "${entryRealpath}" --sand-local-exec-generation=${generationToken}`,
   };
   let termination;
+  let alive = true;
   try {
     await writeFile(discoveryPath, JSON.stringify({
       pid: observed.pid,
@@ -2672,10 +3053,12 @@ test("staged-update daemon shutdown forwards an exact identity into stable Windo
     await loaded.module.killLocalExecDaemon(discoveryPath, {
       expectedPid: observed.pid,
       expectedEntryRealpath: entryRealpath,
-      readIdentity: () => observed,
+      readIdentity: () => alive ? observed : null,
+      isAlive: () => alive,
       now: () => 10_000,
       async terminate(pid, options) {
         termination = { pid, options };
+        alive = false;
       },
     });
     assert.equal(termination.pid, observed.pid);
@@ -2683,6 +3066,62 @@ test("staged-update daemon shutdown forwards an exact identity into stable Windo
       expectedIdentity: observed,
       allowVerifiedWindowsHandleAcquisition: true,
     });
+  } finally {
+    await loaded.dispose();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("staged-update daemon shutdown fails closed for an unreadable live discovery", async () => {
+  const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-update-stop-"));
+  const discoveryPath = path.join(temporary, "local-exec-daemon.json");
+  let terminationCalls = 0;
+  try {
+    await writeFile(discoveryPath, JSON.stringify({
+      pid: 5_312,
+      startedAt: 9_950,
+      entryRealpath: "C:\\app\\local-exec-daemon\\main.cjs",
+      generationToken: "unreadable-live-generation",
+      inflightCount: 0,
+    }), "utf8");
+    await assert.rejects(
+      loaded.module.killLocalExecDaemon(discoveryPath, {
+        expectedEntryRealpath: "C:\\app\\local-exec-daemon\\main.cjs",
+        readIdentity() { return null; },
+        isAlive() { return true; },
+        async terminate() { terminationCalls += 1; },
+      }),
+      error => error instanceof loaded.module.LocalExecTerminationIdentityError
+        && /remained live without a readable identity/.test(error.message),
+    );
+    assert.equal(terminationCalls, 0);
+  } finally {
+    await loaded.dispose();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("staged-update daemon shutdown treats an unreadable dead discovery as already absent", async () => {
+  const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-update-stop-"));
+  const discoveryPath = path.join(temporary, "local-exec-daemon.json");
+  let terminationCalls = 0;
+  try {
+    await writeFile(discoveryPath, JSON.stringify({
+      pid: 5_313,
+      startedAt: 9_950,
+      entryRealpath: "C:\\app\\local-exec-daemon\\main.cjs",
+      generationToken: "unreadable-dead-generation",
+      inflightCount: 0,
+    }), "utf8");
+    await loaded.module.killLocalExecDaemon(discoveryPath, {
+      expectedEntryRealpath: "C:\\app\\local-exec-daemon\\main.cjs",
+      readIdentity() { return null; },
+      isAlive() { return false; },
+      async terminate() { terminationCalls += 1; },
+    });
+    assert.equal(terminationCalls, 0);
   } finally {
     await loaded.dispose();
     await rm(temporary, { recursive: true, force: true });
@@ -2717,6 +3156,7 @@ test("local-exec startup ownership is persisted before polling and cleared only 
   assert.match(reconcileBody, /classification === "reused"/);
   assert.match(reconcileBody, /classification === "ambiguous"/);
   assert.match(reconcileBody, /readDaemonDiscovery\(\)/);
+  assert.match(reconcileBody, /entry\.entryRealpath === canonicalEntryRealpath/);
   assert.match(reconcileBody, /discovery\.pid === entry\.pid/);
   assert.match(reconcileBody, /discovery\.entryRealpath === entry\.entryRealpath/);
   assert.match(reconcileBody, /discovery\.generationToken === entry\.generationToken/);
@@ -2751,8 +3191,11 @@ test("local-exec startup ownership is persisted before polling and cleared only 
   assert.match(confirmBody, /quarantine\.generationToken === identity\.generationToken/);
   assert.match(confirmBody, /classifyStartupQuarantineProcess\(quarantine, identity\) === "match"/);
   assert.match(confirmBody, /releaseStartupQuarantine\(quarantine\)/);
-  assert.match(source, /ownedDaemonChildren\.set\(identity\.pid, child\)/);
-  assert.match(source, /hasRetainedHandle: ownedDaemonChildren\.has\(identity\.pid\)/);
+  assert.match(source, /ownedDaemonChildren\.set\(identity\.pid, ownedChildRegistration\)/);
+  assert.match(source, /sameLocalExecProcessIdentity\(registration\.identity, identity\)/);
+  assert.match(source, /terminationMode: retainedOwnedChild\(identity\) !== undefined/);
+  assert.match(source, /allowVerifiedWindowsHandleAcquisition: true as const/);
+  assert.match(source, /"win32-stable-handle"/);
   assert.match(source, /reconcileLocalExecStartupQuarantine/);
 
   const nativeSource = await readFile(
@@ -2769,12 +3212,22 @@ test("local-exec startup ownership is persisted before polling and cleared only 
   assert.doesNotMatch(terminateBody, /resolveWindowsTaskkillPath/);
   assert.doesNotMatch(terminateBody, /process\.kill/);
   assert.match(nativeSource, /terminateVerifiedWindowsProcessByHandle/);
+  assert.match(nativeSource, /Number\.isSafeInteger\(pid\)/);
+  assert.match(nativeSource, /Number\.isSafeInteger\(expected\.startEpochMs\)/);
+  assert.match(nativeSource, /\[Console\]::In\.ReadToEnd\(\)/);
+  assert.match(nativeSource, /FromBase64String\(\$payloadBase64\)/);
+  assert.doesNotMatch(nativeSource, /expectedCommandBase64/);
   assert.match(nativeSource, /\$null = \$target\.Handle/);
   assert.match(nativeSource, /\$target\.StartTime/);
+  assert.match(nativeSource, /\$heldCim = Get-CimInstance/);
+  assert.match(nativeSource, /\$heldCimStart/);
   assert.match(nativeSource, /\$target\.Kill\(\)/);
   const killStart = nativeSource.indexOf("export async function killLocalExecDaemon");
   const killBody = nativeSource.slice(killStart);
   assert.match(killBody, /expectedPid/);
+  assert.match(killBody, /requireAbsent/);
+  assert.match(killBody, /post-termination identity was unreadable/);
+  assert.match(killBody, /sameNativeProcessIdentity\(after, observed\)/);
   assert.match(killBody, /allowVerifiedWindowsHandleAcquisition: true as const/);
 
   const bindingSource = await readFile(
@@ -2803,8 +3256,10 @@ test("coordinator supervisor wires structured startup, readiness, and handleless
   assert.match(supervisorSource, /inspected\.status === "different" \|\| inspected\.status === "absent"/);
   assert.match(supervisorSource, /confirmReadyIdentity\(spawned\)/);
   assert.match(supervisorSource, /confirmReadyIdentity\(identity\)/);
-  assert.match(supervisorSource, /\(existing\.inflightCount \?\? 0\) > 0 \|\| !hasRetainedHandle/);
+  assert.match(supervisorSource, /\(existing\.inflightCount \?\? 0\) > 0 \|\| terminationMode === "none"/);
   assert.match(supervisorSource, /activeGeneration\("adopted", existing, identity\)/);
+  assert.match(supervisorSource, /active\.daemon\.origin === "adopted"/);
+  assert.match(supervisorSource, /\(discovery\.inflightCount \?\? 0\) === 0/);
   const establishStart = supervisorSource.indexOf("const establishDaemon = async");
   const healStart = supervisorSource.indexOf("const healDaemonInternal", establishStart);
   assert.ok(establishStart >= 0 && healStart > establishStart);

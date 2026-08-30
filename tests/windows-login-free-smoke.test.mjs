@@ -63,12 +63,11 @@ test("Windows packaged smoke exercises the complete signed-out 9Router setup in 
   assert.match(source, /process exited before its final 9Router credential lease revocation was acknowledged/);
   assert.match(source, /forced process cleanup was used only after failure/);
   assert.match(source, /firstExitState\.onlyExpectedPersistentDaemon/);
-  assert.match(source, /finalExitState\.onlyExpectedPersistentDaemon/);
-  assert.match(source, /firstDaemonCreationEpochMs/);
-  assert.match(source, /daemonProcesses\.length === 1/);
+  assert.match(source, /finalExitState\.cleanExitSurvivors/);
+  assert.match(source, /previousDaemonStillPresent/);
   assert.match(source, /generationFingerprint/);
-  assert.match(source, /Persistent relaunch did not safely adopt the one exact identity-verified local-exec daemon/);
-  assert.match(source, /Final graceful quit changed the safely adopted local-exec daemon identity/);
+  assert.match(source, /Persistent relaunch did not retire the previous local-exec daemon/);
+  assert.match(source, /Persistent relaunch reused an idle local-exec daemon/);
 });
 
 test("Windows packaged smoke proves secure quit, persistent recovery, and final stop in order", async () => {
@@ -128,7 +127,7 @@ test("Windows packaged smoke uses authenticated loopback services and never embe
   assert.match(source, /localExecHelloFrames/);
   assert.match(source, /localExecHelloProviders/);
   assert.match(source, /webauthnHelloProviders/);
-  assert.match(source, /Persistent local-exec daemon did not complete distinct authenticated provider handshakes across relaunch/);
+  assert.match(source, /Fresh and recovered local-exec daemons did not complete distinct authenticated provider handshakes/);
   assert.match(source, /Fresh and recovered coordinators did not complete distinct authenticated WebAuthn provider handshakes/);
   assert.match(source, /First ready workspace did not complete local-exec and WebAuthn provider handshakes/);
   assert.match(source, /Verified relaunched daemon and coordinator did not reconnect both provider channels/);
