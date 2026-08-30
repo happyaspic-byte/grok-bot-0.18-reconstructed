@@ -47,6 +47,10 @@ import {
 import { createElectronDesktopConnectivity } from "./desktop-connectivity.js";
 import type { BoxConnectionInfo } from "../../shared/node/egress-tunnel/box-connection.js";
 import {
+  parseCoordinatorRendererPortRequestPayload,
+  type CoordinatorRendererPortDeliveryPayload,
+} from "../../shared/rpc/coordinator-port.js";
+import {
   LOCAL_9ROUTER_WORKSPACE_ID,
   resolveLocal9RouterWorkspaceClaim,
   type LocalWorkspaceStatus,
@@ -1044,7 +1048,7 @@ export interface CoordinatorRendererPortIpcPorts<
   readonly ipcMain: {
     handle(
       channel: string,
-      listener: (event: CoordinatorRendererPortIpcEvent<TContents, TFrame>) => unknown,
+      listener: (event: CoordinatorRendererPortIpcEvent<TContents, TFrame>, payload: unknown) => unknown,
     ): void;
     removeHandler(channel: string): void;
   };
@@ -1084,7 +1088,10 @@ export function createCoordinatorRendererPortIpcRegistrar<
       }
       registered = true;
       const handoff = createCoordinatorHandoffTelemetry(ports.reportHandoff);
-      ports.ipcMain.handle(COORDINATOR_PORT_REQUEST_CHANNEL, (event) => {
+      let activeRequesterFrame: TFrame | undefined;
+      let postedGeneration = 0;
+      let activeSinkEpoch = 0;
+      ports.ipcMain.handle(COORDINATOR_PORT_REQUEST_CHANNEL, (event, payload) => {
         const trustedContents = ports.getTrustedContents();
         assertTrustedCoordinatorPortRequester({
           sender: event.sender,
@@ -1092,13 +1099,54 @@ export function createCoordinatorRendererPortIpcRegistrar<
           trustedContents,
           trustedMainFrame: trustedContents?.mainFrame as TFrame | null | undefined,
         } satisfies CoordinatorPortRequesterContext<TContents, TFrame>);
+        const request = parseCoordinatorRendererPortRequestPayload(payload);
+        if (request == null) {
+          throw new Error("Coordinator renderer-port request must contain exactly one non-negative safe knownGeneration.");
+        }
+        if (activeRequesterFrame !== event.senderFrame) {
+          activeRequesterFrame = event.senderFrame;
+          postedGeneration = 0;
+          activeSinkEpoch += 1;
+        }
+        if (request.knownGeneration < postedGeneration) return null;
+        if (request.knownGeneration > postedGeneration) {
+          throw new Error("Coordinator renderer-port request generation is ahead of the main-process handoff generation.");
+        }
+
         handoff.requested();
         const requester = event.sender;
+        const requesterFrame = event.senderFrame;
+        const sinkEpoch = ++activeSinkEpoch;
         ports.requestRendererPort((port) => {
-          if (requester.isDestroyed()) return;
+          const currentContents = ports.getTrustedContents();
+          if (
+            requester.isDestroyed()
+            || activeRequesterFrame !== requesterFrame
+            || activeSinkEpoch !== sinkEpoch
+            || currentContents !== requester
+            || currentContents?.mainFrame !== requesterFrame
+          ) {
+            try { port.close(); } catch {}
+            return;
+          }
+          if (postedGeneration >= Number.MAX_SAFE_INTEGER) {
+            try { port.close(); } catch {}
+            const error = new Error("Coordinator renderer-port handoff generation is exhausted.");
+            handoff.invokeFailed("renderer_port");
+            ports.reportFailure("coordinator", "renderer-port", error);
+            throw error;
+          }
+          const previousGeneration = postedGeneration;
+          const delivery: CoordinatorRendererPortDeliveryPayload = {
+            generation: previousGeneration + 1,
+          };
+          postedGeneration = delivery.generation;
           try {
-            requester.postMessage(COORDINATOR_PORT_CHANNEL, null, [port]);
+            requester.postMessage(COORDINATOR_PORT_CHANNEL, delivery, [port]);
           } catch (error) {
+            if (postedGeneration === delivery.generation) {
+              postedGeneration = previousGeneration;
+            }
             handoff.invokeFailed("renderer_port");
             ports.reportFailure("coordinator", "renderer-port", error);
             throw error;

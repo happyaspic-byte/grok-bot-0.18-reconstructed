@@ -1,3 +1,8 @@
+import {
+  parseCoordinatorRendererPortDeliveryPayload,
+  type CoordinatorRendererPortRequestPayload,
+} from "../shared/rpc/coordinator-port.js";
+
 export type {
   CoordinatorAgentThreadRequest,
   CoordinatorAgentThreadResponse,
@@ -21,11 +26,14 @@ export interface CoordinatorPortClaim {
   release(): void;
 }
 
-export function createCoordinatorPortBroker<TPort>(options: { readonly invokeRequest: () => void }): {
+export function createCoordinatorPortBroker<TPort extends { close(): void }>(options: {
+  readonly invokeRequest: (payload: CoordinatorRendererPortRequestPayload) => void;
+}): {
   readonly bridge: { claim(consumer: CoordinatorPortConsumer<TPort>): CoordinatorPortClaim | null };
-  readonly deliver: (port: TPort) => void;
+  readonly deliver: (port: TPort, payload: unknown) => void;
 } {
   let owner: CoordinatorPortConsumer<TPort> | null = null;
+  let deliveredGeneration = 0;
   return {
     bridge: {
       claim(consumer) {
@@ -34,7 +42,7 @@ export function createCoordinatorPortBroker<TPort>(options: { readonly invokeReq
         return {
           request: () => {
             if (owner !== consumer) return;
-            options.invokeRequest();
+            options.invokeRequest({ knownGeneration: deliveredGeneration });
           },
           release: () => {
             if (owner !== consumer) return;
@@ -43,8 +51,18 @@ export function createCoordinatorPortBroker<TPort>(options: { readonly invokeReq
         };
       },
     },
-    deliver(port) {
-      owner?.onPort(port);
+    deliver(port, payload) {
+      const delivery = parseCoordinatorRendererPortDeliveryPayload(payload);
+      if (delivery == null || delivery.generation <= deliveredGeneration) {
+        port.close();
+        return;
+      }
+      deliveredGeneration = delivery.generation;
+      if (owner == null) {
+        port.close();
+        return;
+      }
+      owner.onPort(port);
     },
   };
 }

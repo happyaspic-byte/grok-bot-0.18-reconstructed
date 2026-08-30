@@ -702,6 +702,145 @@ test("replacement launch invalidates the previous transport resync before adopti
   assert.ok(mainPort >= 0 && invalidate > mainPort && invalidate < sequence);
 });
 
+test("preload coordinator broker carries and fences renderer-port handoff generations", async () => {
+  const loaded = await loadModule("source/electron-preload/coordinator-port-bridge.ts");
+  try {
+    const requests = [];
+    const received = [];
+    const broker = loaded.module.createCoordinatorPortBroker({
+      invokeRequest: (payload) => requests.push(payload),
+    });
+    const claim = broker.bridge.claim({ onPort: (port) => received.push(port) });
+    assert.ok(claim);
+
+    claim.request();
+    assert.deepEqual(requests, [{ knownGeneration: 0 }]);
+
+    const first = { closed: 0, close() { this.closed += 1; } };
+    broker.deliver(first, { generation: 1 });
+    assert.deepEqual(received, [first]);
+    claim.request();
+    assert.deepEqual(requests, [{ knownGeneration: 0 }, { knownGeneration: 1 }]);
+
+    const duplicate = { closed: 0, close() { this.closed += 1; } };
+    broker.deliver(duplicate, { generation: 1 });
+    assert.equal(duplicate.closed, 1);
+    assert.deepEqual(received, [first]);
+
+    const malformed = { closed: 0, close() { this.closed += 1; } };
+    broker.deliver(malformed, { generation: "2" });
+    assert.equal(malformed.closed, 1);
+
+    const replacement = { closed: 0, close() { this.closed += 1; } };
+    broker.deliver(replacement, { generation: 3 });
+    assert.deepEqual(received, [first, replacement]);
+    claim.request();
+    assert.deepEqual(requests.at(-1), { knownGeneration: 3 });
+
+    claim.release();
+    const unowned = { closed: 0, close() { this.closed += 1; } };
+    broker.deliver(unowned, { generation: 4 });
+    assert.equal(unowned.closed, 1);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("renderer-port IPC suppresses stale close requests after a proactive replacement", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/production-provider.ts");
+  try {
+    let handler;
+    let removedChannel;
+    let requestCount = 0;
+    let activeSink;
+    const queuedPorts = [];
+    const posts = [];
+    const failures = [];
+    const frame = {};
+    const contents = {
+      mainFrame: frame,
+      isDestroyed: () => false,
+      postMessage(channel, payload, transfer) {
+        posts.push({ channel, payload, transfer });
+      },
+    };
+    const registrar = loaded.module.createCoordinatorRendererPortIpcRegistrar({
+      ipcMain: {
+        handle(channel, listener) {
+          assert.equal(channel, "sand:coordinator-port-request");
+          handler = listener;
+        },
+        removeHandler(channel) { removedChannel = channel; },
+      },
+      getTrustedContents: () => contents,
+      requestRendererPort(sink) {
+        requestCount += 1;
+        activeSink = sink;
+        const port = queuedPorts.shift();
+        if (port != null) sink(port);
+      },
+      reportHandoff() {},
+      reportFailure(area, leg, error) { failures.push({ area, leg, error }); },
+    });
+    const registration = registrar.register({});
+    assert.equal(typeof handler, "function");
+
+    const first = { id: "first", closed: 0, close() { this.closed += 1; } };
+    queuedPorts.push(first);
+    handler({ sender: contents, senderFrame: frame }, { knownGeneration: 0 });
+    assert.equal(requestCount, 1);
+    assert.deepEqual(posts[0], {
+      channel: "sand:coordinator-port",
+      payload: { generation: 1 },
+      transfer: [first],
+    });
+
+    const replacement = { id: "replacement", closed: 0, close() { this.closed += 1; } };
+    activeSink(replacement);
+    assert.deepEqual(posts[1], {
+      channel: "sand:coordinator-port",
+      payload: { generation: 2 },
+      transfer: [replacement],
+    });
+
+    handler({ sender: contents, senderFrame: frame }, { knownGeneration: 1 });
+    assert.equal(requestCount, 1, "the old port close request must not reach the runtime");
+    assert.equal(posts.length, 2);
+
+    const third = { id: "third", closed: 0, close() { this.closed += 1; } };
+    queuedPorts.push(third);
+    handler({ sender: contents, senderFrame: frame }, { knownGeneration: 2 });
+    assert.equal(requestCount, 2);
+    assert.deepEqual(posts[2].payload, { generation: 3 });
+    assert.throws(
+      () => handler({ sender: contents, senderFrame: frame }, { knownGeneration: 4 }),
+      /ahead of the main-process handoff generation/
+    );
+    assert.throws(
+      () => handler({ sender: contents, senderFrame: frame }, null),
+      /exactly one non-negative safe knownGeneration/
+    );
+
+    const previousFrameSink = activeSink;
+    const nextFrame = {};
+    contents.mainFrame = nextFrame;
+    const orphan = { id: "orphan", closed: 0, close() { this.closed += 1; } };
+    previousFrameSink(orphan);
+    assert.equal(orphan.closed, 1, "a sink captured by a navigated frame must fail closed");
+
+    const nextFramePort = { id: "next-frame", closed: 0, close() { this.closed += 1; } };
+    queuedPorts.push(nextFramePort);
+    handler({ sender: contents, senderFrame: nextFrame }, { knownGeneration: 0 });
+    assert.deepEqual(posts.at(-1).payload, { generation: 1 });
+    assert.deepEqual(failures, []);
+
+    registration.dispose();
+    assert.equal(removedChannel, "sand:coordinator-port-request");
+  } finally {
+    await loaded.dispose();
+  }
+});
+
 test("replacement coordinator launch ignores late events and problems from the old child", async () => {
   const loaded = await loadModule("source/electron-main/coordinator/coordinator-runtime.ts");
   try {
@@ -757,10 +896,12 @@ test("replacement coordinator launch ignores late events and problems from the o
     const restarted = runtime.restart();
     const second = launches[1];
     assert.equal(first.disposeCalls, 1);
-    assert.equal(delivered.length, 1, "restart must not race a replacement port ahead of the old close");
-    runtime.requestRendererPort(deliver);
-    assert.deepEqual(delivered, [first.rendererDataPort, second.rendererDataPort]);
-    assert.equal(launches.length, 2, "the close-driven request must reuse the launched replacement");
+    assert.deepEqual(
+      delivered,
+      [first.rendererDataPort, second.rendererDataPort],
+      "restart must proactively post the replacement before retiring the old port"
+    );
+    assert.equal(launches.length, 2);
     first.dependencies.onEvent["transport-down"]({ generation: 2, reason: "old child exit" });
     first.dependencies.onEvent["agents-event"]({ stale: true });
     first.dependencies.onProblem("old child control port closed");
@@ -801,7 +942,7 @@ test("replacement coordinator launch ignores late events and problems from the o
   }
 });
 
-test("automatic relaunch hands off the launched replacement without a third coordinator", async () => {
+test("automatic relaunch proactively hands off its replacement", async () => {
   const loaded = await loadModule("source/electron-main/coordinator/coordinator-runtime.ts");
   try {
     const launches = [];
@@ -855,13 +996,11 @@ test("automatic relaunch hands off the launched replacement without a third coor
     await new Promise((resolve) => setImmediate(resolve));
 
     assert.equal(launches.length, 2);
-    assert.equal(delivered.length, 1, "timer relaunch must wait for the renderer close-driven request");
-    runtime.requestRendererPort(deliver);
-    assert.deepEqual(delivered, [
-      launches[0].rendererDataPort,
-      launches[1].rendererDataPort,
-    ]);
-    assert.equal(launches.length, 2, "requesting the pending replacement must not launch a third child");
+    assert.deepEqual(
+      delivered,
+      [launches[0].rendererDataPort, launches[1].rendererDataPort],
+      "timer relaunch must proactively post its replacement"
+    );
 
     const disposed = runtime.dispose();
     launches[1].exited.resolve({ code: 0 });

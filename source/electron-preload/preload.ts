@@ -378,13 +378,15 @@ export function installPrimaryPreload(options: {
   const env = options.env ?? process.env;
   const devRestartEnabled = options.devRestartEnabled ?? hasDevRestart(env);
   const initialState = options.initialState ?? readPrimaryPreloadInitialState(options.ipc);
-  const broker = options.coordinatorBroker ?? createCoordinatorPortBroker<any>({ invokeRequest: () => { void options.ipc.invoke("sand:coordinator-port-request"); } });
+  const broker = options.coordinatorBroker ?? createCoordinatorPortBroker<any>({
+    invokeRequest: (payload) => { void options.ipc.invoke("sand:coordinator-port-request", payload); },
+  });
   const desktop = createDesktopPreloadBridge({ ...options, env, devRestartEnabled, initialState });
   options.contextBridge.exposeInMainWorld("desktop", desktop);
   options.contextBridge.exposeInMainWorld("coordinatorPort", broker.bridge);
-  options.ipc.on("sand:coordinator-port", (event: { readonly ports: readonly any[] }) => {
+  options.ipc.on("sand:coordinator-port", (event: { readonly ports: readonly any[] }, payload: unknown) => {
     const port = event.ports[0];
-    if (port != null) broker.deliver(wrapTransferredCoordinatorPort(port));
+    if (port != null) broker.deliver(wrapTransferredCoordinatorPort(port), payload);
   });
   return { desktop, coordinatorPort: broker.bridge };
 }
@@ -401,7 +403,9 @@ export function installPrimaryPreloadEntrypoint(
 ): ReturnType<typeof installPrimaryPreload> {
   const devRestartEnabled = hasDevRestart(env);
   const initialState = readPrimaryPreloadInitialState(electron.ipcRenderer);
-  const coordinatorBroker = createCoordinatorPortBroker<any>({ invokeRequest: () => { void electron.ipcRenderer.invoke("sand:coordinator-port-request"); } });
+  const coordinatorBroker = createCoordinatorPortBroker<any>({
+    invokeRequest: (payload) => { void electron.ipcRenderer.invoke("sand:coordinator-port-request", payload); },
+  });
   const transport = createMainEdgeTransport(electron.ipcRenderer);
   const mainEdge = bridgeRpcEdge(MAIN_RPC_CONTRACT_NAME, MAIN_RPC_METHOD_TABLE, transport, true) as MainPreloadEdge;
   return installPrimaryPreload({
