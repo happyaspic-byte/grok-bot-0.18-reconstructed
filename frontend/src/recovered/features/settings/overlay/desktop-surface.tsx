@@ -246,10 +246,9 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
       if (!active) return;
       setLocalWorkspaceError(reason instanceof Error ? reason.message : String(reason));
     });
-    const unsubscribeCoordinator = coordinatorClient?.subscribeTransport((_state) => {
+    const unsubscribeCoordinator = coordinatorClient?.subscribeTransport((state) => {
       if (!active) return;
-      // Transport loss fails the coordinator check without revoking the
-      // authoritative claim returned by the main-process activation.
+      if (state === "down") localWorkspaceClaimRef.current = { kind: "disabled" };
       void refreshLocalWorkspace(false).catch((reason: unknown) => {
         if (active) setLocalWorkspaceError(reason instanceof Error ? reason.message : String(reason));
       });

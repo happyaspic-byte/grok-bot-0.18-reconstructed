@@ -2860,8 +2860,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
         refreshAfterCurrentActivation(overlay !== "settings");
         return;
       }
-      // The connected check fails closed while the port is down. Preserve the
-      // main-process claim so the replacement connected edge can recover it.
+      localWorkspaceClaimRef.current = { kind: "disabled" };
       setLocalWorkspace({ kind: "checking" });
       if (overlay === "settings" || localWorkspaceActivationQueueRef.current.pending != null) {
         refreshAfterCurrentActivation();

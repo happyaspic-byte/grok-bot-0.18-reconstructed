@@ -128,7 +128,7 @@ test("activation snapshots detect transport and claim changes during asynchronou
   }
 });
 
-test("settings claim survives rerenders and a transient coordinator replacement", async () => {
+test("settings claim survives rerenders until an authoritative transport-down edge", async () => {
   const loaded = await loadModule();
   try {
     const readyClaim = { kind: "ready", workspaceId: "local:9router" };
@@ -148,19 +148,6 @@ test("settings claim survives rerenders and a transient coordinator replacement"
       true,
     );
     assert.equal(rerendered, readyClaim, "an open-surface rerender must retain the activation claim");
-
-    const disconnected = await loaded.module.readLocalWorkspaceReadiness(bridge(), {
-      transportState: "down",
-      claimStatus: rerendered,
-    });
-    assert.equal(disconnected.kind, "disabled");
-    assert.deepEqual(disconnected.blockers.map((blocker) => blocker.code), ["coordinator-not-connected"]);
-
-    const reconnected = await loaded.module.readLocalWorkspaceReadiness(bridge(), {
-      transportState: "connected",
-      claimStatus: rerendered,
-    });
-    assert.equal(reconnected.kind, "ready", "the replacement connected edge must recover without a second claim");
 
     const closed = loaded.module.reconcileSettingsLocalWorkspaceClaim(readyClaim, initial, true, false);
     assert.equal(closed, readyClaim);
@@ -342,10 +329,10 @@ test("production renderer unlocks local core while keeping account-only surfaces
   assert.match(renderer, /onActivateLocalWorkspace=\{activateFreshLocalWorkspace\}/);
   assert.match(renderer, /onInvalidateLocalWorkspace=\{invalidateRootLocalWorkspace\}/);
   assert.match(renderer, /onLocalWorkspaceReady=\{\(readiness\) => \{ localWorkspaceClaimRef\.current = \{ kind: "ready", workspaceId: readiness\.workspaceId \}; setLocalWorkspace\(readiness\); setOverlay\(null\); \}\}/);
-  assert.doesNotMatch(renderer, /if \(state === "down"\) localWorkspaceClaimRef\.current = \{ kind: "disabled" \}/);
+  assert.match(renderer, /if \(state === "down"\)[\s\S]{0,100}localWorkspaceClaimRef\.current = \{ kind: "disabled" \}/);
   assert.match(settings, /reconcileSettingsLocalWorkspaceClaim\([\s\S]{0,220}wasOpen,[\s\S]{0,80}isOpen/);
   assert.match(settings, /onNoticeRef\.current\?\.\(event\)/);
   assert.doesNotMatch(settings, /initialLocalWorkspaceClaimRef/);
-  assert.doesNotMatch(settings, /if \(state === "down"\) localWorkspaceClaimRef\.current = \{ kind: "disabled" \}/);
+  assert.match(settings, /if \(state === "down"\) localWorkspaceClaimRef\.current = \{ kind: "disabled" \}/);
   assert.doesNotMatch(renderer, /setAccount\(\{\s*kind:\s*"logged-in"/);
 });
