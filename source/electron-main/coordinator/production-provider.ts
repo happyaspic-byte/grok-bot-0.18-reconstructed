@@ -1147,6 +1147,7 @@ export function createCoordinatorRendererPortIpcRegistrar<
             if (postedGeneration === delivery.generation) {
               postedGeneration = previousGeneration;
             }
+            try { port.close(); } catch {}
             handoff.invokeFailed("renderer_port");
             ports.reportFailure("coordinator", "renderer-port", error);
             throw error;

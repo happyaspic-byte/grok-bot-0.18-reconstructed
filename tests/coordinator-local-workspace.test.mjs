@@ -848,6 +848,7 @@ test("renderer-port IPC suppresses stale close requests after a proactive replac
       /synthetic post failure/
     );
     assert.equal(failures.length, 1);
+    assert.equal(failedPostPort.closed, 1, "a failed transfer must close its orphaned port");
     const retryPort = { id: "retry", closed: 0, close() { this.closed += 1; } };
     queuedPorts.push(retryPort);
     handler({ sender: contents, senderFrame: frame }, { knownGeneration: 3 });
