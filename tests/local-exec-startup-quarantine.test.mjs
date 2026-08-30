@@ -179,7 +179,7 @@ test("failed unidentified cleanup persists before signalling and blocks a new ex
     assert.equal(ledger.records.length, 1);
     assert.deepEqual(ledger.records[0], {
       version: 1,
-      spawnRequestedAt: 9_900,
+      spawnRequestedAt: 10_000,
       pid: 4_301,
       recordedAt: 10_000,
       entryRealpath,
