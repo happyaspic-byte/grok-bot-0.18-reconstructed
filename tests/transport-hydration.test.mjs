@@ -123,6 +123,23 @@ test("lifecycle ready hydrates the root connection controller from authoritative
   }
 });
 
+test("readiness rejection cannot overwrite an authoritative connected transport", async () => {
+  const loaded = await loadModules();
+  try {
+    const connected = transportSource("down");
+    const controller = loaded.module.createCoordinatorConnectionController(connected.source);
+    controller.start();
+    connected.setState("connected", false);
+    connected.ready.reject(new Error("obsolete lifecycle gate"));
+    await tick();
+    assert.equal(controller.get().transport, "connected");
+    assert.equal(controller.get().phase, "connected");
+    controller.dispose();
+  } finally {
+    await loaded.dispose();
+  }
+});
+
 test("lifecycle ready does not fabricate a connected computer rebuild transport", async () => {
   const loaded = await loadModules();
   try {

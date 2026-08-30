@@ -274,12 +274,21 @@ export function createCoordinatorClient(portBridge: CoordinatorPortBridge): Prod
       if (disposed) return;
       disposed = true;
       for (const listener of portGenerationListeners) listener();
-      port?.postMessage({ kind: "lifecycle", phase: "shutdown", reason: "requested", detail: null });
-      claim.release();
-      rejectCalls("coordinator source disposed");
-      port?.close();
-      port = null;
-      serving = false;
+      const activePort = port;
+      try {
+        activePort?.postMessage({ kind: "lifecycle", phase: "shutdown", reason: "requested", detail: null });
+      } catch {
+        // A closed port must not prevent release or reject pending readiness.
+      }
+      try {
+        claim.release();
+      } finally {
+        rejectCalls("coordinator source disposed");
+        try { activePort?.close(); }
+        catch { /* The source is already disposed and detached. */ }
+        port = null;
+        serving = false;
+      }
     }
   };
 }

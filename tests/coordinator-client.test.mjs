@@ -228,8 +228,10 @@ test("public readiness follows a coordinator port replaced before lifecycle read
 
     const first = transferredPort();
     ports.deliver(first);
+    const staleCall = client.call("listAgents");
     const second = transferredPort();
     ports.deliver(second);
+    await assert.rejects(staleCall, /coordinator session replaced/);
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(outcome, "pending", "a recoverable pre-ready replacement must not reject public readiness");
 
@@ -239,6 +241,15 @@ test("public readiness follows a coordinator port replaced before lifecycle read
     assert.equal(outcome, "resolved");
     assert.equal(client.getPortGeneration(), 2);
     assert.equal(client.getTransportState(), "connected");
+
+    const projected = [];
+    void client.ready.then(
+      () => { projected.push(client.getTransportState()); },
+      () => { projected.push("down"); },
+    );
+    client.subscribeTransport((state) => projected.push(state));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(projected.at(-1), "connected", "readiness must not overwrite a connected transport replay");
     client.dispose();
   } finally {
     await loaded.dispose();
@@ -251,8 +262,15 @@ test("public readiness rejects when the client is disposed before serving", asyn
     const ports = bridge();
     const client = loaded.module.createCoordinatorClient(ports.source);
     assert.ok(client);
+    const first = transferredPort();
+    const postMessage = first.postMessage;
+    first.postMessage = function (value) {
+      if (value?.kind === "lifecycle" && value.phase === "shutdown") throw new Error("port already closed");
+      return postMessage.call(this, value);
+    };
+    ports.deliver(first);
     const ready = client.ready;
-    client.dispose();
+    assert.doesNotThrow(() => client.dispose());
     await assert.rejects(ready, /coordinator source disposed|Coordinator client is disposed/);
   } finally {
     await loaded.dispose();

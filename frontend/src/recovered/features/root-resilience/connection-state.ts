@@ -224,7 +224,7 @@ export function createCoordinatorConnectionController(
       source.ready.then(() => {
         if (isCurrent(expectedGeneration)) onTransport(source.getTransportState());
       }, () => {
-        if (isCurrent(expectedGeneration)) onTransport("down");
+        if (isCurrent(expectedGeneration)) onTransport(source.getTransportState());
       });
     },
     ingestAccount: onAccount,
