@@ -12,6 +12,7 @@ import {
 } from "./user-secrets-store.js";
 import { SandCliProxySecretStore } from "./cli-proxy-secret-store.js";
 import { fetchCliProxyModels } from "../../shared/node/cli-proxy-models.js";
+import { normalizeCliProxySaveRequest } from "../../shared/cli-proxy.js";
 
 export class SandBoxSecretsPushQuiescedError extends Error {
   constructor() { super("Box secrets pushes are quiesced for quit"); }
@@ -120,9 +121,21 @@ export function registerSecretsIpc(deps: {
     readonly cliProxySecretStore: Pick<SandCliProxySecretStore, "status" | "save" | "remove" | "getConnectionConfig">;
   };
   readonly pushBoxSecrets: () => Promise<boolean>;
+  /** Revoke any host-side memory lease before changing the encrypted source. */
+  readonly beforeCliProxyMutation?: () => Promise<unknown>;
+  /** Re-evaluate login-free workspace ownership after the source changes. */
+  readonly afterCliProxyMutation?: () => Promise<unknown>;
 }): void {
   const { ipcMain, guards, pushBoxSecrets } = deps;
   const { userSecretsStore, clientPersistenceStore, cliProxySecretStore } = deps.stores;
+  const mutateCliProxySecret = async <T>(mutation: () => Promise<T>): Promise<T> => {
+    try {
+      await deps.beforeCliProxyMutation?.();
+      return await mutation();
+    } finally {
+      await deps.afterCliProxyMutation?.();
+    }
+  };
   ipcMain.handle("sand:secrets-list", async (event) => {
     guards.assertTrustedSecretsSender(event);
     return { keys: await userSecretsStore.listKeys(), isPersistent: userSecretsStore.isPersistent() };
@@ -152,11 +165,12 @@ export function registerSecretsIpc(deps: {
   });
   ipcMain.handle("sand:cli-proxy-save", async (event, request) => {
     guards.assertTrustedSecretsSender(event);
-    return cliProxySecretStore.save(request);
+    const validated = normalizeCliProxySaveRequest(request);
+    return await mutateCliProxySecret(() => cliProxySecretStore.save(validated));
   });
   ipcMain.handle("sand:cli-proxy-delete", async (event) => {
     guards.assertTrustedSecretsSender(event);
-    return cliProxySecretStore.remove();
+    return await mutateCliProxySecret(() => cliProxySecretStore.remove());
   });
   ipcMain.handle(CLIENT_PERSISTENCE_CHANNELS.read, async (event, request) => {
     guards.assertTrustedClientPersistenceSender(event);

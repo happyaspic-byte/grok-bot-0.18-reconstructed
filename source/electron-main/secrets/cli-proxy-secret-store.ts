@@ -4,8 +4,9 @@ import { dirname, join } from "node:path";
 
 import {
   CLI_PROXY_DEFAULT_CONFIG,
-  normalizeCliProxyApiKey,
   normalizeCliProxyPublicConfig,
+  normalizeCliProxyApiKey,
+  normalizeCliProxySaveRequest,
   requireCliProxyModel,
   type CliProxyPublicConfig,
   type CliProxyStatus,
@@ -49,6 +50,10 @@ function defaultPath(): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value != null && !Array.isArray(value);
+}
+
+function hasSameOrigin(left: CliProxyPublicConfig, right: CliProxyPublicConfig): boolean {
+  return new URL(left.baseUrl).origin === new URL(right.baseUrl).origin;
 }
 
 function parseDocument(value: unknown): PersistedDocument | null {
@@ -98,20 +103,26 @@ export class SandCliProxySecretStore {
   }
 
   private async saveNow(raw: unknown): Promise<CliProxyStatus> {
-    const record = isRecord(raw) ? raw : {};
-    const config = normalizeCliProxyPublicConfig(record);
-    const suppliedKey = record.apiKey === undefined ? undefined : normalizeCliProxyApiKey(record.apiKey);
+    const { apiKey: suppliedKey, ...config } = normalizeCliProxySaveRequest(raw);
     if (!this.isPersistent()) {
+      await this.discardPersistedDocument();
+      const mayReuseSessionKey = this.sessionConfig != null && hasSameOrigin(this.sessionConfig, config);
       this.sessionConfig = config;
       if (suppliedKey !== undefined) this.sessionApiKey = suppliedKey;
+      else if (!mayReuseSessionKey) this.sessionApiKey = null;
       return this.status();
     }
     const previous = await this.loadDisk();
-    const keyToEncrypt = suppliedKey ?? this.sessionApiKey ?? undefined;
+    const mayReuseSessionKey = this.sessionConfig != null && hasSameOrigin(this.sessionConfig, config);
+    const keyToEncrypt = suppliedKey ?? (mayReuseSessionKey ? this.sessionApiKey ?? undefined : undefined);
     let apiKeyCiphertext: string | undefined;
     try {
-      apiKeyCiphertext = keyToEncrypt === undefined ? previous?.apiKeyCiphertext : this.safeStorage.encryptString(keyToEncrypt).toString("base64");
+      const mayReusePersistedKey = previous != null && hasSameOrigin(previous.config, config);
+      apiKeyCiphertext = keyToEncrypt === undefined
+        ? mayReusePersistedKey ? previous?.apiKeyCiphertext : undefined
+        : this.safeStorage.encryptString(keyToEncrypt).toString("base64");
     } catch {
+      await this.discardPersistedDocument();
       this.sessionConfig = config;
       this.sessionApiKey = keyToEncrypt ?? null;
       return this.status();
@@ -164,6 +175,16 @@ export class SandCliProxySecretStore {
     try { this.diskCache = parseDocument(JSON.parse(await fs.readFile(this.storePath, "utf8"))); }
     catch { this.diskCache = null; }
     return this.diskCache;
+  }
+
+  private async discardPersistedDocument(): Promise<void> {
+    try { await fs.rm(this.storePath, { force: true }); }
+    catch {
+      this.sessionConfig = null;
+      this.sessionApiKey = null;
+      throw new Error("Unable to remove the previous 9Router credential; the new session credential was not activated.");
+    }
+    this.diskCache = null;
   }
 
   private async persist(document: PersistedDocument): Promise<void> {

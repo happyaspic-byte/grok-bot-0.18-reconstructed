@@ -69,11 +69,12 @@ test("Router settings use the trusted backend and display recorded inference usa
   assert.match(preload, /setBoxRuntime: \(mode: string\) => edge\("setBoxRuntime", \{ mode \}\)/);
   assert.match(mainEdge, /syncHostSettingsToBox\(\{ inferenceProvider: provider \}\)/);
   assert.match(mainEdge, /invoke\(deps\.settingsStore, "setInferenceProvider", provider\)/);
-  assert.match(mainEdge, /return \{ provider, usage:/);
+  assert.match(mainEdge, /return\s*\{\s*provider,\s*usage:/);
   assert.match(mainEdge, /invoke\(deps\.boxRecovery, "restartCoordinator"\)/);
-  assert.match(mainEdge, /mode === "local-docker"\) await startLocalDockerBox\(settingsPath\); else await stopLocalDockerBox\(\)/);
+  assert.match(mainEdge, /mode === "local-docker"\) await startLocalDockerBox\(settingsPath, localDockerStartOptionsForProvider\(invoke\(deps\.settingsStore, "getInferenceProvider"\)\)\); else await stopLocalDockerBox\(\)/);
   assert.match(mainEdge, /setBoxRuntime", mode === "local-docker" \? "remote" : "local-docker"/);
-  assert.match(localDocker, /public\.ecr\.aws\/k0i0n2g5\/cursorenvironments\/universal:sand-box-latest/);
+  assert.match(localDocker, /public\.ecr\.aws\/k0i0n2g5\/cursorenvironments\/universal@sha256:3f9e25e1e382b7c4b71e08eb549098a6106fadc615feba848e6cc5c1ef4be3b6/);
+  assert.doesNotMatch(localDocker, /cursorenvironments\/universal:sand-box-latest/);
   assert.match(localDocker, /"127\.0\.0\.1:1340:1340"/);
   assert.match(localDocker, /SAND_BOX_AUTO_UPDATE=0/);
   assert.match(localDocker, /dst=\/home\/box\/sand-host\/host-main\.cjs,readonly/);

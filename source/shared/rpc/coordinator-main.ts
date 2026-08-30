@@ -5,6 +5,7 @@ export const COORDINATOR_MAIN_METHOD_TABLE = {
   readAttachmentChunk: { args: "object" },
   getHostSettings: { args: "none" },
   setHostSettings: { args: "object" },
+  leaseCliProxyCredential: { args: "object" },
   setBoxSecrets: { args: "object" },
   refreshMcp: { args: "object" },
   listBoxMcpServers: { args: "object" },
@@ -25,4 +26,3 @@ export type CoordinatorMainMethod = keyof typeof COORDINATOR_MAIN_METHOD_TABLE;
 export function isCoordinatorMainMethod(name: string): name is CoordinatorMainMethod {
   return Object.hasOwn(COORDINATOR_MAIN_METHOD_TABLE, name);
 }
-

@@ -8,6 +8,7 @@ import type { SandInferenceProvider } from "../../../shared/inference-router.js"
 import type { PromptExecutor } from "./sand-labeling.js";
 import { createProviderPromptSession } from "./provider-session.js";
 import { getSandRootDir } from "../../host-paths.js";
+import { PrivacyMode } from "../../../packages/redaction/privacy-mode.js";
 export interface HostInferenceOptions {
   auth: { getAccessToken(...args: unknown[]): Promise<string>; getMachineId(): string };
   experiments: { checkFeatureGate(name: string): boolean; getComputerUseModelOverride(): SandAgentModelSelection | undefined; getBrowserUseModelOverride(): SandAgentModelSelection | undefined; getSandModelExperimentState(): SandModelExperimentState | null | undefined; hasHydratedStatsigUserId(): boolean; getConfiguredDefaultModel(): SandAgentModelSelection | undefined; getConfiguredAutomationsModel(): SandAgentModelSelection | undefined };
@@ -55,6 +56,11 @@ export function createHostInference(options: HostInferenceOptions) {
   });
   return {
     ...cursor,
+    resolvePrivacyMode() {
+      return routerSettings.getInferenceProvider() === "cursor"
+        ? cursor.resolvePrivacyMode()
+        : PrivacyMode.NO_STORAGE;
+    },
     createSession(onRequestId: (requestId: string) => void, sessionOptions?: Parameters<typeof cursor.createSession>[1]) {
       const provider = routerSettings.getInferenceProvider();
       if (provider === "cursor") return routedSession(cursor.createSession(onRequestId, sessionOptions), provider);

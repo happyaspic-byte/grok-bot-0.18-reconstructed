@@ -13,9 +13,14 @@ import { getSandRootDir } from "../../host-paths.js";
 import { SandSettingsStore } from "../../../shared/node/settings/sand-settings-store.js";
 import { getBoxSecretsStorePath } from "../secrets/secrets-service.js";
 import { streamCodexDirectResponses, type CodexDirectTool } from "./codex-direct-responses.js";
-import { streamOpenAiCompatible, type OpenAiCompatibleTool } from "./openai-compatible-stream.js";
+import {
+  streamOpenAiCompatible,
+  streamOpenAiCompatibleModelStep,
+  type OpenAiCompatibleTool,
+} from "./openai-compatible-stream.js";
 import type { CliProxyTurnConfig } from "../../../shared/cli-proxy.js";
 import type { LabelMessage, PromptExecutor } from "./sand-labeling.js";
+import { requireCliProxyCredentialLease } from "./cli-proxy-credential-lease.js";
 
 type Loose = Record<string, any>;
 interface ProviderMessage extends LabelMessage { role: string; content: string | readonly unknown[] }
@@ -295,18 +300,82 @@ function cliProxyExecutor(config: CliProxyTurnConfig, messages: readonly Provide
   return { fullStream, response: resultResponse.promise, usage: usage.promise, extendedUsage: extendedUsage.promise, providerMetadata: metadata.promise, invocationId: Promise.resolve(invocationId) };
 }
 
+function cliProxyNativeExecutor(
+  config: CliProxyTurnConfig,
+  messages: readonly ProviderMessage[],
+  invocationId: string,
+  definitions?: readonly Loose[],
+  signal?: AbortSignal,
+  onUsage?: (usage: UsageRecord) => void,
+) {
+  const usage = deferred<{ promptTokens: number; completionTokens: number; totalTokens: number }>();
+  const extendedUsage = deferred<{ inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; maxTokens: number }>();
+  const resultResponse = deferred<Loose>();
+  const metadata = deferred<Record<string, unknown>>();
+  const tools = cliProxyTools(definitions);
+  const fullStream = (async function* () {
+    try {
+      for await (const event of streamOpenAiCompatibleModelStep({
+        config,
+        instructions: GROK_ROUTER_SYSTEM_PROMPT,
+        messages,
+        ...(tools == null ? {} : { tools }),
+        ...(signal == null ? {} : { signal }),
+      })) {
+        if (event.type !== "done") {
+          yield event;
+          continue;
+        }
+        const basic = {
+          promptTokens: event.usage.inputTokens,
+          completionTokens: event.usage.outputTokens,
+          totalTokens: event.usage.inputTokens + event.usage.outputTokens,
+        };
+        const extended = { ...event.usage, maxTokens: 0 };
+        onUsage?.(event.usage);
+        usage.resolve(basic);
+        extendedUsage.resolve(extended);
+        metadata.resolve({ openai: { responseId: event.responseId, protocol: event.protocol, compatible: true, nativeTools: true } });
+        resultResponse.resolve({
+          id: event.responseId || invocationId,
+          modelId: config.model,
+          timestamp: new Date(),
+          headers: {},
+          messages: [{ role: "assistant", content: event.content }],
+        });
+      }
+    } catch (error) {
+      usage.reject(error);
+      extendedUsage.reject(error);
+      metadata.reject(error);
+      resultResponse.reject(error);
+      throw error;
+    }
+  })();
+  return { fullStream, response: resultResponse.promise, usage: usage.promise, extendedUsage: extendedUsage.promise, providerMetadata: metadata.promise, invocationId: Promise.resolve(invocationId) };
+}
+
 class ProviderPromptExecutor extends BasePromptExecutor<ProviderMessage> {
   constructor(readonly provider: RoutedProvider, initialMessages?: readonly ProviderMessage[], readonly onUsage?: (usage: UsageRecord) => void) { super(new BasePromptBuilder(initialMessages)); }
-  stream(_ctx: unknown, invocationId = crypto.randomUUID(), definitions?: readonly Loose[]) {
+  stream(ctx: unknown, invocationId = crypto.randomUUID(), definitions?: readonly Loose[]) {
     if (this.provider === "codex") return codexExecutor(this.getMessages(), invocationId, definitions, undefined, this.onUsage);
     if (this.provider === "claude-code") return claudeExecutor(this.getMessages(), invocationId, this.onUsage);
-    if (this.provider === "cli-proxy") throw new Error("9Router requests require the desktop's per-turn secure credential lease.");
+    if (this.provider === "cli-proxy") {
+      // Re-check the short-lived lease before every native model step. The
+      // executor deliberately does not retain a key across tool execution.
+      const cliProxyConfig = requireCliProxyCredentialLease();
+      const signal = typeof ctx === "object" && ctx != null && Reflect.get(ctx, "signal") instanceof AbortSignal
+        ? Reflect.get(ctx, "signal") as AbortSignal
+        : undefined;
+      return cliProxyNativeExecutor(cliProxyConfig, this.getMessages(), invocationId, definitions, signal, this.onUsage);
+    }
     return openRouterExecutor(this.getMessages(), invocationId, definitions, undefined, this.onUsage);
   }
 }
 
 export function createProviderPromptSession(provider: RoutedProvider): { getModelId(): string; getExecutor(state?: unknown): PromptExecutor } {
-  const modelId = provider === "codex" ? configuredCodexModel() : provider === "claude-code" ? "claude-code" : provider === "cli-proxy" ? "9router" : process.env.SAND_OPENROUTER_MODEL?.trim() || "openai/gpt-5.2";
+  const cliProxyModel = provider === "cli-proxy" ? requireCliProxyCredentialLease().model : undefined;
+  const modelId = provider === "codex" ? configuredCodexModel() : provider === "claude-code" ? "claude-code" : provider === "cli-proxy" ? cliProxyModel! : process.env.SAND_OPENROUTER_MODEL?.trim() || "openai/gpt-5.2";
   return { getModelId: () => modelId, getExecutor: state => new ProviderPromptExecutor(provider, Array.isArray(state) ? state as ProviderMessage[] : undefined, usage => recordRoutedUsage(provider, usage)) };
 }
 

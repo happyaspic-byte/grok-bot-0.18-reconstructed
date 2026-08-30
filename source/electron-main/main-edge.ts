@@ -9,7 +9,13 @@ import { reportDesktopEdgeFailure } from "./desktop-edge-failures.js";
 import { isSandInferenceProvider } from "../shared/inference-router.js";
 import { getLocalInferenceCliStatus } from "../shared/node/inference-router-local.js";
 import { isSandBoxRuntime } from "../shared/box-runtime.js";
-import { getLocalDockerStatus, startLocalDockerBox, stopLocalDockerBox } from "./box/local-docker-host-connector.js";
+import {
+  getLocalDockerStatus,
+  revokeCliProxyLeaseOrStopOwnedLocalDocker,
+  localDockerStartOptionsForProvider,
+  startLocalDockerBox,
+  stopLocalDockerBox,
+} from "./box/local-docker-host-connector.js";
 
 export const MAIN_EDGE_UNSERVED = "main/unserved-method";
 export const MAIN_EDGE_UPDATE_UNAVAILABLE = "main/update-unavailable";
@@ -47,6 +53,7 @@ export interface MainEdgeDeps {
   readonly cursorAccount: UnknownRecord;
   readonly experiments: UnknownRecord;
   readonly syncHostSettingsToBox: (settings: UnknownRecord) => Promise<UnknownRecord | null>;
+  readonly syncHostSettingsToBoxStrict: (settings: UnknownRecord) => Promise<UnknownRecord>;
   readonly readHostSettingsFromBox: () => Promise<UnknownRecord>;
   readonly recordLocalToolApproval: (approval: { id: string; action: string; target: string }) => Promise<void>;
   readonly clearLocalToolApprovals: () => Promise<void>;
@@ -58,6 +65,7 @@ export interface MainEdgeDeps {
   readonly platform: NodeJS.Platform;
   readonly delay?: (milliseconds: number) => Promise<void>;
   readonly detectTimeZone?: () => string | null | undefined;
+  readonly stopOwnedLocalDockerBox?: () => Promise<void>;
 }
 
 function invariant(condition: unknown, message: string): asserts condition { if (!condition) throw new Error(message); }
@@ -113,9 +121,43 @@ export function createMainEdgeHandlers(deps: MainEdgeDeps): HandlerMap {
     setHostSidebarSections: (raw) => echo(deps, "sidebarSections", req(raw).sections, "sidebar sections"),
     getAvailableModels: () => deps.fetchAvailableModels(),
     getInferenceRouter: async () => { const settings = await deps.readHostSettingsFromBox().catch(() => ({} as UnknownRecord)); const provider = invoke(deps.settingsStore, "getInferenceProvider"); return { provider: isSandInferenceProvider(provider) ? provider : "cursor", usage: settings.inferenceRouterUsage ?? invoke(deps.settingsStore, "getInferenceRouterUsage") ?? null, local: getLocalInferenceCliStatus() }; },
-    setInferenceRouter: async (raw) => { const provider = req(raw).provider; invariant(isSandInferenceProvider(provider), "Unknown inference provider."); invoke(deps.settingsStore, "setInferenceProvider", provider); const settings = await deps.syncHostSettingsToBox({ inferenceProvider: provider }).catch(() => null); return { provider, usage: settings?.inferenceRouterUsage ?? invoke(deps.settingsStore, "getInferenceRouterUsage") ?? null, local: getLocalInferenceCliStatus() }; },
+    setInferenceRouter: async (raw) => {
+      const provider = req(raw).provider;
+      invariant(isSandInferenceProvider(provider), "Unknown inference provider.");
+      const previous = invoke(deps.settingsStore, "getInferenceProvider");
+      invoke(deps.settingsStore, "setInferenceProvider", provider);
+      let settings: UnknownRecord | null = null;
+      try {
+        if (previous === "cli-proxy" && provider !== "cli-proxy") {
+          let applied: UnknownRecord | null = null;
+          await revokeCliProxyLeaseOrStopOwnedLocalDocker(
+            async () => {
+              applied = await deps.syncHostSettingsToBoxStrict({
+                inferenceProvider: provider,
+                clearCliProxyCredentialLease: true,
+              });
+            },
+            deps.stopOwnedLocalDockerBox ?? stopLocalDockerBox,
+          );
+          settings = applied;
+        } else {
+          settings = await deps.syncHostSettingsToBox({ inferenceProvider: provider }).catch(() => null);
+        }
+      } catch (error) {
+        invoke(deps.settingsStore, "setInferenceProvider", previous);
+        throw error;
+      }
+      invoke(deps.boxRecovery, "restartCoordinator");
+      return {
+        provider,
+        usage: settings?.inferenceRouterUsage
+          ?? invoke(deps.settingsStore, "getInferenceRouterUsage")
+          ?? null,
+        local: getLocalInferenceCliStatus(),
+      };
+    },
     getBoxRuntime: async () => { const mode = invoke(deps.settingsStore, "getBoxRuntime"); invariant(isSandBoxRuntime(mode), "Unknown box runtime."); return { mode, status: await getLocalDockerStatus(String(Reflect.get(deps.settingsStore, "settingsPath"))) }; },
-    setBoxRuntime: async (raw) => { const mode = req(raw).mode; invariant(isSandBoxRuntime(mode), "Unknown box runtime."); const settingsPath = String(Reflect.get(deps.settingsStore, "settingsPath")); invoke(deps.settingsStore, "setBoxRuntime", mode); try { if (mode === "local-docker") await startLocalDockerBox(settingsPath); else await stopLocalDockerBox(); } catch (error) { invoke(deps.settingsStore, "setBoxRuntime", mode === "local-docker" ? "remote" : "local-docker"); throw error; } invoke(deps.boxRecovery, "restartCoordinator"); return { mode, status: await getLocalDockerStatus(settingsPath) }; },
+    setBoxRuntime: async (raw) => { const mode = req(raw).mode; invariant(isSandBoxRuntime(mode), "Unknown box runtime."); const settingsPath = String(Reflect.get(deps.settingsStore, "settingsPath")); invoke(deps.settingsStore, "setBoxRuntime", mode); try { if (mode === "local-docker") await startLocalDockerBox(settingsPath, localDockerStartOptionsForProvider(invoke(deps.settingsStore, "getInferenceProvider"))); else await stopLocalDockerBox(); } catch (error) { invoke(deps.settingsStore, "setBoxRuntime", mode === "local-docker" ? "remote" : "local-docker"); throw error; } invoke(deps.boxRecovery, "restartCoordinator"); return { mode, status: await getLocalDockerStatus(settingsPath) }; },
 
     getEgressTunnelEnabled: () => invoke(deps.boxToggleStore, "getEgressTunnelEnabled"),
     setEgressTunnelEnabled: (raw) => { const enabled = req(raw).enabled === true; invoke(deps.boxToggleStore, "setEgressTunnelEnabled", enabled); invoke(egressController(deps), "setEnabled", enabled); deps.emitEgressTunnelChanged(enabled); return enabled; },

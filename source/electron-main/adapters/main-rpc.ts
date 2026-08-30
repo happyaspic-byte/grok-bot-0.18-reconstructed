@@ -19,6 +19,7 @@ type ExistingMainRpcCoreDeps = Pick<MainEdgeWiringDeps,
   | "boxRecovery"
   | "windowChrome"
   | "syncHostSettingsToBox"
+  | "syncHostSettingsToBoxStrict"
   | "broadcast"
   | "platform"
   | "avatarImages"
@@ -184,6 +185,12 @@ function createExistingMainRpcCoreDeps(
       : supplied.syncHostSettingsToBox,
     "mainRpc.syncHostSettingsToBox",
   );
+  const syncHostSettingsToBoxStrict = requireFunction(
+    supplied.syncHostSettingsToBoxStrict === undefined
+      ? context.coordinatorResync?.pushHostSettingsStrict
+      : supplied.syncHostSettingsToBoxStrict,
+    "mainRpc.syncHostSettingsToBoxStrict",
+  );
   const broadcast = requireFunction(
     supplied.broadcast === undefined ? context.broadcast : supplied.broadcast,
     "mainRpc.broadcast",
@@ -213,6 +220,7 @@ function createExistingMainRpcCoreDeps(
     experiments,
     getComputerUseModelOverride,
     syncHostSettingsToBox,
+    syncHostSettingsToBoxStrict,
     broadcast,
     platform,
   };
@@ -239,6 +247,7 @@ function validateMainRpcDeps(deps: MainEdgeWiringDeps): MainEdgeWiringDeps {
     requireObject(deps[name], `mainRpc.${name}`);
   }
   requireFunction(deps.syncHostSettingsToBox, "mainRpc.syncHostSettingsToBox");
+  requireFunction(deps.syncHostSettingsToBoxStrict, "mainRpc.syncHostSettingsToBoxStrict");
   if (typeof deps.platform !== "string") throw new TypeError("Missing Electron production adapter port: mainRpc.platform.");
   requireObject(deps.ipcMain, "mainRpc.ipcMain");
   requireFunction(deps.ipcMain.handle, "mainRpc.ipcMain.handle");

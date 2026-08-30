@@ -214,13 +214,21 @@ export async function composeCoordinator(dependencies: ComposeCoordinatorDepende
   const inferenceRouter = createCoordinatorInferenceRouter({
     dataDir: bootstrap.processConfig.dataDir,
     postEvent: (family, payload) => server.postEvent(family, payload),
-    dispatchRemote: (method, args) => method === "getCliProxyTurnConfig"
-      ? command(commands, "getCliProxyTurnConfig", args)
-      : method === "listRoutedMcpTools"
-      ? command(commands, "listRoutedMcpTools", args)
-      : method === "executeRoutedMcpTool"
-        ? command(commands, "executeRoutedMcpTool", args)
-        : gatewayClient.dispatchCommand(method, args),
+    dispatchRemote: (method, args) => {
+      if (method === "getCliProxyTurnConfig") {
+        return command(commands, "getCliProxyTurnConfig", args);
+      }
+      if (method === "prepareCliProxyNativeTurn") {
+        return command(commands, "prepareCliProxyNativeTurn", args);
+      }
+      if (method === "listRoutedMcpTools") {
+        return command(commands, "listRoutedMcpTools", args);
+      }
+      if (method === "executeRoutedMcpTool") {
+        return command(commands, "executeRoutedMcpTool", args);
+      }
+      return gatewayClient.dispatchCommand(method, args);
+    },
   });
   const dispatchRequest = async (method: string, args: unknown, signal: AbortSignal) => {
     if (method === "sendPrompt" && typeof args === "object" && args != null) {

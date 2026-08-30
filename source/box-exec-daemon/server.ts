@@ -57,6 +57,11 @@ import {
   ShellTimeout,
   type ShellArgs,
 } from "../packages/proto/generated/agent/v1/shell_exec_pb.js";
+import {
+  applySanitizedBoxExecEnvironmentUpdate,
+  sanitizeBoxExecShellEnvironment,
+  type BoxExecShellIdentity,
+} from "./shell-security.js";
 
 // Recovered generated descriptors predate `satisfies ServiceType` and therefore
 // widen MethodKind during TypeScript reconstruction. Re-declaring only the
@@ -89,6 +94,7 @@ export interface BoxExecDaemonOptions {
   readonly workspaceRoot: string;
   readonly terminalsDirectory?: string;
   readonly environment?: NodeJS.ProcessEnv;
+  readonly shellIdentity?: BoxExecShellIdentity;
 }
 
 export interface BoxExecDaemonHandle {
@@ -170,22 +176,17 @@ class BoxExecRuntime {
   readonly #background = new Map<number, BackgroundProcess>();
   #nextShellId = 1;
 
-  constructor(readonly workspaceRoot: string, readonly terminalsDirectory: string, environment: NodeJS.ProcessEnv) {
-    this.#environment = { ...environment };
+  constructor(
+    readonly workspaceRoot: string,
+    readonly terminalsDirectory: string,
+    environment: NodeJS.ProcessEnv,
+    readonly shellIdentity?: BoxExecShellIdentity,
+  ) {
+    this.#environment = sanitizeBoxExecShellEnvironment(environment, shellIdentity);
   }
 
   applyEnvironment(request: UpdateEnvironmentVariablesRequest): { applied: number; removed: number } {
-    let removed = 0;
-    if (request.replace) {
-      for (const key of Object.keys(this.#environment)) {
-        if (!(key in request.env)) {
-          delete this.#environment[key];
-          removed += 1;
-        }
-      }
-    }
-    for (const [key, value] of Object.entries(request.env)) this.#environment[key] = value;
-    return { applied: Object.keys(request.env).length, removed };
+    return applySanitizedBoxExecEnvironmentUpdate(this.#environment, request);
   }
 
   resolvePath(requested: string): string {
@@ -406,7 +407,13 @@ class BoxExecRuntime {
   }
 
   private spawnShell(command: string, cwd: string): ChildProcessWithoutNullStreams {
-    return spawn("/bin/sh", ["-lc", command], { cwd, env: this.#environment, detached: process.platform !== "win32", stdio: "pipe" });
+    return spawn("/bin/sh", ["-lc", command], {
+      cwd,
+      env: sanitizeBoxExecShellEnvironment(this.#environment, this.shellIdentity),
+      ...(this.shellIdentity == null ? {} : { uid: this.shellIdentity.uid, gid: this.shellIdentity.gid }),
+      detached: process.platform !== "win32",
+      stdio: "pipe",
+    });
   }
 
   private kill(child: ChildProcessWithoutNullStreams): void {
@@ -462,7 +469,7 @@ export async function startBoxExecDaemon(options: BoxExecDaemonOptions): Promise
   await stat(workspaceRoot).then(info => {
     if (!info.isDirectory()) throw new Error(`workspaceRoot is not a directory: ${workspaceRoot}`);
   });
-  const runtime = new BoxExecRuntime(workspaceRoot, terminalsDirectory, options.environment ?? process.env);
+  const runtime = new BoxExecRuntime(workspaceRoot, terminalsDirectory, options.environment ?? process.env, options.shellIdentity);
   const adapter = connectNodeAdapter({
     routes(router) {
       router.service(BoxControlService, {

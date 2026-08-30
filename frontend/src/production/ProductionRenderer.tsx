@@ -132,6 +132,12 @@ import { createSettingsNoticeController } from "./settings-notice-controller";
 import { createGroupMembersRootScope } from "./group-members-root";
 import { createProductionReactionRootScope } from "./reaction-root";
 import { createStrictModeDisposalGuard, type StrictModeDisposable } from "./strict-mode-disposal";
+import {
+  LOCAL_WORKSPACE_CHANGED_EVENT,
+  projectWorkspaceSession,
+  readLocalWorkspaceReadiness,
+  type LocalWorkspaceReadiness
+} from "./local-workspace";
 import { MessageReactionAction, ReactionPills } from "../recovered/features/conversation/cards/transcript-card/reaction-picker";
 import type { TranscriptMessageReactionSlotProps } from "../recovered/features/conversation/cards/transcript-card/message-actions";
 import { LocalToolPermissionDock, type LocalToolPermissionRequest } from "../recovered/features/permissions/local-tool/view";
@@ -890,6 +896,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   const [pluginQuery, setPluginQuery] = useState("");
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [account, setAccount] = useState<CursorAuthStatus | null>(null);
+  const [localWorkspace, setLocalWorkspace] = useState<LocalWorkspaceReadiness>({ kind: "checking" });
   const [sandAccess, setSandAccess] = useState(SAND_ACCESS_UNKNOWN);
   const [accessFirstBox, setAccessFirstBox] = useState(INITIAL_FIRST_BOX_GATE);
   const [privacyBlocked, setPrivacyBlocked] = useState(false);
@@ -919,11 +926,18 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   );
   const [computerInfoOpen, setComputerInfoOpen] = useState(false);
   const [computerViewerRetained, setComputerViewerRetained] = useState(false);
+  const workspaceSession = projectWorkspaceSession(account, localWorkspace);
+  const workspaceReady = workspaceSession.kind === "ready";
+  const workspaceAccountSlot = workspaceSession.accountSlot;
+  const workspaceIdentity = workspaceSession.identity;
+  const isCursorLoggedIn = account?.kind === "logged-in";
   // Frontend 1 owns the windowControls lifecycle through WindowChrome.
   const stagedPaths = useRef(new Set<string>());
   const composerSubmissionQueueRef = useRef<ComposerSubmissionQueue | null>(null);
   const resendSubmissionNoncesRef = useRef(new Set<string>());
   const accountIdentityRef = useRef<string | null>(null);
+  const appliedWorkspaceIdentityRef = useRef<string | null | undefined>(undefined);
+  const workspaceReadyRef = useRef(workspaceReady);
   const accountScopeGenerationRef = useRef(0);
   const accountObservationGenerationRef = useRef(0);
   const accountRef = useRef<CursorAuthStatus | null>(account);
@@ -952,11 +966,58 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   transportRef.current = transport;
   activeAgentIdRef.current = activeAgentId;
   accountRef.current = account;
+  workspaceReadyRef.current = workspaceReady;
   findInChatOpenRef.current = findInChatOpen;
   agentsRef.current = agents;
   hasLoadedAgentsRef.current = hasLoadedAgents;
   pinnedAgentIdsRef.current = pinnedAgentIds;
   entriesByAgentRef.current = entriesByAgent;
+
+  useEffect(() => {
+    if (appliedWorkspaceIdentityRef.current === workspaceIdentity) return;
+    appliedWorkspaceIdentityRef.current = workspaceIdentity;
+    accountScopeGenerationRef.current += 1;
+    localToolPermissionScopeGate.reset();
+    groupMembersRoot.reset();
+    sharedRoomProvider?.reset();
+    for (const submission of composerSubmissionQueueRef.current?.snapshot() ?? []) {
+      if (submission.phase === "queued") composerSubmissionQueueRef.current?.cancelQueued(submission.nonce);
+      else if (submission.phase === "failed") composerSubmissionQueueRef.current?.discard(submission.nonce);
+    }
+    selectionStore.reset();
+    acknowledgementController.reset();
+    completeRosterAgentIdsRef.current = [];
+    setAgents([]);
+    setHasLoadedAgents(false);
+    setBusy(false);
+    setActiveAgentId("");
+    setEntriesByAgent({});
+    setPrivacyBlocked(false);
+    setRosterLoadFailed(false);
+    setRosterFailure(null);
+    rosterAttemptRef.current += 1;
+    setIsRosterRetrying(false);
+    pinnedStateVersionRef.current += 1;
+    pinnedAgentIdsRef.current = [];
+    setPinnedAgentIds([]);
+    navigationHistoryRef.current = createRootShellNavigationState();
+    setPaletteMessageTarget(null);
+    setRoutinesInfoPaneOpen(false);
+    setRoutinesAutomationId(null);
+    setAgentSettingsOpen(false);
+    setGroupInfoPaneOpen(false);
+    setManageSharedRoomId(null);
+    setChannelsInfoPaneOpen(false);
+    setAsyncTasksAgentId(null);
+    asyncTasksReturnFocusRef.current = null;
+    setWorkspaceRoute(null);
+    setCommandPaletteOpen(false);
+    setFindInChatOpen(false);
+    setComputerInfoOpen(false);
+    setAgentNetworkEnabled(false);
+    setTransport(client == null ? "browser" : "connecting");
+    openAgentRequestGenerationRef.current += 1;
+  }, [acknowledgementController, client, groupMembersRoot, localToolPermissionScopeGate, selectionStore, setActiveAgentId, sharedRoomProvider, workspaceIdentity]);
 
   const [hiddenChatsMutationController] = useState(() => createHiddenChatsMutationController({
     call: (input) => client == null
@@ -996,7 +1057,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   useStrictModeSafeDisposal(hiddenChatsMutationController);
 
   const sendComposerPrompt = async (submission: ComposerSubmission): Promise<void> => {
-    if (client == null) throw new Error("coordinator is unavailable for sendPrompt");
+    if (client == null || !workspaceReadyRef.current) throw new Error("workspace is unavailable for sendPrompt");
     const draftAttachments = submission.attachments.map((attachment) => ({ path: attachment.path, name: attachment.name }));
     const attachments = bridge == null ? draftAttachments : await commitComposerAttachments(bridge, draftAttachments);
     for (const attachment of draftAttachments) stagedPaths.current.delete(attachment.path);
@@ -1104,12 +1165,8 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     });
   }, [client, composerSubmissionQueue]);
 
-  const paletteAccountIdentity = account?.kind === "logged-in"
-    ? `logged-in:${account.authId ?? account.email ?? "account"}`
-    : account?.kind ?? "signed-out";
-  const transcriptAccountSlot = account?.kind === "logged-in"
-    ? account.authId ?? account.email ?? "account"
-    : null;
+  const paletteAccountIdentity = workspaceIdentity ?? account?.kind ?? "signed-out";
+  const transcriptAccountSlot = workspaceAccountSlot;
   localToolPermissionScopeGate.enter(transcriptAccountSlot);
   const reactionRootCallbacks = useMemo(() => ({
     onReacted: (input: import("../recovered/features/conversation/cards/transcript-card/reaction-actions").ReactToMessageInput) => {
@@ -1410,7 +1467,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     [client]
   );
   const visibleAgents = agents.filter((agent) => !agent.isHidden).map((agent) => ({ ...agent, isPinned: pinnedAgentIds.includes(agent.id) }));
-  const pinnedAccountKey = account?.kind === "logged-in" ? account.authId ?? account.email ?? "account" : account?.kind ?? "unknown";
+  const pinnedAccountKey = workspaceAccountSlot ?? account?.kind ?? "unknown";
   const settingsNoticeSurface = overlay === "settings" || overlay === "plugins" ? overlay : "none";
   const settingsNoticeScope = `${pinnedAccountKey}:${account?.kind ?? "unknown"}:${settingsNoticeSurface}`;
   const settingsNoticeScopeRef = useRef({ scope: settingsNoticeScope, generation: 0 });
@@ -1453,13 +1510,14 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   }, [activeAgentId, editorSuggestionAdapter, transcriptAccountSlot, transport]);
   useEffect(() => {
     const scopedAgentId = activeAgentId.length > 0 ? activeAgentId : null;
-    editorMcpReferenceProvider.setScope({ accountKey: transcriptAccountSlot, agentId: scopedAgentId });
-    if (transport === "connected" && transcriptAccountSlot != null && scopedAgentId != null) {
+    const accountKey = isCursorLoggedIn ? pinnedAccountKey : null;
+    editorMcpReferenceProvider.setScope({ accountKey, agentId: scopedAgentId });
+    if (transport === "connected" && accountKey != null && scopedAgentId != null) {
       void editorMcpReferenceProvider.refresh();
     } else if (transport !== "connected") {
       editorMcpReferenceProvider.noteReconnect();
     }
-  }, [activeAgentId, editorMcpReferenceProvider, transcriptAccountSlot, transport]);
+  }, [activeAgentId, editorMcpReferenceProvider, isCursorLoggedIn, pinnedAccountKey, transport]);
   const pluginAuthAccountSlot = account?.kind === "logged-in" ? pinnedAccountKey : null;
   const pluginAuthSnapshot = useSyncExternalStore(
     pluginAuthAdapter.subscribe,
@@ -1503,14 +1561,14 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     avatarEditorAdapter.getSnapshot,
     avatarEditorAdapter.getSnapshot
   );
-  const avatarEditorReady = account?.kind === "logged-in"
+  const avatarEditorReady = isCursorLoggedIn
     && activeAgent != null
     && !activeAgent.isGroup
     && avatarEditorSnapshot.status === "ready"
     && avatarEditorSnapshot.controller != null;
   useEffect(() => {
     avatarEditorAdapter.setScope({
-      accountKey: account?.kind === "logged-in" ? pinnedAccountKey : null,
+      accountKey: isCursorLoggedIn ? pinnedAccountKey : null,
       agent: client == null || activeAgent == null ? null : {
         id: activeAgent.id,
         isGroup: activeAgent.isGroup,
@@ -1520,7 +1578,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       }
     });
     setAvatarEditorOpen(false);
-  }, [account?.kind, activeAgent?.avatarColor, activeAgent?.avatarDataUrl, activeAgent?.avatarShape, activeAgent?.id, activeAgent?.isGroup, avatarEditorAdapter, client, pinnedAccountKey]);
+  }, [activeAgent?.avatarColor, activeAgent?.avatarDataUrl, activeAgent?.avatarShape, activeAgent?.id, activeAgent?.isGroup, avatarEditorAdapter, client, isCursorLoggedIn, pinnedAccountKey]);
   const asyncTasksAccountSlot = account?.kind === "logged-in" ? pinnedAccountKey : null;
   useEffect(() => {
     if (asyncTasksProvider == null || client == null || asyncTasksAccountSlot == null) {
@@ -1553,9 +1611,9 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     };
   }, [asyncTasksAccountSlot, asyncTasksProvider, client, transport]);
   useEffect(() => {
-    conversationOutlineProvider.setAccount(account?.kind === "logged-in" ? pinnedAccountKey : null);
+    conversationOutlineProvider.setAccount(workspaceAccountSlot);
     setConversationOutlineAgentId(null);
-  }, [account?.kind, conversationOutlineProvider, pinnedAccountKey]);
+  }, [conversationOutlineProvider, workspaceAccountSlot]);
   useEffect(() => {
     setAsyncTasksAgentId(null);
     asyncTasksReturnFocusRef.current = null;
@@ -1565,7 +1623,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     setAsyncTasksAgentId(null);
     asyncTasksReturnFocusRef.current = null;
   }, [agents, asyncTasksAgentId]);
-  const hiddenChatsAccountSlot = account?.kind === "logged-in" ? pinnedAccountKey : null;
+  const hiddenChatsAccountSlot = workspaceAccountSlot;
   useEffect(() => {
     hiddenChatsMutationController.setScope(hiddenChatsAccountSlot, activeAgentId.length > 0 ? activeAgentId : null);
   }, [activeAgentId, hiddenChatsAccountSlot, hiddenChatsMutationController]);
@@ -1589,7 +1647,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     pollingPolicy: createTeachRecordingPollingPolicy
   }));
   const teachRecordingAgentId = activeAgent == null || activeAgent.isGroup ? null : activeAgent.id;
-  const teachRecordingAccountSlot = account?.kind === "logged-in" ? pinnedAccountKey : null;
+  const teachRecordingAccountSlot = workspaceAccountSlot;
   const teachRecordingLifecycleGenerationRef = useRef(0);
   useEffect(() => {
     if (teachRecordingStore == null) return;
@@ -1612,7 +1670,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       else if (state === "down") teachRecordingStore.reset();
     });
   }, [client, teachRecordingAccountSlot, teachRecordingAgentId, teachRecordingStore]);
-  const acknowledgementAccountSlot = account?.kind === "logged-in" ? pinnedAccountKey : null;
+  const acknowledgementAccountSlot = workspaceAccountSlot;
   useEffect(() => {
     acknowledgementScopeRef.current = { accountSlot: acknowledgementAccountSlot, agentId: activeAgentId.length > 0 ? activeAgentId : null };
     acknowledgementController.setScope(acknowledgementAccountSlot, activeAgentId.length > 0 ? activeAgentId : null);
@@ -1648,13 +1706,13 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   );
   useEffect(() => {
     findInChatController.setScope(transcriptAccountSlot, activeAgentId.length > 0 ? activeAgentId : null);
-    if (account?.kind !== "logged-in" || activeAgentId.length === 0) setFindInChatOpen(false);
-  }, [account?.kind, activeAgentId, findInChatController, transcriptAccountSlot]);
+    if (!workspaceReady || activeAgentId.length === 0) setFindInChatOpen(false);
+  }, [activeAgentId, findInChatController, transcriptAccountSlot, workspaceReady]);
   useEffect(() => {
     findInChatController.replaceEntries(entries);
   }, [entries, findInChatController]);
   useEffect(() => {
-    const scopedAccountKey = account?.kind === "logged-in" && transport === "connected" ? transcriptAccountSlot : null;
+    const scopedAccountKey = isCursorLoggedIn && transport === "connected" ? transcriptAccountSlot : null;
     const scopedAgentId = scopedAccountKey == null || activeAgentId.length === 0 ? null : activeAgentId;
     editorPrReferenceProvider.setScope({ accountKey: scopedAccountKey, agentId: scopedAgentId });
     if (scopedAccountKey == null || scopedAgentId == null) {
@@ -1662,7 +1720,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       return;
     }
     editorPrReferenceProvider.setEntries(entries);
-  }, [account?.kind, activeAgentId, editorPrReferenceProvider, entries, transcriptAccountSlot, transport]);
+  }, [activeAgentId, editorPrReferenceProvider, entries, isCursorLoggedIn, transcriptAccountSlot, transport]);
   useEffect(() => {
     spreadsheetViewerProvider.reset();
     spreadsheetTriggerRef.current = null;
@@ -1670,7 +1728,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   }, [activeAgentId, spreadsheetViewerProvider, transcriptAccountSlot]);
   useEffect(() => {
     const transcript = findTranscriptContainer;
-    if (transcript == null || account?.kind !== "logged-in" || activeAgentId.length === 0) return undefined;
+    if (transcript == null || !workspaceReady || activeAgentId.length === 0) return undefined;
     const attachmentsByPath = new Map<string, DraftAttachment>();
     for (const entry of entries) {
       for (const attachment of entry.kind === "message" ? entry.attachments ?? [] : []) attachmentsByPath.set(attachment.path, attachment);
@@ -1713,7 +1771,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       };
     });
     return () => { for (const cleanup of cleanups) cleanup(); };
-  }, [account?.kind, activeAgentId, entries, findTranscriptContainer, spreadsheetViewerProvider]);
+  }, [activeAgentId, entries, findTranscriptContainer, spreadsheetViewerProvider, workspaceReady]);
   const closeFindInChat = useCallback(() => {
     setFindInChatOpen(false);
     const restoreFocus = () => findTranscriptContainer?.focus();
@@ -1770,7 +1828,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     [entries, transcriptCardContract]
   );
   const pendingLocalToolPermission = useMemo<LocalToolPermissionRequest | null>(() => {
-    if (account?.kind !== "logged-in" || transcriptAccountSlot == null) return null;
+    if (!workspaceReady || transcriptAccountSlot == null) return null;
     const entry = transcriptCardEntries.find((candidate) => candidate.kind === "send-message"
       && candidate.message.type === "local-tool-permission"
       && candidate.message.ask.status === "pending"
@@ -1790,7 +1848,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     return legacyEntry == null
       ? null
       : { entryId: legacyEntry.entryId, agentId: activeAgent?.id ?? legacyEntry.agentId, ask: legacyEntry.ask };
-  }, [account?.kind, activeAgent?.id, entries, localToolPermissionScopeGate, transcriptAccountSlot, transcriptCardEntries]);
+  }, [activeAgent?.id, entries, localToolPermissionScopeGate, transcriptAccountSlot, transcriptCardEntries, workspaceReady]);
   const localToolPermissionDock = <LocalToolPermissionDock
     isEscapeTarget={true}
     request={pendingLocalToolPermission}
@@ -1806,9 +1864,9 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   );
   useEffect(() => {
     transcriptCardWidgetInteractions.setScope(transcriptCardScope);
-    transcriptCardCloudAgents.setScope(transcriptCardScope);
+    transcriptCardCloudAgents.setScope(isCursorLoggedIn ? transcriptCardScope : { accountSlot: null, agentId: null });
     transcriptCardWidgetInteractions.replaceEntries(transcriptCardEntries);
-  }, [transcriptCardCloudAgents, transcriptCardEntries, transcriptCardScope, transcriptCardWidgetInteractions]);
+  }, [isCursorLoggedIn, transcriptCardCloudAgents, transcriptCardEntries, transcriptCardScope, transcriptCardWidgetInteractions]);
   useEffect(() => {
     const actionScope = `${transcriptCardScope.accountSlot ?? ""}:${transcriptCardScope.agentId ?? ""}`;
     if (transcriptCardAutoReviewActionScopeRef.current != null && transcriptCardAutoReviewActionScopeRef.current !== actionScope) {
@@ -1816,7 +1874,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       transcriptCardAutoReviewActionsRef.current.clear();
     }
     transcriptCardAutoReviewActionScopeRef.current = actionScope;
-    transcriptCardListenerIntegrations?.setScope(transcriptCardScope);
+    transcriptCardListenerIntegrations?.setScope(isCursorLoggedIn ? transcriptCardScope : { accountSlot: null, agentId: null });
     transcriptCardSecretRequests?.setScope(transcriptCardScope);
     transcriptCardUrlCards.reset();
     transcriptCardConnectors.close();
@@ -1829,7 +1887,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       transcriptCardListenerSubscriptionRef.current?.();
       transcriptCardListenerSubscriptionRef.current = null;
     }
-  }, [account?.kind, client, transcriptCardConnectors, transcriptCardListenerIntegrations, transcriptCardSecretRequests, transcriptCardScope, transcriptCardUrlCards]);
+  }, [account?.kind, client, isCursorLoggedIn, transcriptCardConnectors, transcriptCardListenerIntegrations, transcriptCardSecretRequests, transcriptCardScope, transcriptCardUrlCards]);
   useEffect(() => {
     transcriptCardSecretRequests?.replaceEntries(transcriptCardSecretEntries);
   }, [transcriptCardSecretEntries, transcriptCardSecretRequests]);
@@ -1935,7 +1993,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       || computer.statusStore?.getStatus(activeAgent?.id ?? null)?.imageUpdateAvailable === true,
     [activeAgent?.id, activeComputerStatus.status?.imageUpdateAvailable, computer.statusStore]
   );
-  const settingsComputerScope = `${account?.kind === "logged-in" ? pinnedAccountKey : "signed-out"}:${activeAgent?.id ?? ""}`;
+  const settingsComputerScope = `${workspaceAccountSlot ?? "signed-out"}:${activeAgent?.id ?? ""}`;
   const settingsComputerGenerationRef = useRef(0);
   const settingsComputerQueueDispatchRef = useRef<string | null>(null);
   const [settingsComputerActionState, setSettingsComputerActionState] = useState<SettingsComputerActionState>(() => ({
@@ -1998,7 +2056,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     setChannelsInfoPaneOpen(false);
     setComputerInfoOpen(true);
   }, []);
-  const settingsComputerCanUpdateBaseline = account?.kind === "logged-in" && activeAgent != null && !activeAgent.isGroup;
+  const settingsComputerCanUpdateBaseline = workspaceReady && activeAgent != null && !activeAgent.isGroup;
   const settingsComputerWorkingAgentNames = useMemo(
     () => agents.filter((agent) => agent.isRunning).map((agent) => agent.name),
     [agents]
@@ -2069,16 +2127,16 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     }
   }), [activeComputerImageUpdateAvailable, activeComputerStatus.status, bridge.isDev, cancelSettingsComputerUpdate, queueSettingsComputerUpdate, runSettingsComputerAction, scopedSettingsComputerActionState.isBlocked, scopedSettingsComputerActionState.isUpdateQueued, scopedSettingsComputerActionState.pending, settingsComputerCanUpdateBaseline, settingsComputerCanUpdateBox, settingsComputerRebuildStates, settingsComputerWorkingAgentNames]);
   const computerUpdateAction = useMemo<CommandPaletteComputerUpdateAction | null>(() => {
-    if (account?.kind !== "logged-in" || activeAgent == null || activeAgent.isGroup) return null;
+    if (!workspaceReady || activeAgent == null || activeAgent.isGroup) return null;
     if (!activeComputerImageUpdateAvailable) return null;
     if (scopedSettingsComputerActionState.pending != null || scopedSettingsComputerActionState.isBlocked || scopedSettingsComputerActionState.isUpdateQueued) return null;
     if (!settingsComputerCanUpdateBaseline) return null;
     return settingsComputerWorkingAgentNames.length === 0 ? "ready" : "busy-override";
-  }, [account?.kind, activeAgent, activeComputerImageUpdateAvailable, scopedSettingsComputerActionState.isBlocked, scopedSettingsComputerActionState.isUpdateQueued, scopedSettingsComputerActionState.pending, settingsComputerCanUpdateBaseline, settingsComputerWorkingAgentNames]);
+  }, [activeAgent, activeComputerImageUpdateAvailable, scopedSettingsComputerActionState.isBlocked, scopedSettingsComputerActionState.isUpdateQueued, scopedSettingsComputerActionState.pending, settingsComputerCanUpdateBaseline, settingsComputerWorkingAgentNames, workspaceReady]);
   const computerUpdateConfirmationController = useMemo(() => createComputerUpdateConfirmationController({
     context: {
       scope: {
-        accountSlot: account?.kind === "logged-in" ? pinnedAccountKey : null,
+        accountSlot: workspaceAccountSlot,
         agentId: activeAgent?.id ?? null,
         boxId: "forever-box"
       },
@@ -2096,7 +2154,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   useEffect(() => {
     computerUpdateConfirmationController.setContext({
       scope: {
-        accountSlot: account?.kind === "logged-in" ? pinnedAccountKey : null,
+        accountSlot: workspaceAccountSlot,
         agentId: activeAgent?.id ?? null,
         boxId: "forever-box"
       },
@@ -2108,7 +2166,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
         isBlocked: scopedSettingsComputerActionState.isBlocked
       }
     });
-  }, [account?.kind, activeAgent?.id, activeComputerImageUpdateAvailable, computerUpdateAction, computerUpdateConfirmationController, pinnedAccountKey, scopedSettingsComputerActionState.isBlocked, scopedSettingsComputerActionState.pending, settingsComputerCanUpdateBaseline]);
+  }, [activeAgent?.id, activeComputerImageUpdateAvailable, computerUpdateAction, computerUpdateConfirmationController, scopedSettingsComputerActionState.isBlocked, scopedSettingsComputerActionState.pending, settingsComputerCanUpdateBaseline, workspaceAccountSlot]);
   const onboardingComputerStatus = useMemo(
     () => createOnboardingComputerStatusSource(computer.statusStore),
     [computer.statusStore]
@@ -2150,14 +2208,14 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   }, [computer.isOpen, computerInfoOpen]);
 
   const refreshRoster = useCallback(async () => {
-    if (client == null) return;
+    if (client == null || !workspaceReadyRef.current) return;
     const accountScopeGeneration = accountScopeGenerationRef.current;
     const transportScopeGeneration = transportScopeGenerationRef.current;
     const attempt = ++rosterAttemptRef.current;
     const isCurrent = () => rosterAttemptRef.current === attempt
       && accountScopeGenerationRef.current === accountScopeGeneration
       && transportScopeGenerationRef.current === transportScopeGeneration
-      && accountRef.current?.kind === "logged-in";
+      && workspaceReadyRef.current;
     setIsRosterRetrying(true);
     try {
       const projected = projectRendererAgents(await client.call("listAgents"));
@@ -2222,7 +2280,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     const accountScopeGeneration = accountScopeGenerationRef.current;
     const transportScopeGeneration = transportScopeGenerationRef.current;
     const requestGeneration = ++openAgentRequestGenerationRef.current;
-    if (accountRef.current?.kind !== "logged-in") return;
+    if (!workspaceReadyRef.current) return;
     setTranscriptLoadError((current) => current?.agentId === agentId ? null : current);
     const hasLoadedEntries = entriesByAgentRef.current[agentId] != null;
     transcriptPaginationController.setScope(transcriptAccountSlot, agentId);
@@ -2241,7 +2299,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       if (accountScopeGenerationRef.current !== accountScopeGeneration
         || openAgentRequestGenerationRef.current !== requestGeneration
         || transportScopeGenerationRef.current !== transportScopeGeneration
-        || accountRef.current?.kind !== "logged-in") return;
+        || !workspaceReadyRef.current) return;
       const projectedPage = projectTranscriptPageResult(page, agentName, agentId);
       setEntriesByAgent((current) => ({ ...current, [agentId]: projectedPage.entries }));
       transcriptPaginationController.installInitialPage(projectedPage);
@@ -2252,7 +2310,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       if (accountScopeGenerationRef.current !== accountScopeGeneration
         || openAgentRequestGenerationRef.current !== requestGeneration
         || transportScopeGenerationRef.current !== transportScopeGeneration
-        || accountRef.current?.kind !== "logged-in") return;
+        || !workspaceReadyRef.current) return;
       selectionStore.settle(agentId);
       selectionStore.reconcile({ agentIds: completeRosterAgentIdsRef.current, isRosterComplete: hasLoadedAgentsRef.current });
       setTranscriptLoadError({ agentId, accountScopeGeneration });
@@ -2265,12 +2323,12 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   }, [openAgent]);
 
   const openSidebarSearch = useCallback(() => {
-    if (accountRef.current?.kind !== "logged-in") return;
+    if (!workspaceReadyRef.current) return;
     setCommandPaletteOpen(true);
   }, []);
   const sidebarSearchTrigger = useMemo(() => createSidebarSearchTrigger({ openSearch: openSidebarSearch }), [openSidebarSearch]);
   const openSidebarProfile = useCallback((agentId: string) => {
-    if (bridge == null || accountRef.current?.kind !== "logged-in") return;
+    if (bridge == null || !workspaceReadyRef.current) return;
     const target = agentsRef.current.find((agent) => agent.id === agentId);
     if (target == null || target.isGroup) return;
     setOverlay(null);
@@ -2283,9 +2341,9 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       setAgentSettingsOpen(true);
       return;
     }
-    const accountAtOpen = accountRef.current;
+    const workspaceGenerationAtOpen = accountScopeGenerationRef.current;
     void openAgent(agentId).then(() => {
-      if (accountRef.current !== accountAtOpen || activeAgentIdRef.current !== agentId) return;
+      if (accountScopeGenerationRef.current !== workspaceGenerationAtOpen || activeAgentIdRef.current !== agentId) return;
       setAgentSettingsOpen(true);
     });
   }, [bridge, openAgent]);
@@ -2294,19 +2352,24 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   useEffect(() => {
     if (client == null) return;
     const lifecycleGeneration = ++clientLifecycleGenerationRef.current;
+    if (!workspaceReady) return () => {
+      queueMicrotask(() => {
+        if (clientLifecycleGenerationRef.current === lifecycleGeneration) client.dispose();
+      });
+    };
     const accountScopeGeneration = accountScopeGenerationRef.current;
     let active = true;
     const isCurrent = () => active
       && clientLifecycleGenerationRef.current === lifecycleGeneration
       && accountScopeGenerationRef.current === accountScopeGeneration;
     client.ready.then(() => {
-      if (!isCurrent() || accountRef.current?.kind !== "logged-in") return;
+      if (!isCurrent() || !workspaceReadyRef.current) return;
       transportScopeGenerationRef.current += 1;
       setTransport("connected");
       void refreshRoster().catch((error: unknown) => setNotice(error instanceof Error ? error.message : String(error)));
-      void refreshAgentNetworkAvailability();
+      if (accountRef.current?.kind === "logged-in") void refreshAgentNetworkAvailability();
     }, () => {
-      if (!isCurrent() || accountRef.current?.kind !== "logged-in") return;
+      if (!isCurrent() || !workspaceReadyRef.current) return;
       transportScopeGenerationRef.current += 1;
       setTransport("down");
       setRosterLoadFailed(true);
@@ -2319,15 +2382,15 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
         setRosterLoadFailed(true);
         setIsRosterRetrying(false);
       }
-      if (state === "connected" && accountRef.current?.kind === "logged-in") {
+      if (state === "connected" && workspaceReadyRef.current) {
         if (connectionController?.get().isRetrying !== true) {
           void refreshRoster().catch((error: unknown) => setNotice(error instanceof Error ? error.message : String(error)));
         }
-        void refreshAgentNetworkAvailability();
+        if (accountRef.current?.kind === "logged-in") void refreshAgentNetworkAvailability();
       }
     });
     const stopAgents = client.subscribe("agents", (value) => {
-      if (!isCurrent() || accountRef.current?.kind !== "logged-in") return;
+      if (!isCurrent() || !workspaceReadyRef.current) return;
       const projected = projectRendererAgents(value);
       setPrivacyBlocked(false);
       setRosterLoadFailed(false);
@@ -2338,13 +2401,13 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       setHasLoadedAgents(true);
     });
     const stopUpsert = client.subscribe("agent-upserted", (value) => {
-      if (!isCurrent() || accountRef.current?.kind !== "logged-in") return;
+      if (!isCurrent() || !workspaceReadyRef.current) return;
       const projected = projectRendererAgent(value);
       if (projected != null) setAgents((current) => [projected, ...current.filter((agent) => agent.id !== projected.id)].sort((a, b) => b.updatedAt - a.updatedAt));
     });
     const stopTranscript = reactionRoot?.feed.observeEntriesFeed({
       onBaseline: ({ agentId: ownerId, entries: rawEntries }) => {
-        if (!isCurrent() || accountRef.current?.kind !== "logged-in") return;
+        if (!isCurrent() || !workspaceReadyRef.current) return;
         const owner = agentsRef.current.find((agent) => agent.id === ownerId);
         const projectedEntries = projectTranscriptFeedEntries(rawEntries, owner?.name ?? UI_TEXT.title, ownerId);
         for (const entry of projectedEntries) {
@@ -2362,7 +2425,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
         setEntriesByAgent((current) => ({ ...current, [ownerId]: projectedEntries }));
       },
       onUpdated: ({ agentId: ownerId, after: event }) => {
-        if (!isCurrent() || accountRef.current?.kind !== "logged-in") return;
+        if (!isCurrent() || !workspaceReadyRef.current) return;
         const owner = agentsRef.current.find((agent) => agent.id === ownerId);
         const projected = projectTranscriptEntry(event, entriesByAgentRef.current[ownerId]?.length ?? 0, owner?.name ?? UI_TEXT.title, ownerId);
         if (projected == null || !ownerId) return;
@@ -2373,7 +2436,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
         });
       },
       onCleared: (ownerId) => {
-        if (!isCurrent() || accountRef.current?.kind !== "logged-in") return;
+        if (!isCurrent() || !workspaceReadyRef.current) return;
         setEntriesByAgent((current) => {
           if (!(ownerId in current)) return current;
           const next = { ...current };
@@ -2385,7 +2448,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
         transcriptPaginationController.reset();
       },
       onAppended: ({ agentId: ownerId, entry: event }) => {
-      if (!isCurrent() || accountRef.current?.kind !== "logged-in") return;
+      if (!isCurrent() || !workspaceReadyRef.current) return;
       const owner = agentsRef.current.find((agent) => agent.id === ownerId);
       const projected = projectTranscriptEntry(event, entriesByAgentRef.current[ownerId]?.length ?? 0, owner?.name ?? UI_TEXT.title, ownerId);
       if (projected == null || !ownerId) return;
@@ -2429,10 +2492,10 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
         if (clientLifecycleGenerationRef.current === lifecycleGeneration) client.dispose();
       });
     };
-  }, [account?.kind, client, clientLifecycleGenerationRef, connectionController, pinnedAccountKey, reactionRoot, refreshAgentNetworkAvailability, refreshRoster, selectionStore, transcriptAccountSlot]);
+  }, [client, clientLifecycleGenerationRef, connectionController, reactionRoot, refreshAgentNetworkAvailability, refreshRoster, selectionStore, transcriptAccountSlot, workspaceIdentity, workspaceReady]);
 
   useEffect(() => {
-    if (bridge == null || account?.kind !== "logged-in") {
+    if (bridge == null || !workspaceReady) {
       pinnedStateVersionRef.current += 1;
       pinnedAgentIdsRef.current = [];
       setPinnedAgentIds([]);
@@ -2446,11 +2509,11 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       setPinnedAgentIds(value);
     }).catch(() => {});
     return () => { active = false; };
-  }, [bridge, pinnedAccountKey]);
+  }, [bridge, pinnedAccountKey, workspaceReady]);
 
   useEffect(() => {
     let active = true;
-    const accountSlot = account?.kind === "logged-in" ? pinnedAccountKey : null;
+    const accountSlot = workspaceAccountSlot;
     void selectionStore.restore(accountSlot).then(() => {
       if (!active || accountSlot == null) return;
       selectionStore.reconcile({
@@ -2459,12 +2522,11 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       });
     });
     return () => { active = false; };
-  }, [account?.kind, pinnedAccountKey, selectionStore]);
+  }, [selectionStore, workspaceAccountSlot]);
 
   useEffect(() => {
-    const accountSlot = account?.kind === "logged-in" ? pinnedAccountKey : null;
-    void composerDraftStore.restore(accountSlot);
-  }, [account?.kind, composerDraftStore, pinnedAccountKey]);
+    void composerDraftStore.restore(workspaceAccountSlot);
+  }, [composerDraftStore, workspaceAccountSlot]);
 
   useEffect(() => {
     void uiLayoutStore.restore();
@@ -2494,7 +2556,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   }, [account?.kind, pinnedAccountKey, bridge]);
 
   useEffect(() => {
-    if (client == null || account?.kind !== "logged-in" || rebuildBoxStore == null || rebuildTransportStore == null) {
+    if (client == null || !workspaceReady || rebuildBoxStore == null || rebuildTransportStore == null) {
       rebuildMigrationStore.reset();
       rebuildBoxStore?.reset();
       rebuildTransportStore?.reset();
@@ -2520,7 +2582,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       rebuildBoxStore.reset();
       rebuildTransportStore.reset();
     };
-  }, [account?.kind, client, pinnedAccountKey, rebuildBoxStore, rebuildMigrationStore, rebuildTransportStore]);
+  }, [client, rebuildBoxStore, rebuildMigrationStore, rebuildTransportStore, workspaceIdentity, workspaceReady]);
 
   useStrictModeSafeDisposal(accessRosterStore);
   useStrictModeSafeDisposal(rebuildMigrationStore);
@@ -2537,7 +2599,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   }, [accessRosterSnapshot.failure?.code, accessRosterSnapshot.failure?.transportKind, accessRosterSnapshot.isShowingRestoredRoster, accessRosterSnapshot.loadState]);
 
   useEffect(() => {
-    const accountSlot = account?.kind === "logged-in" ? pinnedAccountKey : null;
+    const accountSlot = workspaceAccountSlot;
     setDeleteSection(null);
     sidebarCollapseStore.reset();
     sidebarSectionsStore.reset();
@@ -2552,7 +2614,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       if (active) void sidebarSectionsStore.loadFromBridge();
     });
     return () => { active = false; };
-  }, [account?.kind, pinnedAccountKey, sidebarCollapseStore, sidebarSectionsStore]);
+  }, [sidebarCollapseStore, sidebarSectionsStore, workspaceAccountSlot]);
 
   useStrictModeSafeDisposal(selectionStore);
   useStrictModeSafeDisposal(composerDraftStore);
@@ -2568,13 +2630,13 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   useStrictModeSafeDisposal(settingsNoticeController);
 
   useEffect(() => {
-    if (client == null || account?.kind !== "logged-in") return;
+    if (client == null || !workspaceReady) return;
     let active = true;
     const loadSections = () => { if (active) void sidebarSectionsStore.loadFromBridge(); };
     const stopTransport = client.subscribeTransport((state) => { if (state === "connected") loadSections(); });
     void client.ready.then(loadSections, () => {});
     return () => { active = false; stopTransport(); };
-  }, [account?.kind, client, sidebarSectionsStore]);
+  }, [client, sidebarSectionsStore, workspaceReady]);
 
   useEffect(() => {
     if (activeAgentId && entriesByAgent[activeAgentId] == null) void openAgent(activeAgentId);
@@ -2599,19 +2661,19 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   useEffect(() => {
     if (routineProvider == null) return;
     routineProvider.reset();
-    if (client == null || account?.kind !== "logged-in") return () => routineProvider.cancel();
+    if (client == null || !workspaceReady) return () => routineProvider.cancel();
     let active = true;
     const refresh = () => { if (active) void routineProvider.refresh(); };
     const stopTransport = client.subscribeTransport((state) => { if (state === "connected") refresh(); });
     void client.ready.then(refresh, () => {});
     return () => { active = false; stopTransport(); routineProvider.cancel(); };
-  }, [account?.kind, client, paletteAccountIdentity, routineProvider]);
+  }, [client, paletteAccountIdentity, routineProvider, workspaceReady]);
 
   useStrictModeSafeDisposal(routineProvider);
 
   useEffect(() => {
     routinesController.reset();
-    if (client == null || account?.kind !== "logged-in") return () => {};
+    if (client == null || !workspaceReady) return () => {};
     const stopAutomations = client.subscribe("automations", (value) => {
       if (typeof value !== "object" || value == null || Array.isArray(value)) return;
       const event = value as { agentId?: unknown; automations?: unknown };
@@ -2619,7 +2681,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       routinesController.ingest({ agentId: event.agentId, automations: event.automations });
     });
     return () => { stopAutomations(); routinesController.reset(); };
-  }, [account?.kind, client, paletteAccountIdentity, routinesController]);
+  }, [client, paletteAccountIdentity, routinesController, workspaceReady]);
 
   useStrictModeSafeDisposal(routinesController);
   useStrictModeSafeDisposal(agentSettingsController);
@@ -2630,7 +2692,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     if (fileProvider == null) return;
     fileProvider.reset();
     fileProvider.setAvailable(false);
-    if (client == null || account?.kind !== "logged-in") return () => fileProvider.cancel();
+    if (client == null || !workspaceReady) return () => fileProvider.cancel();
     let active = true;
     const refreshAvailability = async () => {
       try {
@@ -2645,7 +2707,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     const stopTransport = client.subscribeTransport((state) => { if (state === "connected") void refreshAvailability(); });
     void client.ready.then(refreshAvailability, () => {});
     return () => { active = false; stopTransport(); fileProvider.cancel(); };
-  }, [account?.kind, client, fileProvider, paletteAccountIdentity]);
+  }, [client, fileProvider, paletteAccountIdentity, workspaceReady]);
 
   useStrictModeSafeDisposal(fileProvider);
 
@@ -2654,7 +2716,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     if (messageProvider == null) return;
     messageProvider.reset();
     messageProvider.setAvailable(false);
-    if (client == null || account?.kind !== "logged-in") return () => messageProvider.cancel();
+    if (client == null || !workspaceReady) return () => messageProvider.cancel();
     let active = true;
     const refreshAvailability = async () => {
       try {
@@ -2667,7 +2729,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     const stopTransport = client.subscribeTransport((state) => { if (state === "connected") void refreshAvailability(); });
     void client.ready.then(refreshAvailability, () => {});
     return () => { active = false; stopTransport(); messageProvider.cancel(); };
-  }, [account?.kind, client, messageProvider, paletteAccountIdentity]);
+  }, [client, messageProvider, paletteAccountIdentity, workspaceReady]);
 
   useStrictModeSafeDisposal(messageProvider);
 
@@ -2675,7 +2737,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   useEffect(() => {
     linkMetadataProvider.reset();
     linkMetadataProvider.setAvailable(false);
-    if (client == null || account?.kind !== "logged-in") return () => linkMetadataProvider.cancel();
+    if (client == null || !workspaceReady) return () => linkMetadataProvider.cancel();
     let active = true;
     const refreshAvailability = async () => {
       try {
@@ -2688,9 +2750,30 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     const stopTransport = client.subscribeTransport((state) => { if (state === "connected") void refreshAvailability(); });
     void client.ready.then(refreshAvailability, () => {});
     return () => { active = false; stopTransport(); linkMetadataProvider.cancel(); };
-  }, [account?.kind, client, linkMetadataProvider, paletteAccountIdentity]);
+  }, [client, linkMetadataProvider, paletteAccountIdentity, workspaceReady]);
 
   useStrictModeSafeDisposal(linkMetadataProvider);
+
+  useEffect(() => {
+    let active = true;
+    let requestGeneration = 0;
+    const refresh = async () => {
+      const generation = ++requestGeneration;
+      const next = await readLocalWorkspaceReadiness(bridge);
+      if (active && generation === requestGeneration) setLocalWorkspace(next);
+    };
+    const onWorkspaceChanged = () => { void refresh(); };
+    const onWindowFocus = () => { void refresh(); };
+    void refresh();
+    window.addEventListener(LOCAL_WORKSPACE_CHANGED_EVENT, onWorkspaceChanged);
+    window.addEventListener("focus", onWindowFocus);
+    return () => {
+      active = false;
+      requestGeneration += 1;
+      window.removeEventListener(LOCAL_WORKSPACE_CHANGED_EVENT, onWorkspaceChanged);
+      window.removeEventListener("focus", onWindowFocus);
+    };
+  }, [bridge]);
 
   useEffect(() => {
     if (bridge == null) return;
@@ -2700,56 +2783,20 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       const identity = status.kind === "logged-in" ? `logged-in:${status.authId ?? status.email ?? "account"}` : status.kind;
       const identityChanged = accountIdentityRef.current != null && accountIdentityRef.current !== identity;
       if (accountIdentityRef.current !== identity) {
-        accountScopeGenerationRef.current += 1;
-        localToolPermissionScopeGate.reset();
-        groupMembersRoot.reset();
         sharedRoomProvider?.reset();
-        setGroupInfoPaneOpen(false);
-        setManageSharedRoomId(null);
-      }
-      if (accountIdentityRef.current != null && accountIdentityRef.current !== identity) {
-        selectionStore.reset();
-        acknowledgementController.reset();
-        completeRosterAgentIdsRef.current = [];
-        setAgents([]); setHasLoadedAgents(false); setActiveAgentId(""); setEntriesByAgent({});
-        setPrivacyBlocked(false);
-        setRosterLoadFailed(false);
-        setRosterFailure(null);
-        rosterAttemptRef.current += 1;
-        setIsRosterRetrying(false);
-        pinnedStateVersionRef.current += 1; pinnedAgentIdsRef.current = []; setPinnedAgentIds([]);
-        navigationHistoryRef.current = createRootShellNavigationState();
-        setPaletteMessageTarget(null);
-        setRoutinesInfoPaneOpen(false);
-        setRoutinesAutomationId(null);
-        setAgentSettingsOpen(false);
         setManageSharedRoomId(null);
         setChannelsInfoPaneOpen(false);
         setAsyncTasksAgentId(null);
         asyncTasksReturnFocusRef.current = null;
-        setWorkspaceRoute(null); setCommandPaletteOpen(false);
-        setTransport(client == null ? "browser" : "connecting");
-        openAgentRequestGenerationRef.current += 1;
       }
       accountIdentityRef.current = identity;
       if (status.kind !== "logged-in") {
-        localToolPermissionScopeGate.reset();
-        selectionStore.reset();
-        acknowledgementController.reset();
         sharedRoomProvider?.reset();
-        setPrivacyBlocked(false);
-        setRosterLoadFailed(false);
-        setRosterFailure(null);
-        rosterAttemptRef.current += 1;
-        setIsRosterRetrying(false);
-        setPaletteMessageTarget(null);
-        setRoutinesInfoPaneOpen(false);
-        setRoutinesAutomationId(null);
-        setAgentSettingsOpen(false);
         setManageSharedRoomId(null);
         setChannelsInfoPaneOpen(false);
         setAsyncTasksAgentId(null);
         asyncTasksReturnFocusRef.current = null;
+        setOverlay((current) => current === "plugins" || current === "confirm-logout" ? null : current);
       }
       setAccount(status);
       if (identityChanged) void bridge.onboarding.getSeen().then((seen) => resolveOnboarding(status, seen)).catch(() => {});
@@ -2775,7 +2822,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     });
     const stopDeepLink = bridge.onDeepLink((value) => {
       const intent = parseDesktopIntent(value, "deep-link");
-      if (intent?.kind === "plugin-add") { setPluginQuery(intent.pluginId); setOverlay("plugins"); }
+      if (intent?.kind === "plugin-add" && accountRef.current?.kind === "logged-in") { setPluginQuery(intent.pluginId); setOverlay("plugins"); }
       else if (intent?.kind === "deep-link-info") setDeepLinkInfo(intent.link);
     });
     const stopOnboarding = bridge.onForceOnboarding(() => setOnboardingOpen(true));
@@ -2786,7 +2833,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     applyRootShellTheme(bridge.theme.initial.resolved);
     void bridge.deepLinksReady().catch((error: unknown) => setNotice(error instanceof Error ? error.message : String(error)));
     return () => { active = false; stopAccount(); stopTheme(); themeInstaller?.dispose(); stopWindow(); stopFocus(); stopDeepLink(); stopOnboarding(); stopSkip(); stopFeedback(); stopAbout(); };
-  }, [bridge, client, groupMembersRoot, localToolPermissionScopeGate, openAgent, resolveOnboarding, selectionStore, sharedRoomProvider]);
+  }, [bridge, openAgent, resolveOnboarding, sharedRoomProvider]);
 
   // @evidence src/app/dist/renderer/assets/index-UbX-y3il.js#L537
   useEffect(() => {
@@ -2817,7 +2864,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   }, [client, refreshRoster, transport]);
 
   const createAgent = async () => {
-    if (client == null) return;
+    if (client == null || !workspaceReadyRef.current) return;
     setBusy(true);
     try {
       const result = await client.call("createAgent", { name: "New chat", description: "", origin: "user", isKickstartRequested: false, clientNonce: makeClientNonce() });
@@ -2833,10 +2880,10 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   openAgentRef.current = openAgent;
 
   const globalShortcutActions = useMemo(() => createRootShellShortcutActions({
-    toggleCommandPalette: () => setCommandPaletteOpen((open) => !open),
-    openSearch: () => setCommandPaletteOpen(true),
+    toggleCommandPalette: () => { if (workspaceReadyRef.current) setCommandPaletteOpen((open) => !open); },
+    openSearch: () => { if (workspaceReadyRef.current) setCommandPaletteOpen(true); },
     findInChat: () => {
-      if (accountRef.current?.kind !== "logged-in" || activeAgentIdRef.current.length === 0) return;
+      if (!workspaceReadyRef.current || activeAgentIdRef.current.length === 0) return;
       setCommandPaletteOpen(false);
       setOverlay(null);
       setFindInChatOpen(true);
@@ -2849,6 +2896,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       setOverlay("settings");
     },
     openTools: () => {
+      if (accountRef.current?.kind !== "logged-in") return;
       setPluginQuery("");
       setOverlay("plugins");
     },
@@ -2903,7 +2951,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   }, [globalShortcutController]);
   useEffect(() => {
     globalShortcutController.acceptOverlayState({
-      isArmed: account?.kind === "logged-in" && (findInChatOpen || commandPaletteOpen || overlay != null || asyncTasksAgentId != null),
+      isArmed: workspaceReady && (findInChatOpen || commandPaletteOpen || overlay != null || asyncTasksAgentId != null),
       isOverlayStacked: commandPaletteOpen && overlay != null,
       close: () => {
         if (findInChatOpenRef.current) {
@@ -2914,7 +2962,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
         else if (asyncTasksAgentId != null) closeAsyncTasks();
       }
     });
-  }, [account?.kind, asyncTasksAgentId, closeAsyncTasks, closeFindInChat, commandPaletteOpen, findInChatController, findInChatOpen, globalShortcutController, overlay]);
+  }, [asyncTasksAgentId, closeAsyncTasks, closeFindInChat, commandPaletteOpen, findInChatController, findInChatOpen, globalShortcutController, overlay, workspaceReady]);
 
   const stageFiles = async (files: File[]) => {
     if (activeAgent == null || bridge == null) return;
@@ -3243,7 +3291,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     });
   }, [groupMembersRoot, settingsUpdateController, updateStatus]);
   const openCommandPaletteInfo = useCallback((section: CommandPaletteInfoSection) => {
-    if (account?.kind !== "logged-in" || activeAgent == null) return;
+    if (!workspaceReady || activeAgent == null) return;
     setCommandPaletteOpen(false);
     setOverlay(null);
     setGroupInfoPaneOpen(false);
@@ -3269,7 +3317,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       return;
     }
     setAgentSettingsOpen(true);
-  }, [account?.kind, activeAgent, agentChannelsController]);
+  }, [activeAgent, agentChannelsController, workspaceReady]);
   const openComputerUpdateConfirm = useCallback((action: CommandPaletteComputerUpdateAction) => {
     const content = projectComputerUpdateConfirmationContent(action, settingsComputerWorkingAgentNames);
     if (content == null || computerUpdateAction !== action) return;
@@ -3336,7 +3384,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
         id: `settings:${section.id}`, label: `Settings: ${section.label}`, keywords: section.keywords, detail: "Settings",
         run: () => { setSettingsSection(section.id); setManageSharedRoomId(null); setOverlay("settings"); }
       });
-      commands.push({
+      if (isCursorLoggedIn) commands.push({
         id: "overlay:plugins", label: "Plugins", keywords: ["plugins", "marketplace", "tools", "skills", "mcp", "connectors", "customize"],
         run: () => { setPluginQuery(""); setOverlay("plugins"); }
       });
@@ -3353,11 +3401,11 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     if (computerUpdateCommand != null) commands.push(computerUpdateCommand);
     if (updatePaletteCommand != null) commands.push(updatePaletteCommand);
     return commands;
-  }, [activeAgent, agentChannelsController, bridge, computerUpdateAction, hiddenAgents.length, openCommandPaletteInfo, openComputerUpdateConfirm, orgChartIsAvailable, themePreference, updatePaletteCommand]);
+  }, [activeAgent, agentChannelsController, bridge, computerUpdateAction, hiddenAgents.length, isCursorLoggedIn, openCommandPaletteInfo, openComputerUpdateConfirm, orgChartIsAvailable, themePreference, updatePaletteCommand]);
 
-  const showSignIn = bridge != null && account != null && account.kind !== "logged-in";
-  const showRootLoading = bridge != null && account?.kind === "logged-in" && activeAgent == null && transport === "connecting" && !onboardingOpen;
-  const showRootEmptyWorkspace = bridge != null && account?.kind === "logged-in" && transport === "connected" && hasLoadedAgents && agents.length === 0 && activeAgent == null && workspaceRoute == null && !onboardingOpen;
+  const showSignIn = bridge != null && workspaceSession.kind === "unavailable";
+  const showRootLoading = bridge != null && workspaceReady && activeAgent == null && transport === "connecting" && !onboardingOpen;
+  const showRootEmptyWorkspace = bridge != null && workspaceReady && transport === "connected" && hasLoadedAgents && agents.length === 0 && activeAgent == null && workspaceRoute == null && !onboardingOpen;
   const accessCoverComposition = useMemo(() => projectAccessCoverComposition({
     access: sandAccess,
     roster: accessRosterSnapshot,
@@ -3369,7 +3417,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     ]
   }), [accessFirstBox, accessRosterSnapshot, rebuildBoxStore, rebuildMigrationStore, rebuildRevision, rebuildTransportStore, sandAccess]);
   const rosterAccessReadiness = selectRosterAccessReadiness({
-    accountKey: account?.kind === "logged-in" ? pinnedAccountKey : null,
+    accountKey: workspaceAccountSlot,
     agentIds: agents.map((agent) => agent.id),
     failure: rosterFailure,
     hasLoadedAgents,
@@ -3386,16 +3434,34 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       failureCode: rosterAccessReadiness.rosterFailureCode
     });
   }, [connectionController, rosterAccessReadiness.hasReachedBox, rosterAccessReadiness.isPrivacyBlocked, rosterAccessReadiness.rosterFailureCode]);
-  const rosterListStatus = rosterAccessReadiness.isLoaded
+  const retryLocalWorkspace = useCallback(async () => {
+    if (workspaceSession.source !== "local-9router" || isRosterRetrying) return;
+    setIsRosterRetrying(true);
+    setTransport("connecting");
+    try {
+      await bridge.forceGatewayReconnect();
+      setLocalWorkspace(await readLocalWorkspaceReadiness(bridge));
+    } catch (error) {
+      setTransport("down");
+      setNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsRosterRetrying(false);
+    }
+  }, [bridge, isRosterRetrying, workspaceSession.source]);
+  const rosterListStatus = workspaceSession.source === "local-9router" && transport === "connecting" && !hasLoadedAgents
+    ? <RosterStatus kind="loading" />
+    : workspaceSession.source === "local-9router" && (transport === "down" || rosterFailure != null || rosterLoadFailed)
+      ? <RosterStatus isRetrying={isRosterRetrying} kind="error" onRetry={() => void retryLocalWorkspace()} />
+      : rosterAccessReadiness.isLoaded
     ? agents.length === 0
       ? <RosterStatus kind="empty" />
       : visibleAgents.length === 0
         ? <RosterStatus kind="all-hidden" onShowHiddenBots={() => setOverlay("hidden-chats")} />
         : null
-    : null;
+      : null;
   const groupInfoPaneRoute = projectGroupInfoPaneRoute({
     agent: activeAgent ?? null,
-    accountKey: account?.kind === "logged-in" ? pinnedAccountKey : null,
+    accountKey: workspaceAccountSlot,
     accountGeneration: groupMembersRoot.roster.getAccountGeneration(),
     onOpenAgentChat: openGroupMemberChat
   });
@@ -3432,7 +3498,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
 
   // @evidence src/app/dist/renderer/assets/index-UbX-y3il.js#L132101-L132102
   return (
-    <div className="sand-shell" data-empty={activeAgent == null ? true : undefined} data-loading={showRootLoading || undefined} data-runtime={bridge == null ? "browser" : "electron"} data-theme={RUNTIME_THEME_CLASS[resolvedTheme]} style={{ height: "100%", position: "relative", width: "100%" }}>
+    <div className="sand-shell" data-empty={activeAgent == null ? true : undefined} data-loading={showRootLoading || undefined} data-runtime={bridge == null ? "browser" : "electron"} data-theme={RUNTIME_THEME_CLASS[resolvedTheme]} data-workspace={workspaceSession.source ?? undefined} style={{ height: "100%", position: "relative", width: "100%" }}>
       <WorkspaceIndicator isFullscreen={windowFullscreen} label={workspaceRoute == null ? activeAgent?.name ?? null : null} />
       {bridge == null ? null : <WindowStatusBadge isFullscreen={windowFullscreen} transport={transport} />}
       <RootShellNotificationHost bridge={bridge} client={client} />
@@ -3441,14 +3507,14 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
         onDismiss={() => settingsNoticeController.reset()}
       />
       <AppAlertHost controller={groupMembersRoot.alert} />
-      {account?.kind === "logged-in" && !computerInfoOpen && !computer.isOpen && computerRebuildBannerInput.kind === "reconnecting" ? <ComputerReconnectBanner
+      {workspaceReady && !computerInfoOpen && !computer.isOpen && computerRebuildBannerInput.kind === "reconnecting" ? <ComputerReconnectBanner
         input={{
           kind: computerRebuildBannerInput.kind,
           stage: computerRebuildBannerInput.stage,
           transport: computerReconnectTransport
         }}
       /> : null}
-      {account?.kind === "logged-in" && !computerInfoOpen && !computer.isOpen && computerRebuildBannerInput.kind !== "reconnecting" ? <ComputerRebuildProgressBanner input={computerRebuildBannerInput} onRestore={restoreComputerProgress} /> : null}
+      {workspaceReady && !computerInfoOpen && !computer.isOpen && computerRebuildBannerInput.kind !== "reconnecting" ? <ComputerRebuildProgressBanner input={computerRebuildBannerInput} onRestore={restoreComputerProgress} /> : null}
       {bridge == null ? null : <WindowChrome bridge={bridge} isFullscreen={windowFullscreen} isMaximized={windowMaximized} />}
       <RootShellLoading isVisible={showRootLoading} />
       <div style={{ display: "grid", gridTemplateColumns: `${renderedSidebarLayout.isCollapsed ? SIDEBAR_LAYOUT_BOUNDS.collapsedWidth : renderedSidebarLayout.expandedWidth}px minmax(0, 1fr)`, height: "100%", minHeight: 0, width: "100%" }}>
@@ -3459,7 +3525,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
           </div>
           {hiddenAgents.length > 0 && visibleAgents.length > 0 ? <SandButton aria-haspopup="dialog" onClick={() => setOverlay("hidden-chats")} size="sm" variant="secondary"><span>{UI_TEXT.hiddenBots}</span><SandBadge aria-label={`${hiddenAgents.length} hidden bots`}>{hiddenAgents.length}</SandBadge></SandButton> : null}
           {/* @evidence src/app/dist/renderer/assets/index-UbX-y3il.js#byteOffset=2602084 (s0n Plugins footer button/icon/text composition) */}
-          <div className="sand-agents-sidebar__plugins-entry"><SandButton className="sand-agents-sidebar__plugins" leadingIcon="plug" onClick={() => { setPluginQuery(""); setOverlay("plugins"); }} shape="pill" size="md" variant="secondary">{UI_TEXT.plugins}</SandButton></div>
+          {isCursorLoggedIn ? <div className="sand-agents-sidebar__plugins-entry"><SandButton className="sand-agents-sidebar__plugins" leadingIcon="plug" onClick={() => { setPluginQuery(""); setOverlay("plugins"); }} shape="pill" size="md" variant="secondary">{UI_TEXT.plugins}</SandButton></div> : null}
           <AccountMenu
             account={account}
             accountLabel={UI_TEXT.account}
@@ -3638,7 +3704,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
 
       {overlay === "hidden-chats" ? <div style={OVERLAY_FRAME_STYLE}><Suspense fallback={null}><HiddenChatsDialog hiddenAgents={hiddenAgents} isOpen onClose={() => setOverlay(null)} onOpenAgent={(id) => void openAgent(id)} onUnhide={(id) => void unhide(id)} /></Suspense></div> : null}
       {overlay === "settings" && bridge != null ? <div style={OVERLAY_FRAME_STYLE}><Suspense fallback={overlayFallback(UI_TEXT.settings)}><SettingsOverlayErrorBoundary onClose={() => setOverlay(null)}><SettingsDesktopSurface bridge={bridge} computer={settingsComputerMount} coordinatorClient={client} initialSection={settingsSection} isOpen onClose={() => setOverlay(null)} onNotice={publishSettingsNotice} /></SettingsOverlayErrorBoundary></Suspense></div> : null}
-      {overlay === "plugins" && bridge != null ? <div style={OVERLAY_FRAME_STYLE}><Suspense fallback={overlayFallback(UI_TEXT.plugins)}><PluginsDesktopSurface activeAgentId={activeAgent?.id ?? null} bridge={bridge} githubAuth={pluginAuthBanner} initialQuery={pluginQuery} isOpen key={pluginQuery} onClose={() => setOverlay(null)} onNotice={publishSettingsNotice} privateSkillEnableSource={privateSkillEnableSource} privateSkillSource={pluginPrivateSkillSource} /></Suspense></div> : null}
+      {overlay === "plugins" && bridge != null && isCursorLoggedIn ? <div style={OVERLAY_FRAME_STYLE}><Suspense fallback={overlayFallback(UI_TEXT.plugins)}><PluginsDesktopSurface activeAgentId={activeAgent?.id ?? null} bridge={bridge} githubAuth={pluginAuthBanner} initialQuery={pluginQuery} isOpen key={pluginQuery} onClose={() => setOverlay(null)} onNotice={publishSettingsNotice} privateSkillEnableSource={privateSkillEnableSource} privateSkillSource={pluginPrivateSkillSource} /></Suspense></div> : null}
       {overlay === "about" && bridge != null ? <div style={OVERLAY_FRAME_STYLE}><RecoveredAboutDialog
         bridge={bridge}
         labels={{ copied: UI_TEXT.copied, copyVersionInfo: UI_TEXT.copyVersionInfo, copyright: UI_TEXT.copyright, title: UI_TEXT.title }}

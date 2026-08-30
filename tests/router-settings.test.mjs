@@ -44,14 +44,32 @@ test("settings registry exposes Router with the native settings icon contract", 
   assert.match(source, /\{ id: "router", label: "Router", icon: "git-branch" \}/);
 });
 
-test("9Router settings expose only status/save/delete credential operations and keep MCP advanced opt-in explicit", async () => {
+test("9Router settings expose secure Tailscale setup without weakening the default HTTP policy", async () => {
   const preload = await readFile(path.join(repoRoot, "source/electron-preload/preload.ts"), "utf8");
   const panel = await readFile(path.join(repoRoot, "frontend/src/recovered/features/settings/overlay/panels.tsx"), "utf8");
+  const desktopSurface = await readFile(path.join(repoRoot, "frontend/src/recovered/features/settings/overlay/desktop-surface.tsx"), "utf8");
   const coordinator = await readFile(path.join(repoRoot, "source/node-agent-coordinator/inference-router.ts"), "utf8");
   assert.match(preload, /cliProxy:\s*\{[\s\S]*status:[\s\S]*save:[\s\S]*remove:/);
   assert.doesNotMatch(preload, /cliProxy:\s*\{[\s\S]{0,500}reveal:/);
   assert.match(panel, /Test &amp; load models/);
   assert.match(panel, /Manual entry stays available/);
+  assert.match(panel, /save the key first, run Test &amp; load models/);
+  assert.match(panel, /v0\.5\.35 when reviewed/);
+  assert.doesNotMatch(panel, /9Router 0\.5\.2 or newer/);
+  assert.match(panel, /const \[allowTailscaleHttp, setAllowTailscaleHttp\] = useState\(false\)/);
+  assert.match(panel, /Allow HTTP over Tailscale/);
+  assert.match(panel, /http:\/\/100\.112\.10\.8:20128\/v1/);
+  assert.match(panel, /Required\. Use the 9Router proxy\/client API key/);
+  assert.match(panel, /verify the peer separately with tailscale ping/);
+  assert.match(panel, /onSave\(\{ baseUrl, model, protocol, allowRemoteHttps, allowTailscaleHttp,/);
+  assert.match(panel, /Use local Docker VM/);
+  assert.match(panel, /computer tools locally on this Windows PC/);
+  assert.match(panel, /aria-live="polite" role=\{boxRuntime\.error == null \? "status" : "alert"\}/);
+  assert.match(desktopSurface, /getBoxRuntime\(\)/);
+  assert.match(desktopSurface, /setBoxRuntime\(mode\)/);
+  assert.match(desktopSurface, /await bridge\.forceGatewayReconnect\(\)/);
+  assert.match(desktopSurface, /window\.dispatchEvent\(new Event\(LOCAL_WORKSPACE_CHANGED_EVENT\)\)/);
+  assert.equal(desktopSurface.match(/await refreshLocalWorkspace\(\)/g)?.length, 4);
   assert.match(coordinator, /SAND_9ROUTER_ENABLE_UNREVIEWED_MCP_TOOLS === "1"/);
   assert.match(coordinator, /bridge == null && cliProxyToolsEnabled/);
 });
@@ -63,5 +81,18 @@ test("polished renderer 9Router component injection remains valid JavaScript", a
   const component = patched.slice(0, patched.indexOf("function Sa(s){"));
   await transform(component, { format: "esm", loader: "js", target: "es2023" });
   assert.match(component, /window\.desktop\.cliProxy\.status\(\{testConnection:!0\}\)/);
+  assert.match(component, /allowTailscaleHttp:x/);
+  assert.match(component, /Allow HTTP over Tailscale \(numeric IPs only; verify with tailscale ping\)/);
+  assert.match(component, /http:\/\/100\.112\.10\.8:20128\/v1/);
+  assert.match(component, /Required\. Use the 9Router proxy\/client API key/);
+  assert.match(component, /save the key first, run Test & load models/);
+  assert.match(component, /v0\.5\.35 when reviewed/);
+  assert.doesNotMatch(component, /9Router 0\.5\.2/);
+  assert.match(component, /window\.desktop\.forceGatewayReconnect\(\)/);
+  assert.match(component, /new Event\("sand-local-workspace-changed"\)/);
+  assert.equal(component.match(/await RRouterRefreshLocalWorkspace\(\)/g)?.length, 4);
+  const boxRuntime = component.slice(component.indexOf("function RBoxRuntime"), component.indexOf("function RRouterPanel"));
+  assert.match(boxRuntime, /Use local Docker VM/);
+  assert.doesNotMatch(boxRuntime, /\b(?:Mac|Windows)\b/);
   assert.doesNotMatch(component, /cliProxy\.reveal/);
 });

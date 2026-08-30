@@ -115,6 +115,7 @@ export interface CoordinatorControlExecutorDependencies {
   readonly listRoutedMcpTools?: () => Promise<unknown>;
   readonly executeRoutedMcpTool?: (request: unknown) => Promise<unknown>;
   readonly getCliProxyTurnConfig?: () => Promise<unknown>;
+  readonly prepareCliProxyNativeTurn?: () => Promise<unknown>;
   readonly readLocalExecDaemonDiscovery?: () => Promise<LocalExecDiscovery | null>;
   readonly clearLocalExecDaemonDiscoveryIfMatches?: (expected: LocalExecDiscovery) => Promise<boolean>;
   readonly native?: {
@@ -474,6 +475,12 @@ export function createCoordinatorControlExecutors(
     getCliProxyTurnConfig: async () => {
       if (dependencies.getCliProxyTurnConfig == null) throw new Error("9Router routing is unavailable.");
       return await dependencies.getCliProxyTurnConfig();
+    },
+    prepareCliProxyNativeTurn: async () => {
+      if (dependencies.prepareCliProxyNativeTurn == null) {
+        throw new Error("Native 9Router routing is unavailable.");
+      }
+      return await dependencies.prepareCliProxyNativeTurn();
     },
     async mintLocalExecDaemonCredential() {
       return (await connector.issueLocalExecDaemonCredential?.()) ?? null;
