@@ -18,6 +18,7 @@ import {
   resolveLocalExecDaemonEntryRealpath,
   spawnLocalExecDaemon,
   terminateProcess,
+  type LocalExecProcessIdentity as NativeLocalExecProcessIdentity,
 } from "../local-exec/local-exec-native.js";
 import {
   commandCarriesLocalExecGeneration,
@@ -473,7 +474,7 @@ export function createCoordinatorControlExecutors(
   };
   const startupQuarantineMatchesObserved = (
     entry: LocalExecStartupQuarantine,
-    observed: LocalExecProcessIdentity,
+    observed: NativeLocalExecProcessIdentity,
   ): boolean => observed.pid === entry.pid
     && commandCarriesLocalExecGeneration(observed.command, entry.entryRealpath, entry.generationToken);
   const releaseStartupQuarantine = async (entry: LocalExecStartupQuarantine): Promise<void> => {
@@ -483,7 +484,7 @@ export function createCoordinatorControlExecutors(
   const reconcileStartupQuarantine = async (): Promise<void> => {
     const blocked: LocalExecStartupQuarantine[] = [];
     for (const entry of await readStartupQuarantines()) {
-      let observed: LocalExecProcessIdentity | null = null;
+      let observed: NativeLocalExecProcessIdentity | null = null;
       try { observed = native.readProcessIdentity(entry.pid); } catch {}
       if (observed == null) {
         try {
@@ -500,7 +501,7 @@ export function createCoordinatorControlExecutors(
       }
       try { await native.terminateProcess(entry.pid, { expectedIdentity: observed }); }
       catch {}
-      let after: LocalExecProcessIdentity | null = null;
+      let after: NativeLocalExecProcessIdentity | null = null;
       try { after = native.readProcessIdentity(entry.pid); } catch {}
       if (after != null) {
         if (startupQuarantineMatchesObserved(entry, after)) blocked.push(entry);
@@ -538,7 +539,7 @@ export function createCoordinatorControlExecutors(
     const isStillOwned = () => child.pid === pid && child.exitCode === null && child.signalCode === null;
     const release = async () => releaseStartupQuarantine(quarantine);
     const inspectAfterFailure = async (): Promise<boolean> => {
-      let observed: LocalExecProcessIdentity | null = null;
+      let observed: NativeLocalExecProcessIdentity | null = null;
       try { observed = native.readProcessIdentity(pid); } catch {}
       if (observed != null && !startupQuarantineMatchesObserved(quarantine, observed)) {
         await release();
@@ -618,7 +619,7 @@ export function createCoordinatorControlExecutors(
     }) {
       await reconcileStartupQuarantine();
       for (const [pid, quarantine] of [...unidentifiedSpawnQuarantine]) {
-        let observed: LocalExecProcessIdentity | null = null;
+        let observed: NativeLocalExecProcessIdentity | null = null;
         try { observed = native.readProcessIdentity(pid); } catch {}
         if (observed != null && !startupQuarantineMatchesObserved(quarantine, observed)) {
           unidentifiedSpawnQuarantine.delete(pid);
