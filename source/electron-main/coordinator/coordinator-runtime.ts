@@ -129,6 +129,7 @@ export function createCoordinatorRuntime(
   const restartForceExitGraceMs = dependencies.restartForceExitGraceMs
     ?? COORDINATOR_RESTART_FORCE_EXIT_GRACE_MS;
   const retirements = new WeakMap<CoordinatorLaunchHandle, Promise<void>>();
+  const finalRetirements = new WeakMap<CoordinatorLaunchHandle, Promise<void>>();
 
   const waitForExit = async (
     handle: CoordinatorLaunchHandle,
@@ -162,15 +163,36 @@ export function createCoordinatorRuntime(
         dependencies.onProblem(`coordinator forced termination failed: ${String(error)}`);
       }
       if (await waitForExit(handle, restartForceExitGraceMs)) return;
-      // No live main-process ports or accepted callbacks remain after
-      // forceDispose plus the launch-epoch fence. Do not let a platform process
-      // that failed to report exit pin every later restart or application quit.
-      launchedHandles.delete(handle);
+      // The launch-epoch fence and forceDispose isolate the replacement, so a
+      // restart may continue. Keep the unconfirmed handle tracked: final
+      // application disposal must reissue termination and observe its real exit.
       dependencies.onProblem(
         `coordinator exit remained unconfirmed after forced termination; continuing with the isolated replacement`,
       );
     })();
     retirements.set(handle, retirement);
+    return retirement;
+  };
+
+  const forceRetireHandle = (handle: CoordinatorLaunchHandle): Promise<void> => {
+    const existing = finalRetirements.get(handle);
+    if (existing !== undefined) return existing;
+    const retirement = (async () => {
+      const force = (): void => {
+        try { handle.forceDispose(); }
+        catch (error) {
+          dependencies.onProblem(`coordinator forced termination failed: ${String(error)}`);
+        }
+      };
+      force();
+      if (await waitForExit(handle, restartForceExitGraceMs)) return;
+      dependencies.onProblem(
+        `coordinator exit remained unconfirmed after ${restartForceExitGraceMs} ms of final disposal; retrying termination and awaiting exit`,
+      );
+      force();
+      await handle.processExited.then(() => undefined, () => undefined);
+    })();
+    finalRetirements.set(handle, retirement);
     return retirement;
   };
 
@@ -307,7 +329,7 @@ export function createCoordinatorRuntime(
       activeLaunchEpoch = ++nextLaunchEpoch;
       cancelPendingRelaunch();
       disposeCompletion = Promise.all(
-        [...launchedHandles].map((handle) => retireHandle(handle)),
+        [...launchedHandles].map((handle) => forceRetireHandle(handle)),
       ).then(() => undefined);
       return disposeCompletion;
     },

@@ -110,16 +110,20 @@ export function launchCoordinator(
       });
     },
     forceDispose() {
-      if (forceDisposeRequested || exited) return;
-      forceDisposeRequested = true;
-      disposeRequested = true;
-      server.dispose();
-      // Closing the main-side ports first prevents an unresponsive retired
-      // child from retaining an executor or data path while termination is in
-      // flight. The runtime launch fence separately rejects all late events.
-      try { controlChannel.port2.close(); } catch {}
-      try { dataChannel.port2.close(); } catch {}
-      try { mainDataChannel.port2.close(); } catch {}
+      if (exited) return;
+      if (!forceDisposeRequested) {
+        forceDisposeRequested = true;
+        disposeRequested = true;
+        server.dispose();
+        // Closing the main-side ports first prevents an unresponsive retired
+        // child from retaining an executor or data path while termination is in
+        // flight. The runtime launch fence separately rejects all late events.
+        try { controlChannel.port2.close(); } catch {}
+        try { dataChannel.port2.close(); } catch {}
+        try { mainDataChannel.port2.close(); } catch {}
+      }
+      // A later final-disposal pass must be able to retry termination when a
+      // platform process ignored or failed to report the first kill request.
       child.kill();
     },
   };

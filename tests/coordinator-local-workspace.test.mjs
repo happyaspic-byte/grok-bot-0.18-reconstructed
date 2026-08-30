@@ -877,6 +877,61 @@ test("renderer-port IPC suppresses stale close requests after a proactive replac
   }
 });
 
+
+test("coordinator forced disposal retries kill until process exit is observed", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-launcher.ts");
+  try {
+    let exitListener;
+    let killCalls = 0;
+    const channels = [];
+    const makePort = () => {
+      const listeners = {};
+      const port = {
+        closeCalls: 0,
+        postMessage() {},
+        on(event, listener) { listeners[event] = listener; },
+        start() {},
+        close() { this.closeCalls += 1; listeners.close?.(); },
+      };
+      return port;
+    };
+    const handle = loaded.module.launchCoordinator({
+      fork() {
+        return {
+          postMessage() {},
+          on(event, listener) {
+            if (event === "exit") exitListener = listener;
+          },
+          kill() { killCalls += 1; },
+        };
+      },
+      artifactPath: "/coordinator.cjs",
+      createChannel: () => {
+        const channel = { port1: makePort(), port2: makePort() };
+        channels.push(channel);
+        return channel;
+      },
+      executors: {},
+      onEvent: {},
+      onProblem() {},
+      processConfig: {},
+    });
+
+    handle.forceDispose();
+    assert.equal(killCalls, 1);
+    handle.forceDispose();
+    assert.equal(killCalls, 2, "a still-running child must receive a repeated kill request");
+    assert.equal(typeof exitListener, "function");
+    exitListener(0);
+    await handle.processExited;
+    handle.forceDispose();
+    assert.equal(killCalls, 2, "an observed exit must make forced disposal idempotent");
+    assert.ok(channels.every(({ port2 }) => port2.closeCalls >= 1));
+  } finally {
+    await loaded.dispose();
+  }
+});
+
 test("replacement coordinator launch ignores late events and problems from the old child", async () => {
   const loaded = await loadModule("source/electron-main/coordinator/coordinator-runtime.ts");
   try {
@@ -909,7 +964,13 @@ test("replacement coordinator launch ignores late events and problems from the o
         }
         const exited = Promise.withResolvers();
         const rendererDataPort = { launch: launches.length + 1 };
-        const record = { dependencies, exited, rendererDataPort, disposeCalls: 0 };
+        const record = {
+          dependencies,
+          exited,
+          rendererDataPort,
+          disposeCalls: 0,
+          forceDisposeCalls: 0,
+        };
         launches.push(record);
         return {
           rendererDataPort,
@@ -917,6 +978,7 @@ test("replacement coordinator launch ignores late events and problems from the o
           controlSettled: Promise.resolve(),
           processExited: exited.promise,
           dispose() { record.disposeCalls += 1; },
+          forceDispose() { record.forceDisposeCalls += 1; },
         };
       },
     });
@@ -962,6 +1024,8 @@ test("replacement coordinator launch ignores late events and problems from the o
     first.exited.resolve({ code: 0 });
     await restarted;
     const disposed = runtime.dispose();
+    assert.equal(second.disposeCalls, 0, "final disposal must bypass the restart grace period");
+    assert.equal(second.forceDisposeCalls, 1, "final disposal must force the active child immediately");
     second.dependencies.onEvent["transport-down"]({ generation: 3, reason: "disposed" });
     second.dependencies.onProblem("disposed child problem");
     assert.deepEqual(observed.map(([kind]) => kind), [
@@ -1046,6 +1110,63 @@ test("automatic relaunch proactively hands off its replacement", async () => {
   }
 });
 
+test("final disposal preempts an in-flight graceful coordinator retirement", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-runtime.ts");
+  try {
+    const launches = [];
+    const runtime = loaded.module.createCoordinatorRuntime({
+      fork() { assert.fail("custom launch should be used"); },
+      createChannel() { assert.fail("custom launch should be used"); },
+      executors: {},
+      onEvent: {
+        "transport-connected"() {},
+        "transport-down"() {},
+      },
+      onProblem(problem) { assert.fail(problem); },
+      processConfig: {},
+      artifactPath: "/coordinator.cjs",
+      monotonicNow: () => 1_000,
+      onMainDataPort() {},
+      onLifecycle() {},
+      relaunchBackoff: {
+        schedule() { assert.fail("replacement overlap must not schedule a relaunch"); },
+      },
+      restartExitGraceMs: 60_000,
+      restartForceExitGraceMs: 60_000,
+      launch() {
+        const exited = Promise.withResolvers();
+        const record = { exited, disposeCalls: 0, forceDisposeCalls: 0 };
+        launches.push(record);
+        return {
+          rendererDataPort: {},
+          mainDataPort: {},
+          controlSettled: Promise.resolve(),
+          processExited: exited.promise,
+          dispose() { record.disposeCalls += 1; },
+          forceDispose() { record.forceDisposeCalls += 1; },
+        };
+      },
+    });
+
+    const restarted = runtime.restart();
+    const first = launches[0];
+    const second = launches[1];
+    assert.equal(first.disposeCalls, 1);
+    assert.equal(first.forceDisposeCalls, 0);
+
+    const disposed = runtime.dispose();
+    assert.equal(first.forceDisposeCalls, 1, "final disposal must preempt graceful retirement");
+    assert.equal(second.disposeCalls, 0);
+    assert.equal(second.forceDisposeCalls, 1, "final disposal must immediately force the active child");
+
+    first.exited.resolve({ code: 0 });
+    second.exited.resolve({ code: 0 });
+    await Promise.all([restarted, disposed]);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
 test("a hung old coordinator is force-isolated without pinning later restarts", async () => {
   const loaded = await loadModule("source/electron-main/coordinator/coordinator-runtime.ts");
   try {
@@ -1100,6 +1221,14 @@ test("a hung old coordinator is force-isolated without pinning later restarts", 
 
     const third = launches[2];
     const disposed = runtime.dispose();
+    assert.equal(
+      first.forceDisposeCalls,
+      2,
+      "final disposal must retry a previously unconfirmed retired child",
+    );
+    assert.equal(third.disposeCalls, 0, "final disposal must not wait on graceful retirement");
+    assert.equal(third.forceDisposeCalls, 1, "final disposal must force the active child immediately");
+    first.exited.resolve({ code: 0 });
     third.exited.resolve({ code: 0 });
     await disposed;
   } finally {
