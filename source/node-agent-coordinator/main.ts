@@ -240,7 +240,15 @@ export async function composeCoordinator(dependencies: ComposeCoordinatorDepende
   };
   server = createRendererPortServer(
     { post: (frame) => carrier.data.post(frame), close: () => carrier.data.close() },
-    { dispatchRequest, onServing: () => { toolRelay.replay(); if (!isGatewayStreamLive) server.postEvent(COORDINATOR_TRANSPORT_STATE_FAMILY, { state: "down" }); } }
+    {
+      dispatchRequest,
+      onServing: () => {
+        toolRelay.replay();
+        server.postEvent(COORDINATOR_TRANSPORT_STATE_FAMILY, {
+          state: isGatewayStreamLive ? "connected" : "down",
+        });
+      },
+    }
   );
   const mainDispatch = createGatewayRequestDispatch(gatewayClient, isCoordinatorMainMethod);
   const applyPause = (paused: boolean) => {

@@ -7,6 +7,7 @@ export const CLI_PROXY_MAX_MODELS = 500;
 export const CLI_PROXY_MAX_JSON_BYTES = 2 * 1024 * 1024;
 export const CLI_PROXY_MAX_STREAM_BYTES = 32 * 1024 * 1024;
 export const CLI_PROXY_REQUEST_TIMEOUT_MS = 120_000;
+export const CLI_PROXY_PERSISTED_CHANNEL = "sand:cli-proxy-persisted";
 
 export const CLI_PROXY_PROTOCOLS = ["auto", "chat-completions", "responses"] as const;
 export type CliProxyProtocol = (typeof CLI_PROXY_PROTOCOLS)[number];

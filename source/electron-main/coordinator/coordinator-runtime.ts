@@ -19,6 +19,8 @@ export function resolveCoordinatorArtifactPath(
 
 export const COORDINATOR_PORT_REQUEST_CHANNEL = "sand:coordinator-port-request";
 export const COORDINATOR_PORT_CHANNEL = "sand:coordinator-port";
+export const COORDINATOR_RESTART_EXIT_GRACE_MS = 10_000;
+export const COORDINATOR_RESTART_FORCE_EXIT_GRACE_MS = 2_000;
 
 type GenerationPayload = { readonly generation: number };
 type TransportDownPayload = GenerationPayload & {
@@ -53,6 +55,21 @@ export function fenceStaleGenerations<T extends CoordinatorEventConsumer>(
   } as T;
 }
 
+/** Drops every callback emitted by a child after a replacement launch starts. */
+export function fenceStaleRuntimeLaunch<T extends Record<string, (payload: any) => void>>(
+  consumer: T,
+  isCurrent: () => boolean,
+): T {
+  return Object.fromEntries(
+    Object.entries(consumer).map(([name, listener]) => [
+      name,
+      (payload: unknown) => {
+        if (isCurrent()) listener(payload);
+      },
+    ]),
+  ) as T;
+}
+
 export interface CoordinatorRelaunchDelay {
   readonly elapsed: Promise<void>;
   dispose(): void;
@@ -67,6 +84,8 @@ export interface CoordinatorRuntimeDependencies
   readonly relaunchBackoff: {
     schedule(attempt: number): CoordinatorRelaunchDelay;
   };
+  readonly restartExitGraceMs?: number;
+  readonly restartForceExitGraceMs?: number;
   readonly launch?: (
     dependencies: LaunchCoordinatorDependencies,
   ) => CoordinatorLaunchHandle;
@@ -102,7 +121,58 @@ export function createCoordinatorRuntime(
   let launchedAtMs = 0;
   let relaunchSeq = 0;
   let fastExitAttempt = 0;
+  let nextLaunchEpoch = 0;
+  let activeLaunchEpoch = 0;
   let pendingRelaunch: CoordinatorRelaunchDelay | undefined;
+  const restartExitGraceMs = dependencies.restartExitGraceMs
+    ?? COORDINATOR_RESTART_EXIT_GRACE_MS;
+  const restartForceExitGraceMs = dependencies.restartForceExitGraceMs
+    ?? COORDINATOR_RESTART_FORCE_EXIT_GRACE_MS;
+  const retirements = new WeakMap<CoordinatorLaunchHandle, Promise<void>>();
+
+  const waitForExit = async (
+    handle: CoordinatorLaunchHandle,
+    timeoutMs: number,
+  ): Promise<boolean> => {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        handle.processExited.then(() => true, () => true),
+        new Promise<false>((resolve) => {
+          timeout = setTimeout(() => resolve(false), timeoutMs);
+          timeout.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
+  };
+
+  const retireHandle = (handle: CoordinatorLaunchHandle): Promise<void> => {
+    const existing = retirements.get(handle);
+    if (existing !== undefined) return existing;
+    const retirement = (async () => {
+      handle.dispose();
+      if (await waitForExit(handle, restartExitGraceMs)) return;
+      dependencies.onProblem(
+        `coordinator did not exit within ${restartExitGraceMs} ms; forcing termination`,
+      );
+      try { handle.forceDispose(); }
+      catch (error) {
+        dependencies.onProblem(`coordinator forced termination failed: ${String(error)}`);
+      }
+      if (await waitForExit(handle, restartForceExitGraceMs)) return;
+      // No live main-process ports or accepted callbacks remain after
+      // forceDispose plus the launch-epoch fence. Do not let a platform process
+      // that failed to report exit pin every later restart or application quit.
+      launchedHandles.delete(handle);
+      dependencies.onProblem(
+        `coordinator exit remained unconfirmed after forced termination; continuing with the isolated replacement`,
+      );
+    })();
+    retirements.set(handle, retirement);
+    return retirement;
+  };
 
   const cancelPendingRelaunch = (): void => {
     pendingRelaunch?.dispose();
@@ -123,17 +193,34 @@ export function createCoordinatorRuntime(
   };
 
   const launch = (): void => {
-    const handle = (dependencies.launch ?? launchCoordinator)({
-      fork: dependencies.fork,
-      createChannel: dependencies.createChannel,
-      executors: dependencies.executors,
-      // Generations restart at one with each child. The old control server stops
-      // dispatching when that child exits, so every launch gets a fresh fence.
-      onEvent: fenceStaleGenerations(dependencies.onEvent),
-      onProblem: dependencies.onProblem,
-      processConfig: dependencies.processConfig,
-      artifactPath: dependencies.artifactPath,
-    });
+    const previousLaunchEpoch = activeLaunchEpoch;
+    const launchEpoch = ++nextLaunchEpoch;
+    activeLaunchEpoch = launchEpoch;
+    const isCurrentLaunch = (): boolean => launchEpoch === activeLaunchEpoch;
+    let handle: CoordinatorLaunchHandle;
+    try {
+      handle = (dependencies.launch ?? launchCoordinator)({
+        fork: dependencies.fork,
+        createChannel: dependencies.createChannel,
+        executors: dependencies.executors,
+        // Generations restart at one with each child. A replacement is launched
+        // before the previous child exits, so fence both per-child generations
+        // and every callback from the now-stale launch during that overlap.
+        onEvent: fenceStaleGenerations(
+          fenceStaleRuntimeLaunch(dependencies.onEvent, isCurrentLaunch),
+        ),
+        onProblem: (problem) => {
+          if (isCurrentLaunch()) dependencies.onProblem(problem);
+        },
+        processConfig: dependencies.processConfig,
+        artifactPath: dependencies.artifactPath,
+      });
+    } catch (error) {
+      // A failed replacement never becomes active; keep the previous child's
+      // callback fence live so its still-running transport remains observable.
+      activeLaunchEpoch = previousLaunchEpoch;
+      throw error;
+    }
     current = handle;
     launchedHandles.add(handle);
     portTransferred = false;
@@ -200,7 +287,7 @@ export function createCoordinatorRuntime(
       }
       const previous = current;
       launch();
-      previous.dispose();
+      void retireHandle(previous);
       serveRequester();
     },
     revokeRendererPortRequest() {
@@ -211,17 +298,16 @@ export function createCoordinatorRuntime(
       cancelPendingRelaunch();
       const previous = current;
       launch();
-      previous.dispose();
       serveRequester();
-      return previous.processExited.then(() => undefined);
+      return retireHandle(previous);
     },
     dispose() {
       if (disposeCompletion !== undefined) return disposeCompletion;
       disposed = true;
+      activeLaunchEpoch = ++nextLaunchEpoch;
       cancelPendingRelaunch();
-      current.dispose();
       disposeCompletion = Promise.all(
-        [...launchedHandles].map((handle) => handle.processExited),
+        [...launchedHandles].map((handle) => retireHandle(handle)),
       ).then(() => undefined);
       return disposeCompletion;
     },

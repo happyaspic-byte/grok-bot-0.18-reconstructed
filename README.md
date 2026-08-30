@@ -131,12 +131,17 @@ Tailscale IP addresses; it does not permit arbitrary private or public HTTP
 hosts. MagicDNS names are deliberately rejected for HTTP. Remote DNS names
 require HTTPS and the separate HTTPS opt-in. Numeric-range validation does not
 prove which Windows route is active, so confirm `tailscale ping 100.112.10.8`
-succeeds before enabling plain HTTP.
+succeeds before enabling plain HTTP. The Local Docker workspace does not share
+Windows loopback: `127.0.0.1` inside its host container refers to that container,
+not to a same-PC Windows 9Router process.
 
 The 9Router key is stored in its own fixed-purpose Electron `safeStorage` file.
 It is never placed in user secrets, box-secret synchronization, environment
 variables, settings, renderer status responses, or transcripts. If OS secure
 storage is unavailable, it is held only in memory for the current session.
+Before publishing the Local Docker workspace as ready, the authenticated local
+gateway installs that memory lease and invokes a no-credential-argument
+`/v1/models` probe inside the Docker host.
 Immediately before a local native turn, the authenticated local gateway gives
 the Docker host a short-lived, memory-only credential lease. The host cannot
 read a prior lease back through that gateway and does not persist it. Changing
@@ -259,18 +264,39 @@ dist/Grok Bot 0.18 Reconstructed-win32-x64/
 ```
 
 `package:win` and `package-windows` are aliases for `package:windows`.
-`smoke:windows` launches the packaged executable with a new temporary profile,
-waits for the clean renderer, and verifies that Router settings are reachable.
-The normal repository check performs the same bounded launch on
-`windows-latest` and discards the binary.
+On Windows, `smoke:windows` launches the packaged executable with a new
+temporary profile and a strict fake-Docker/control-plane harness. It saves an
+OS-encrypted 9Router credential, authenticates `/v1/models`, enforces the model
+and Docker blockers, waits for authenticated coordinator resync before entering
+the signed-out workspace, closes cleanly with lease revocation, and repeats the
+flow after relaunch. The normal repository check performs the same bounded
+launch on `windows-latest` and discards the binary.
 
-Repository owners can run **Windows owner draft release** after explicitly
-enabling Actions on a new fork. That workflow repeats the source, package, and
+Repository maintainers can run **Windows push-access-visible draft release**
+after explicitly enabling Actions on a new fork. That workflow repeats the source, package, and
 fresh-profile launch checks, creates a ZIP, re-extracts it into a clean temporary
 directory, repeats verification and launch smoke, produces checksums and an
-SBOM, and attaches the exact files to an unpublished Draft Release. It never
+artifact-attributed production-dependency SBOM, and attaches the exact files to an unpublished Draft Release. It never
 publishes a public release automatically. The draft remains subject to the
-rights and signing review described below.
+rights and signing review described below. GitHub exposes an unpublished draft
+only to users with push access; it is not intrinsically immutable. This workflow
+enforces an append-only exact-resume policy: an exact same-commit draft rerun may
+byte-check existing assets and add only missing ones, but it never replaces an
+asset or reuses a mismatched tag. Any
+new binary requires a package-version bump, and changes to packaged application
+or validation inputs on `main` trigger a new draft attempt. The validated files
+are uploaded directly from the Windows job and are never exposed through a
+general Actions artifact handoff. A rerun aborts if any bytes already in the
+push-access-visible draft differ from the newly validated bundle. The ZIP,
+CycloneDX SBOM, manifest, and checksum are built twice and must be byte-for-byte
+identical. The ZIP timestamp and manifest source time derive from the exact Git
+commit. The SBOM omits per-generation serial and timestamp fields instead of
+misrepresenting source identity. It records the portable ZIP SHA-256, production
+npm dependencies, and packaged Electron framework, but not every native or
+recovered upstream byte.
+Every existing draft asset is preflighted before any missing asset is appended,
+and no nonempty existing asset is deleted or overwritten. GitHub's empty
+zero-byte upload starter may be retired only after that full preflight succeeds.
 
 ### Windows login-free Local 9Router workspace
 
@@ -309,7 +335,13 @@ Configure the workspace as follows:
 7. Enable **Use local Docker VM**. The workspace becomes available when the
    provider is `cli-proxy`, a credential and exact model ID are configured,
    Chat Completions or Auto is selected, and the local Docker runtime is
-   selected.
+   selected. Before readiness is published, the authenticated Docker host calls
+   `/v1/models` itself, so a URL reachable only from Windows is rejected. If
+   Docker was restarted or the existing container needs an upgrade, choose
+   **Repair Local Docker VM**.
+8. Choose **Save & continue without sign-in**. The settings dialog remains open
+   until the new coordinator connection completes its authenticated resync;
+   any failed requirement is shown in the readiness checklist.
 
 No Cursor sign-in is needed for this local workspace. 9Router performs model
 inference; the Docker host performs agent orchestration, shell commands, file
@@ -317,12 +349,23 @@ operations, and computer/browser actions. Cursor-backed remote boxes, shared
 rooms, account billing, and other cloud/account-only features do not become
 available merely because this workspace is ready.
 
-For a same-PC 9Router deployment, the loopback default remains
-`http://127.0.0.1:20128/v1`. HTTP hostnames, including `localhost`, are
-rejected; use the literal loopback address. The proxy/client API key is a
-credential; on Windows its store is protected with a real DACL (current user,
-SYSTEM, and Administrators), not a POSIX `0600` claim. The shared credential
-helper enforces and re-verifies that boundary.
+The automated Windows smoke uses simulated Docker commands and an authenticated
+loopback gateway so CI can verify packaging, state transitions, encryption,
+resync, relaunch, and clean shutdown without privileged Docker Desktop. Source
+integration tests separately exercise the real 9Router SSE tool-call contract,
+the production deferred-tool transcript, a Browser screenshot, its structured
+image follow-up, and the final model response. A final check on the destination
+PC is still required for that PC's Docker Desktop, Tailnet route, live 9Router
+model, VNC/browser stack, and native Linux container processes.
+
+A same-PC 9Router bound only to Windows `127.0.0.1` is unsupported by the Local
+Docker workspace because container loopback is not Windows loopback. Use the
+9Router server's literal Tailscale IP on port `20128` with **Allow HTTP over
+Tailscale**, or an allowed HTTPS endpoint that is reachable from Linux
+containers. The proxy/client API key is a credential; on Windows its store is
+protected with a real DACL (current user, SYSTEM, and Administrators), not a
+POSIX `0600` claim. The shared credential helper enforces and re-verifies that
+boundary.
 
 ### Windows trust and identity boundary
 
@@ -387,7 +430,8 @@ npm run verify            # verify an existing packaged app
 npm run smoke             # bounded native smoke check
 npm run package:windows   # local unsigned Windows x64 portable directory
 npm run verify:windows    # structural/hash/native verification of that directory
-npm run smoke:windows     # fresh-profile packaged Windows launch + Router reachability
+npm run smoke:windows     # packaged login-free workspace, relaunch, and clean-quit smoke
+npm run docker:image:verify # verify the pinned public ECR manifest and runtime config
 npm run publication:check # prove a fresh-history export is lossless
 ```
 

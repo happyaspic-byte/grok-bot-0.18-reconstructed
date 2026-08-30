@@ -41,6 +41,7 @@ export function createCoordinatorResyncChain(deps: {
   readonly detectTimeZone: () => string | null | undefined;
   readonly getUserTimeZoneOverride: () => string | null | undefined;
   readonly getInferenceProvider: () => unknown;
+  readonly getLocalWorkspaceBrowserUseCapability: () => boolean;
   readonly getComputerUseModel: () => unknown;
   readonly getAutoReviewInstructions: () => unknown;
   readonly getLocalToolPermission: () => unknown;
@@ -127,6 +128,10 @@ export function createCoordinatorResyncChain(deps: {
     });
     await step("inference_provider", () =>
       deps.legs.setHostSettings({ inferenceProvider: deps.getInferenceProvider() }));
+    await step("local_workspace_capabilities", () =>
+      deps.legs.setHostSettings({
+        localWorkspaceBrowserUse: deps.getLocalWorkspaceBrowserUseCapability(),
+      }));
     await step("computer_use_model", () =>
       deps.legs.setHostSettings({ computerUseModel: deps.getComputerUseModel() ?? null }));
     await step("auto_review", () =>

@@ -65,6 +65,8 @@ export interface MainEdgeDeps {
   readonly platform: NodeJS.Platform;
   readonly delay?: (milliseconds: number) => Promise<void>;
   readonly detectTimeZone?: () => string | null | undefined;
+  readonly readLocalDockerStatus?: typeof getLocalDockerStatus;
+  readonly startOwnedLocalDockerBox?: typeof startLocalDockerBox;
   readonly stopOwnedLocalDockerBox?: () => Promise<void>;
 }
 
@@ -125,6 +127,9 @@ export function createMainEdgeHandlers(deps: MainEdgeDeps): HandlerMap {
       const provider = req(raw).provider;
       invariant(isSandInferenceProvider(provider), "Unknown inference provider.");
       const previous = invoke(deps.settingsStore, "getInferenceProvider");
+      const settingsPath = String(Reflect.get(deps.settingsStore, "settingsPath"));
+      const stopOwnedLocalDocker = deps.stopOwnedLocalDockerBox
+        ?? (() => stopLocalDockerBox(settingsPath));
       invoke(deps.settingsStore, "setInferenceProvider", provider);
       let settings: UnknownRecord | null = null;
       try {
@@ -137,17 +142,28 @@ export function createMainEdgeHandlers(deps: MainEdgeDeps): HandlerMap {
                 clearCliProxyCredentialLease: true,
               });
             },
-            deps.stopOwnedLocalDockerBox ?? stopLocalDockerBox,
+            stopOwnedLocalDocker,
           );
           settings = applied;
         } else {
           settings = await deps.syncHostSettingsToBox({ inferenceProvider: provider }).catch(() => null);
         }
+        await Promise.resolve(invoke(deps.boxRecovery, "restartCoordinator"));
       } catch (error) {
         invoke(deps.settingsStore, "setInferenceProvider", previous);
+        // Even a failed strict call may have reached the host before its reply
+        // was lost. Restart from the restored persisted provider in every
+        // failure case so desktop and host cannot silently diverge.
+        try {
+          await Promise.resolve(invoke(deps.boxRecovery, "restartCoordinator"));
+        } catch (rollbackError) {
+          throw new AggregateError(
+            [error, rollbackError],
+            "Could not activate the inference provider or restore the previous provider.",
+          );
+        }
         throw error;
       }
-      invoke(deps.boxRecovery, "restartCoordinator");
       return {
         provider,
         usage: settings?.inferenceRouterUsage
@@ -156,8 +172,77 @@ export function createMainEdgeHandlers(deps: MainEdgeDeps): HandlerMap {
         local: getLocalInferenceCliStatus(),
       };
     },
-    getBoxRuntime: async () => { const mode = invoke(deps.settingsStore, "getBoxRuntime"); invariant(isSandBoxRuntime(mode), "Unknown box runtime."); return { mode, status: await getLocalDockerStatus(String(Reflect.get(deps.settingsStore, "settingsPath"))) }; },
-    setBoxRuntime: async (raw) => { const mode = req(raw).mode; invariant(isSandBoxRuntime(mode), "Unknown box runtime."); const settingsPath = String(Reflect.get(deps.settingsStore, "settingsPath")); invoke(deps.settingsStore, "setBoxRuntime", mode); try { if (mode === "local-docker") await startLocalDockerBox(settingsPath, localDockerStartOptionsForProvider(invoke(deps.settingsStore, "getInferenceProvider"))); else await stopLocalDockerBox(); } catch (error) { invoke(deps.settingsStore, "setBoxRuntime", mode === "local-docker" ? "remote" : "local-docker"); throw error; } invoke(deps.boxRecovery, "restartCoordinator"); return { mode, status: await getLocalDockerStatus(settingsPath) }; },
+    getBoxRuntime: async () => { const mode = invoke(deps.settingsStore, "getBoxRuntime"); invariant(isSandBoxRuntime(mode), "Unknown box runtime."); return { mode, status: await (deps.readLocalDockerStatus ?? getLocalDockerStatus)(String(Reflect.get(deps.settingsStore, "settingsPath")), invoke(deps.settingsStore, "getInferenceProvider")) }; },
+    setBoxRuntime: async (raw) => {
+      const mode = req(raw).mode;
+      invariant(isSandBoxRuntime(mode), "Unknown box runtime.");
+      const settingsPath = String(Reflect.get(deps.settingsStore, "settingsPath"));
+      const previousMode = invoke(deps.settingsStore, "getBoxRuntime");
+      invariant(isSandBoxRuntime(previousMode), "Unknown previous box runtime.");
+      const inferenceProvider = invoke(deps.settingsStore, "getInferenceProvider");
+      const readStatus = () => (deps.readLocalDockerStatus ?? getLocalDockerStatus)(
+        settingsPath,
+        inferenceProvider,
+      );
+      if (mode === previousMode) {
+        const status = await readStatus();
+        if (mode === "local-docker" && status.ready !== true) {
+          await (deps.startOwnedLocalDockerBox ?? startLocalDockerBox)(
+            settingsPath,
+            localDockerStartOptionsForProvider(inferenceProvider),
+            inferenceProvider,
+          );
+          await Promise.resolve(invoke(deps.boxRecovery, "restartCoordinator"));
+          return { mode, status: await readStatus() };
+        }
+        return { mode, status };
+      }
+      invoke(deps.settingsStore, "setBoxRuntime", mode);
+      const stopOwnedLocalDocker = deps.stopOwnedLocalDockerBox
+        ?? (() => stopLocalDockerBox(settingsPath));
+      let dockerTransitionCompleted = false;
+      try {
+        if (mode === "local-docker") {
+          await (deps.startOwnedLocalDockerBox ?? startLocalDockerBox)(
+            settingsPath,
+            localDockerStartOptionsForProvider(inferenceProvider),
+            inferenceProvider,
+          );
+        } else {
+          await stopOwnedLocalDocker();
+        }
+        dockerTransitionCompleted = true;
+        await Promise.resolve(invoke(deps.boxRecovery, "restartCoordinator"));
+      } catch (error) {
+        if (mode === "remote" && dockerTransitionCompleted) {
+          return {
+            mode,
+            status: await readStatus(),
+            reconnectError: error instanceof Error ? error.message : String(error),
+          };
+        }
+        let cleanupError: unknown;
+        let rollbackError: unknown;
+        invoke(deps.settingsStore, "setBoxRuntime", previousMode);
+        if (mode === "local-docker") {
+          try { await stopOwnedLocalDocker(); }
+          catch (failure) { cleanupError = failure; }
+        }
+        try { await Promise.resolve(invoke(deps.boxRecovery, "restartCoordinator")); }
+        catch (failure) { rollbackError = failure; }
+        const rollbackFailures = [cleanupError, rollbackError].filter(
+          (failure) => failure !== undefined,
+        );
+        if (rollbackFailures.length > 0) {
+          throw new AggregateError(
+            [error, ...rollbackFailures],
+            "Could not change the local Docker runtime or fully restore the previous runtime.",
+          );
+        }
+        throw error;
+      }
+      return { mode, status: await readStatus() };
+    },
 
     getEgressTunnelEnabled: () => invoke(deps.boxToggleStore, "getEgressTunnelEnabled"),
     setEgressTunnelEnabled: (raw) => { const enabled = req(raw).enabled === true; invoke(deps.boxToggleStore, "setEgressTunnelEnabled", enabled); invoke(egressController(deps), "setEnabled", enabled); deps.emitEgressTunnelChanged(enabled); return enabled; },
@@ -172,7 +257,9 @@ export function createMainEdgeHandlers(deps: MainEdgeDeps): HandlerMap {
     submitFeedback: (raw) => invoke(deps.shell, "submitFeedback", raw),
     markDeepLinksReady: () => { invoke(deps.shell, "markDeepLinksReady"); },
     getBoxMigrationStatus: () => invoke(deps.boxRecovery, "readBoxMigrationStatus"),
-    forceReconnectGateway: () => { invoke(deps.boxRecovery, "restartCoordinator"); },
+    forceReconnectGateway: async () => {
+      return await Promise.resolve(invoke(deps.boxRecovery, "restartCoordinator"));
+    },
     forceRecreateComputer: () => invoke(deps.boxRecovery, "forceRecreateComputer"),
     updateComputer: async (raw) => { const { id } = req(raw); invariant(typeof id === "string", "A computer update names the agent by its string id."); const force = req(raw).force === true; const result = req(await Promise.resolve(invoke(deps.boxRecovery, "recreateComputer", { preserveData: true, force }))); if (result.status !== "dev-fallback") return result; await Promise.resolve(invoke(deps.boxRecovery, "updateForeverBox", { id, force })); return { status: "dev-fallback-finished" }; },
 

@@ -37,7 +37,7 @@ export async function resolveLocal9RouterWorkspaceClaim(args: {
   return status.configured === true
     && typeof status.model === "string"
     && status.model.trim().length > 0
-    && status.protocol !== "responses"
+    && (status.protocol === "chat-completions" || status.protocol === "auto")
     ? { kind: "local-workspace", slot: LOCAL_9ROUTER_WORKSPACE_ID }
     : null;
 }

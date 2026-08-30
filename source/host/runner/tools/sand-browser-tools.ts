@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { createHash } from "node:crypto";
+import { createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { buildHostShellArgs } from "../../box/box-shell-command.js";
 import { navigationProbeCommand, normalizeNavigationUrl, parseNavigationProbeOutput } from "../sand-action-audit.js";
 import { SAND_BOX_NO_MONITOR_AVAILABLE_MESSAGE } from "../../ports/box.js";
@@ -16,6 +16,7 @@ import {
   SAND_BROWSER_DRIVER_BOX_DIR,
   SAND_BROWSER_DRIVER_BOX_PATH,
   SAND_BROWSER_DRIVER_SOURCE,
+  SAND_BROWSER_ENCRYPTED_RESULT_MARKER,
   SAND_BROWSER_RESULT_MARKER,
 } from "./sand-browser-driver-source.js";
 
@@ -124,6 +125,10 @@ export function toDriverResponse(
 export function parseDriverResponse(
   stdout: string,
 ): BrowserDriverResponse | undefined {
+  const genericPreKeyFailures = new Set([
+    "Browser driver request channel failed",
+    "Browser driver timed out after 90s",
+  ]);
   const lines = stdout.split("\n");
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     const line = lines[index] ?? "";
@@ -138,13 +143,61 @@ export function parseDriverResponse(
         && parsed !== null
         && !Array.isArray(parsed)
       ) {
-        return toDriverResponse(parsed as Record<string, unknown>);
+        const record = parsed as Record<string, unknown>;
+        // Plaintext output is permitted only before the response key has been
+        // bound. Never trust it as a normal Browser result: a raw driver or
+        // runtime error can contain page text, URLs, or request data.
+        if (
+          record.ok === false
+          && typeof record.error === "string"
+          && genericPreKeyFailures.has(record.error)
+        ) {
+          return { ok: false, error: record.error };
+        }
+        return undefined;
       }
     } catch {
       return undefined;
     }
   }
   return undefined;
+}
+
+function parseEncryptedDriverResponse(stdout: string): Buffer | undefined {
+  const markerIndex = stdout.lastIndexOf(SAND_BROWSER_ENCRYPTED_RESULT_MARKER);
+  if (markerIndex < 0) return undefined;
+  const encoded = stdout
+    .slice(markerIndex + SAND_BROWSER_ENCRYPTED_RESULT_MARKER.length)
+    .split(/\r?\n/u, 1)[0]
+    ?.trim() ?? "";
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) return undefined;
+  const packet = Buffer.from(encoded, "base64");
+  return packet.length > 29 && packet[0] === 1 ? packet : undefined;
+}
+
+function decryptDriverResponse(
+  packet: Buffer,
+  responseKey: Buffer,
+): BrowserDriverResponse | undefined {
+  try {
+    const decipher = createDecipheriv(
+      "aes-256-gcm",
+      responseKey,
+      packet.subarray(1, 13),
+    );
+    decipher.setAAD(Buffer.from("sand-browser-result-v1", "utf8"));
+    decipher.setAuthTag(packet.subarray(13, 29));
+    const parsed: unknown = JSON.parse(Buffer.concat([
+      decipher.update(packet.subarray(29)),
+      decipher.final(),
+    ]).toString("utf8"));
+    if (typeof parsed !== "object" || parsed == null || Array.isArray(parsed)) {
+      return undefined;
+    }
+    return toDriverResponse(parsed as Record<string, unknown>);
+  } catch {
+    return undefined;
+  }
 }
 
 export function sanitizeForBoxPath(value: string): string {
@@ -172,7 +225,12 @@ export interface BrowserDriverDependencies<Context> {
     boxId: string,
     path: string,
   ): Promise<Uint8Array>;
-  executeShell(
+  removeFile(
+    context: Context,
+    boxId: string,
+    path: string,
+  ): Promise<void>;
+  executeShellWithInput(
     context: Context,
     input: {
       command: string;
@@ -180,6 +238,7 @@ export interface BrowserDriverDependencies<Context> {
       workingDirectory: string;
       toolCallId: string;
     },
+    stdin: string,
   ): Promise<{
     readonly case: "success" | string;
     readonly stdout?: string;
@@ -258,6 +317,8 @@ export class SandBrowserDriver<Context = unknown> {
     const screenshotPath = input.skipScreenshot === true
       ? undefined
       : `${SAND_BROWSER_DRIVER_BOX_DIR}/shot-${sanitizeForBoxPath(input.toolCallId)}.png`;
+    let screenshotRemoved = false;
+    try {
     const requestedViewId = input.args.viewId;
     const request = {
       ...input.args,
@@ -269,31 +330,49 @@ export class SandBrowserDriver<Context = unknown> {
         : this.dependencies.getDefaultViewId(),
       ...(screenshotPath == null ? {} : { screenshotPath }),
     };
-    const encoded = Buffer.from(
-      JSON.stringify(request),
-      "utf8",
-    ).toString("base64");
-
-    const shell = await this.dependencies.executeShell(context, {
-      command: `node ${SAND_BROWSER_DRIVER_BOX_PATH} ${encoded}`,
-      name: "node",
-      workingDirectory: "/workspace",
-      toolCallId: `sand-browser-${input.op}-${sanitizeForBoxPath(input.toolCallId)}`,
-    });
+    // Request data travels over the exec daemon's stdin channel only. The
+    // background driver disables terminal echo before it acknowledges ready,
+    // so no request carrier or reusable key is written to the box or audit.
+    const responseKey = randomBytes(32);
+    const responseKeyHex = responseKey.toString("hex");
+    const stdin = `${Buffer.from(JSON.stringify({
+      request,
+      responseKey: responseKeyHex,
+    }), "utf8").toString("base64")}\n`;
+    let shell: Awaited<ReturnType<BrowserDriverDependencies<Context>["executeShellWithInput"]>>;
+    try {
+      shell = await this.dependencies.executeShellWithInput(context, {
+        command: `node ${SAND_BROWSER_DRIVER_BOX_PATH} --request-stdin`,
+        name: "node",
+        workingDirectory: "/workspace",
+        toolCallId: `sand-browser-${input.op}-${sanitizeForBoxPath(input.toolCallId)}`,
+      }, stdin);
+    } catch (error) {
+      responseKey.fill(0);
+      throw error;
+    }
     if (shell.case !== "success") {
+      responseKey.fill(0);
       throw new SandBrowserDriverError(
-        `Browser driver shell failed (${shell.case || "unknown"})`,
+        "Browser driver shell did not complete successfully.",
       );
     }
 
-    const response = parseDriverResponse(shell.stdout ?? "");
+    let response: BrowserDriverResponse | undefined;
+    try {
+      const encryptedResponse = parseEncryptedDriverResponse(shell.stdout ?? "");
+      response = encryptedResponse == null
+        ? parseDriverResponse(shell.stdout ?? "")
+        : decryptDriverResponse(encryptedResponse, responseKey);
+    } finally {
+      responseKey.fill(0);
+    }
     if (response === undefined) {
-      const detail = [shell.stderr ?? "", shell.stdout ?? ""]
-        .map((part) => part.trim().slice(-400))
-        .filter((part) => part.length > 0)
-        .join(" | ");
+      const exitCode = typeof shell.exitCode === "number"
+        ? String(shell.exitCode)
+        : "unknown";
       throw new SandBrowserDriverError(
-        `Browser driver produced no result (exit ${shell.exitCode ?? "unknown"})${detail.length > 0 ? `: ${detail}` : ""}`,
+        `Browser driver produced no authenticated result (exit ${exitCode}).`,
       );
     }
     if (!response.ok) {
@@ -311,19 +390,49 @@ export class SandBrowserDriver<Context = unknown> {
       parts.push(response.data);
     }
 
-    const imageB64 = response.screenshot === true && screenshotPath != null
-      ? await this.fetchScreenshot(context, screenshotPath)
-      : undefined;
+    let imageB64: string | undefined;
+    if (response.screenshot === true && screenshotPath != null) {
+      const bytes = await this.downloadScreenshot(context, screenshotPath);
+      // Delete immediately after the transfer settles. Local persistence and
+      // base64 conversion can continue from memory without extending the
+      // lifetime of page pixels in the box filesystem.
+      await this.removeScreenshot(context, screenshotPath);
+      screenshotRemoved = true;
+      imageB64 = await this.encodeScreenshot(bytes);
+    }
     return {
       text: parts.join("\n\n"),
       ...(imageB64 == null ? {} : { imageB64 }),
     };
+    } finally {
+      if (screenshotPath != null && !screenshotRemoved) {
+        // This runs only after any download attempt has settled, so cleanup
+        // cannot truncate an in-flight screenshot transfer. Production
+        // supplies a detached, bounded remover so caller aborts do not
+        // strand the temporary PNG in the box.
+        await this.removeScreenshot(context, screenshotPath);
+      }
+    }
   }
 
-  async fetchScreenshot(
+  async removeScreenshot(context: Context, boxPath: string): Promise<void> {
+    try {
+      await this.dependencies.removeFile(
+        context,
+        this.dependencies.getBoxId(),
+        boxPath,
+      );
+    } catch {
+      throw new SandBrowserDriverError(
+        "Could not remove the temporary Browser screenshot from the box.",
+      );
+    }
+  }
+
+  async downloadScreenshot(
     context: Context,
     boxPath: string,
-  ): Promise<string | undefined> {
+  ): Promise<Uint8Array | undefined> {
     try {
       const bytes = await this.dependencies.downloadFile(
         context,
@@ -331,14 +440,19 @@ export class SandBrowserDriver<Context = unknown> {
         boxPath,
       );
       if (bytes.length === 0) return undefined;
-      const persistImage = this.dependencies.getPersistImage?.();
-      if (persistImage != null) {
-        await persistImage(bytes, "image/png").catch(() => null);
-      }
-      return Buffer.from(bytes).toString("base64");
+      return bytes;
     } catch {
       return undefined;
     }
+  }
+
+  async encodeScreenshot(bytes: Uint8Array | undefined): Promise<string | undefined> {
+    if (bytes == null || bytes.length === 0) return undefined;
+    const persistImage = this.dependencies.getPersistImage?.();
+    if (persistImage != null) {
+      await persistImage(bytes, "image/png").catch(() => null);
+    }
+    return Buffer.from(bytes).toString("base64");
   }
 }
 
@@ -386,8 +500,10 @@ function resolveBrowserTargetPageUrl(
   const views = fields.views !== null && typeof fields.views === "object" && !Array.isArray(fields.views)
     ? fields.views as Record<string, unknown>
     : {};
-  const urls = fields.urls !== null && typeof fields.urls === "object" && !Array.isArray(fields.urls)
-    ? fields.urls as Record<string, unknown>
+  const urlFingerprints = fields.urlFingerprints !== null
+    && typeof fields.urlFingerprints === "object"
+    && !Array.isArray(fields.urlFingerprints)
+    ? fields.urlFingerprints as Record<string, unknown>
     : {};
   const targetId = views[viewId];
   if (typeof targetId === "string" && targetId.length > 0) {
@@ -395,7 +511,17 @@ function resolveBrowserTargetPageUrl(
     const url = typeof target?.url === "string" ? normalizeNavigationUrl(target.url) : undefined;
     if (url !== undefined) return url;
   }
-  return typeof urls[viewId] === "string" ? normalizeNavigationUrl(urls[viewId] as string) : undefined;
+  const fingerprint = urlFingerprints[viewId];
+  if (typeof fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(fingerprint)) {
+    return undefined;
+  }
+  for (const target of parseNavigationProbeOutput(probeStdout)) {
+    if (target.type !== "page" || typeof target.url !== "string") continue;
+    if (createHash("sha256").update(target.url, "utf8").digest("hex") !== fingerprint) continue;
+    const url = normalizeNavigationUrl(target.url);
+    if (url !== undefined) return url;
+  }
+  return undefined;
 }
 
 async function captureBrowserReviewState(args: {
@@ -528,7 +654,7 @@ export interface BrowserToolDefinition<Context> {
   execute(
     context: Context,
     args: Record<string, unknown>,
-    metadata: { readonly toolCallId: string; readonly stateHandler?: unknown; readonly workspacePaths?: readonly string[] },
+    metadata: { readonly toolCallId: string; readonly signal?: AbortSignal; readonly stateHandler?: unknown; readonly workspacePaths?: readonly string[] },
   ): Promise<BrowserDriverOutput>;
   render(output: BrowserDriverOutput): {
     readonly kind: "text" | "image";
@@ -618,6 +744,7 @@ export function createSandBrowserTools<Context>(
             },
             exactAction,
             toolCallId: metadata.toolCallId,
+            ...(metadata.signal === undefined ? {} : { signal: metadata.signal }),
             ...(metadata.stateHandler === undefined ? {} : { stateHandler: metadata.stateHandler }),
             ...(metadata.workspacePaths === undefined ? {} : { workspacePaths: metadata.workspacePaths }),
           });

@@ -61,6 +61,60 @@ export function routerProviderById(id: RouterProviderId): RouterProvider {
   return ROUTER_PROVIDERS.find((provider) => provider.id === id) ?? ROUTER_PROVIDERS[0]!;
 }
 
+/**
+ * Returns only the network origin represented by a draft URL. Keeping this
+ * helper independent from the stricter main-process validator lets the form
+ * fail closed while the user is midway through editing an address.
+ */
+export function cliProxyDraftOrigin(raw: string): string | null {
+  try {
+    const parsed = new URL(raw.trim());
+    return parsed.username.length === 0 && parsed.password.length === 0
+      ? parsed.origin
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A credential typed for one origin must never survive a draft-origin edit. */
+export function shouldClearCliProxyApiKeyDraft(
+  apiKey: string,
+  keyOrigin: string | null,
+  nextBaseUrl: string,
+): boolean {
+  return apiKey.trim().length > 0
+    && (keyOrigin == null || cliProxyDraftOrigin(nextBaseUrl) !== keyOrigin);
+}
+
+export interface CliProxyApiKeyDraftIdentity {
+  readonly revision: number;
+  readonly origin: string | null;
+}
+
+/**
+ * Binds a persistence acknowledgement to the exact draft that was submitted.
+ * A late acknowledgement must never erase a replacement key or a key now bound
+ * to a different endpoint origin.
+ */
+export function createCliProxyApiKeyPersistenceGuard(
+  submitted: CliProxyApiKeyDraftIdentity,
+  current: () => CliProxyApiKeyDraftIdentity,
+  clear: () => void,
+): () => void {
+  let applied = false;
+  return () => {
+    if (applied) return;
+    const latest = current();
+    if (
+      latest.revision !== submitted.revision
+      || latest.origin !== submitted.origin
+    ) return;
+    applied = true;
+    clear();
+  };
+}
+
 export function parseRouterProviderPreference(raw: string | null): RouterProviderId {
   if (raw == null) return DEFAULT_ROUTER_PROVIDER;
   try {

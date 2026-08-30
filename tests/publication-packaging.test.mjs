@@ -29,23 +29,24 @@ test("publication ignore rules retain reconstructed frontend source", async () =
   assert.equal(matcher.ignores("recovered/generated-output.txt"), true, "root recovery output must remain ignored");
 });
 
-test("Windows owner draft release identities stay aligned", async () => {
+test("Windows push-access-visible draft release identities stay aligned", async () => {
   const [packageJson, packageLock, windowsPackage, workflow] = await Promise.all([
     readFile(path.join(repoRoot, "package.json"), "utf8").then(JSON.parse),
     readFile(path.join(repoRoot, "package-lock.json"), "utf8").then(JSON.parse),
     readFile(path.join(repoRoot, "scripts", "lib", "windows-package.mjs"), "utf8"),
     readFile(path.join(repoRoot, ".github", "workflows", "windows-draft-release.yml"), "utf8"),
   ]);
-  const version = "0.18.0-reconstructed.2";
+  const version = "0.18.0-reconstructed.3";
   assert.equal(packageJson.version, version);
   assert.equal(packageLock.version, version);
   assert.equal(packageLock.packages[""].version, version);
-  assert.match(windowsPackage, /reconstructedVersion: "0\.18\.0-reconstructed\.2"/);
-  assert.match(workflow, /v0\.18\.0-reconstructed\.2/);
-  assert.match(workflow, /Grok-Bot-0\.18\.0-reconstructed\.2-windows-x64-portable-unsigned\.zip/);
+  assert.match(windowsPackage, /reconstructedVersion: packageVersion/);
+  assert.match(windowsPackage, /manifest\.reconstructedVersion !== packageVersion/);
+  assert.match(workflow, /RELEASE_VERSION: 0\.18\.0-reconstructed\.3/);
+  assert.match(workflow, /Grok-Bot-\$\(\$env:RELEASE_VERSION\)-windows-x64-portable-unsigned\.zip/);
   assert.match(workflow, /http:\/\/100\.112\.10\.8:20128\/v1/);
   assert.match(workflow, /v0\.5\.35/);
-  assert.doesNotMatch(workflow, /reconstructed\.1/);
+  assert.doesNotMatch(workflow, /reconstructed\.[12]/);
 });
 
 test("default packaging keeps the polished checksum-pinned renderer", async () => {
@@ -90,8 +91,10 @@ test("Router settings use the trusted backend and display recorded inference usa
   assert.match(mainEdge, /invoke\(deps\.settingsStore, "setInferenceProvider", provider\)/);
   assert.match(mainEdge, /return\s*\{\s*provider,\s*usage:/);
   assert.match(mainEdge, /invoke\(deps\.boxRecovery, "restartCoordinator"\)/);
-  assert.match(mainEdge, /mode === "local-docker"\) await startLocalDockerBox\(settingsPath, localDockerStartOptionsForProvider\(invoke\(deps\.settingsStore, "getInferenceProvider"\)\)\); else await stopLocalDockerBox\(\)/);
-  assert.match(mainEdge, /setBoxRuntime", mode === "local-docker" \? "remote" : "local-docker"/);
+  assert.match(mainEdge, /deps\.startOwnedLocalDockerBox \?\? startLocalDockerBox/);
+  assert.match(mainEdge, /localDockerStartOptionsForProvider\(inferenceProvider\)/);
+  assert.match(mainEdge, /setBoxRuntime", previousMode/);
+  assert.match(mainEdge, /Could not change the local Docker runtime or fully restore the previous runtime/);
   assert.match(localDocker, /public\.ecr\.aws\/k0i0n2g5\/cursorenvironments\/universal@sha256:3f9e25e1e382b7c4b71e08eb549098a6106fadc615feba848e6cc5c1ef4be3b6/);
   assert.doesNotMatch(localDocker, /cursorenvironments\/universal:sand-box-latest/);
   assert.match(localDocker, /"127\.0\.0\.1:1340:1340"/);

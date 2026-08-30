@@ -1,3 +1,5 @@
+import { setTimeout as delay } from "node:timers/promises";
+import { posix } from "node:path";
 import {
   ComputerUseAction,
   ComputerUseArgs,
@@ -17,12 +19,28 @@ import {
   WaitAction,
   type ComputerUseResult as GeneratedComputerUseResult,
 } from "../../packages/proto/generated/agent/v1/computer_use_tool_pb.js";
+import {
+  backgroundShellExecutorResource,
+  writeBackgroundShellInputExecutorResource,
+} from "../../packages/agent-exec/background-shell.js";
 import { computerUseExecutorResource } from "../../packages/agent-exec/computer-use.js";
 import { shellExecutorResource } from "../../packages/agent-exec/shell.js";
 import type { Executor, ExecutorOptions } from "../../packages/agent-exec/remote.js";
-import type { Context } from "../../packages/context/core.js";
+import type { Context as OperationContext } from "../../packages/context/core.js";
+import {
+  BackgroundShellSpawnArgs,
+  WriteShellStdinArgs,
+  type BackgroundShellSpawnResult,
+  type WriteShellStdinResult,
+} from "../../packages/proto/generated/agent/v1/background_shell_exec_pb.js";
 import { buildHostShellArgs, type HostShellArgsInput } from "../box/box-shell-command.js";
-import type { ShellArgs, ShellResult } from "../../packages/proto/generated/agent/v1/shell_exec_pb.js";
+import {
+  ShellCommandParsingResult,
+  ShellCommandParsingResult_ExecutableCommand,
+  type ShellArgs,
+  type ShellResult,
+} from "../../packages/proto/generated/agent/v1/shell_exec_pb.js";
+import { shellSingleQuote } from "../box/box-file-transfer.js";
 import type {
   ComputerProtocolAction,
   ComputerToolDependencies,
@@ -32,6 +50,12 @@ import type {
 import type { BrowserDriverDependencies } from "./tools/sand-browser-tools.js";
 import type { SandBrowserAutoReviewOptions } from "./sand-browser-auto-review.js";
 import type { SandComputerAutoReviewOptions } from "./sand-computer-auto-review.js";
+import { parseShellTerminalFooter } from "./background-work.js";
+import {
+  SAND_BROWSER_ENCRYPTED_RESULT_MARKER,
+  SAND_BROWSER_RESULT_MARKER,
+  SAND_BROWSER_STDIN_READY_MARKER,
+} from "./tools/sand-browser-driver-source.js";
 
 export interface HostComputerToolProjectionInput<Context = unknown> {
   readonly resourceAccessor: { get(resource: unknown): unknown };
@@ -59,7 +83,7 @@ export interface HostShellExecutor {
 }
 
 export interface HostBrowserBoxOwner<Context = unknown> {
-  ensureReady(context: Context, agentId: string): Promise<unknown>;
+  ensureReady(context: Context, agentId: string): Promise<{ readonly terminalsFolder?: string }>;
   getAgentWindowIndex(agentId: string): number | undefined;
   uploadFile(context: Context, agentId: string, path: string, bytes: Uint8Array): Promise<void>;
   downloadFile(context: Context, agentId: string, path: string): Promise<Uint8Array>;
@@ -69,6 +93,7 @@ export interface HostBrowserDriverProjectionInput<Context = unknown> {
   readonly resourceAccessor: { get(resource: unknown): unknown };
   readonly box: HostBrowserBoxOwner<Context>;
   readonly getBoxId: () => string;
+  readonly getWindowAgentId?: () => string;
   readonly getDefaultViewId: () => string;
   readonly executeShell: HostShellExecutor;
   readonly getPersistImage?: BrowserDriverDependencies<Context>["getPersistImage"];
@@ -297,7 +322,7 @@ export function createHostShellExecutor(
       input.assertNoPendingApproval();
       input.auditShellCommand(args.command);
       return await executor.execute(
-        context as Context,
+        context as OperationContext,
         buildHostShellArgs(args),
         options,
       );
@@ -318,8 +343,9 @@ export function createHostBrowserDriverDependencies<Context = unknown>(
     resourceAccessor: input.resourceAccessor,
     async getWindowIndex(context) {
       const boxId = input.getBoxId();
-      await input.box.ensureReady(context, boxId);
-      return input.box.getAgentWindowIndex(boxId);
+      const windowAgentId = input.getWindowAgentId?.() ?? boxId;
+      await input.box.ensureReady(context, windowAgentId);
+      return input.box.getAgentWindowIndex(windowAgentId);
     },
     getBoxId: input.getBoxId,
     getDefaultViewId: input.getDefaultViewId,
@@ -329,17 +355,185 @@ export function createHostBrowserDriverDependencies<Context = unknown>(
     async downloadFile(context, boxId, path) {
       return await input.box.downloadFile(context, boxId, path);
     },
-    async executeShell(context, shellInput) {
-      const result = await input.executeShell.execute(context, shellInput);
-      if (result.result.case === "success") {
-        return {
-          case: "success",
-          stdout: result.result.value.stdout,
-          stderr: result.result.value.stderr,
-          exitCode: result.result.value.exitCode,
-        };
+    async removeFile(context, boxId, path) {
+      if (boxId !== input.getBoxId()) {
+        throw new TypeError("Browser screenshot cleanup box does not match the active box");
       }
-      return { case: result.result.case ?? "" };
+      if (!/^\/tmp\/\.sand-browser\/shot-[A-Za-z0-9_-]+\.png$/u.test(path)) {
+        throw new TypeError("Browser screenshot cleanup path is outside the private screenshot area");
+      }
+      const operationContext = context as unknown as OperationContext;
+      const [cleanupContext, cancelCleanup] = operationContext
+        .withDetached()
+        .withTimeoutAndCancel(10_000);
+      try {
+        const result = await input.executeShell.execute(cleanupContext, {
+          command: `rm -f -- ${shellSingleQuote(path)}`,
+          name: "rm",
+          workingDirectory: "/workspace",
+          toolCallId: `sand-browser-screenshot-cleanup-${Date.now()}`,
+        });
+        if (
+          result.result.case !== "success"
+          || result.result.value.exitCode !== 0
+        ) {
+          throw new Error("Browser screenshot cleanup command failed");
+        }
+      } finally {
+        cancelCleanup();
+      }
+    },
+    async executeShellWithInput(context, shellInput, stdin) {
+      const operationContext = context as unknown as OperationContext;
+      const connection = await input.box.ensureReady(
+        context,
+        input.getWindowAgentId?.() ?? input.getBoxId(),
+      );
+      if (connection.terminalsFolder == null || connection.terminalsFolder.length === 0) {
+        return { case: "spawnError" };
+      }
+      const background = input.resourceAccessor.get(backgroundShellExecutorResource) as Executor<BackgroundShellSpawnArgs, BackgroundShellSpawnResult>;
+      const writeInput = input.resourceAccessor.get(writeBackgroundShellInputExecutorResource) as Executor<WriteShellStdinArgs, WriteShellStdinResult>;
+      let terminalPath: string | undefined;
+      let shellPid: number | undefined;
+      let driverResultObserved = false;
+      const readTerminal = async (pollContext: OperationContext): Promise<string | undefined> => {
+        if (terminalPath == null) return undefined;
+        if (pollContext.signal.aborted) throw pollContext.reason;
+        try {
+          return Buffer.from(await input.box.downloadFile(
+            pollContext as unknown as Context,
+            input.getBoxId(),
+            terminalPath,
+          )).toString("utf8");
+        } catch {
+          return undefined;
+        }
+      };
+      const waitFor = async (
+        pollContext: OperationContext,
+        timeoutMs: number,
+        predicate: (output: string) => boolean,
+      ): Promise<string> => {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+          if (pollContext.signal.aborted) throw pollContext.reason;
+          const output = await readTerminal(pollContext);
+          if (output != null && predicate(output)) return output;
+          await delay(50, undefined, { signal: pollContext.signal });
+        }
+        throw new Error("Browser driver terminal response timed out");
+      };
+      try {
+        const spawned = await background.execute(operationContext, new BackgroundShellSpawnArgs({
+          command: shellInput.command,
+          workingDirectory: shellInput.workingDirectory,
+          toolCallId: shellInput.toolCallId,
+          enableWriteShellStdinTool: true,
+          skipApproval: true,
+          parsingResult: new ShellCommandParsingResult({
+            parsingFailed: false,
+            executableCommands: [new ShellCommandParsingResult_ExecutableCommand({
+              name: shellInput.name,
+              args: [],
+              fullText: shellInput.command,
+            })],
+            hasRedirects: false,
+            hasCommandSubstitution: false,
+          }),
+        }));
+        if (spawned.result.case !== "success") return { case: spawned.result.case ?? "" };
+        const shellId = spawned.result.value.shellId;
+        shellPid = spawned.result.value.pid;
+        terminalPath = posix.join(connection.terminalsFolder, `${shellId}.txt`);
+        await waitFor(operationContext, 10_000, output => output.includes(SAND_BROWSER_STDIN_READY_MARKER));
+        const written = await writeInput.execute(operationContext, new WriteShellStdinArgs({
+          shellId,
+          chars: stdin,
+        }));
+        if (written.result.case !== "success") return { case: written.result.case ?? "" };
+        const stdout = await waitFor(
+          operationContext,
+          95_000,
+          output => output.includes(SAND_BROWSER_ENCRYPTED_RESULT_MARKER)
+            || output.includes(SAND_BROWSER_RESULT_MARKER),
+        );
+        driverResultObserved = true;
+        return { case: "success", stdout, stderr: "", exitCode: 0 };
+      } finally {
+        if (terminalPath != null) {
+          const pathToRemove = terminalPath;
+          // The background process can outlive an aborted caller. Complete the
+          // bounded detached cleanup before this operation settles: otherwise
+          // its queued footer append can outlive the owning box/temp directory,
+          // recreate a transcript after an early unlink, or reject as an
+          // unhandled write after teardown.
+          const runCleanupCommand = async (
+            command: string,
+            suffix: string,
+          ): Promise<void> => {
+            const [cleanupContext, cancelCleanup] = operationContext
+              .withDetached()
+              .withTimeoutAndCancel(5_000);
+            try {
+              await input.executeShell.execute(cleanupContext, {
+                command,
+                name: "sh",
+                workingDirectory: "/workspace",
+                toolCallId: `${shellInput.toolCallId}-${suffix}`,
+              }).catch(() => undefined);
+            } finally {
+              cancelCleanup();
+            }
+          };
+          const terminateDriver = async (signal: "TERM" | "KILL"): Promise<void> => {
+            if (!Number.isSafeInteger(shellPid) || (shellPid ?? 0) <= 1) return;
+            const pid = Math.trunc(shellPid!);
+            // Verify the exact internal command immediately before signaling so
+            // a stale/reused PID cannot terminate an unrelated box process.
+            const expectedCommand = shellSingleQuote(shellInput.command);
+            const command = [
+              `pid=${pid}`,
+              `if test -r "/proc/$pid/cmdline" && tr '\\000' ' ' < "/proc/$pid/cmdline" | grep -Fq -- ${expectedCommand}; then`,
+              `  kill -${signal} -- "-$pid" 2>/dev/null || kill -${signal} -- "$pid" 2>/dev/null || true`,
+              "fi",
+            ].join("\n");
+            await runCleanupCommand(command, `driver-${signal.toLowerCase()}`);
+          };
+          const waitForFooter = async (timeoutMs: number): Promise<boolean> => {
+            const [footerContext, cancelFooter] = operationContext
+              .withDetached()
+              .withTimeoutAndCancel(timeoutMs);
+            try {
+              return await waitFor(
+                footerContext,
+                timeoutMs,
+                output => parseShellTerminalFooter(output).isComplete,
+              ).then(() => true, () => false);
+            } finally {
+              cancelFooter();
+            }
+          };
+
+          // Cancellation can leave the background driver alive after the tool
+          // promise rejects. Stop only the attested command's process group so
+          // its footer is queued promptly instead of leaving detached work.
+          if (!driverResultObserved) await terminateDriver("TERM");
+          let footerComplete = await waitForFooter(shellPid == null ? 95_000 : 10_000);
+          if (!footerComplete) {
+            await terminateDriver("KILL");
+            footerComplete = await waitForFooter(5_000);
+          }
+          void footerComplete;
+          // A result marker can be appended just before the exec daemon's
+          // terminal footer. The waits above ensure the final unlink happens
+          // after that authoritative append, so the transcript stays removed.
+          await runCleanupCommand(
+            `rm -f -- ${shellSingleQuote(pathToRemove)}`,
+            "terminal-cleanup",
+          );
+        }
+      }
     },
     ...(input.getPersistImage === undefined ? {} : { getPersistImage: input.getPersistImage }),
     ...(input.autoReview === undefined ? {} : { autoReview: input.autoReview }),

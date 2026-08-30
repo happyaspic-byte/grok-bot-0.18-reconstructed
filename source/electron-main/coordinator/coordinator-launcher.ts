@@ -27,6 +27,8 @@ export interface CoordinatorLaunchHandle {
   readonly controlSettled: Promise<unknown>;
   readonly processExited: Promise<{ readonly code: number | null }>;
   dispose(): void;
+  /** Closes every control/data leg and terminates a child that did not retire gracefully. */
+  forceDispose(): void;
 }
 
 export interface LaunchCoordinatorDependencies {
@@ -89,6 +91,7 @@ export function launchCoordinator(
   });
 
   let disposeRequested = false;
+  let forceDisposeRequested = false;
   return {
     rendererDataPort: dataChannel.port2,
     mainDataPort: mainDataChannel.port2,
@@ -105,6 +108,19 @@ export function launchCoordinator(
       void server.settled.then(() => {
         if (!exited) child.kill();
       });
+    },
+    forceDispose() {
+      if (forceDisposeRequested || exited) return;
+      forceDisposeRequested = true;
+      disposeRequested = true;
+      server.dispose();
+      // Closing the main-side ports first prevents an unresponsive retired
+      // child from retaining an executor or data path while termination is in
+      // flight. The runtime launch fence separately rejects all late events.
+      try { controlChannel.port2.close(); } catch {}
+      try { dataChannel.port2.close(); } catch {}
+      try { mainDataChannel.port2.close(); } catch {}
+      child.kill();
     },
   };
 }

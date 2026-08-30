@@ -38,9 +38,17 @@ import type {
 } from "./prompt-collector-glue.js";
 import {
   createTurnAgentRunContext,
+  SandTurnInterruptedBeforeDispatchError,
   type TurnAgentInferenceOwner,
   type TurnAgentRunContext,
+  type TurnAgentRunContextInput,
 } from "./turn-run-shell.js";
+
+function assertProductionTurnActive(context: Context): void {
+  if (context.signal.aborted) {
+    throw new SandTurnInterruptedBeforeDispatchError();
+  }
+}
 
 /**
  * The host-owned inputs immediately before immutable buildAgentForRun.  This
@@ -55,6 +63,8 @@ export interface ProductionTurnAgentOwnerInput {
   readonly inference: TurnAgentInferenceOwner;
   readonly onRequestId: (requestId: string) => void;
   readonly isSubagentRunner: boolean;
+  readonly isComputerUseSubagent: boolean;
+  readonly isBrowserUseSubagent: boolean;
   readonly isSilenceAllowed: boolean;
   readonly canUseSelfSummary: () => boolean;
   readonly cancelThisRun: TurnAgentScope["cancelThisRun"];
@@ -87,6 +97,7 @@ export interface ProductionTurnAgentOwnerInput {
   readonly hidden?: boolean;
   readonly lineage?: unknown;
   readonly profilePromptSnapshot?: AgentProfilePromptSnapshot;
+  readonly systemPromptAssembly?: TurnAgentRunContextInput<Context>["systemPromptAssembly"];
   readonly profilePromptSnapshotStore?: PromptSnapshotStore;
   readonly onProfileUpdateAppended?: (identity: {
     readonly name: string;
@@ -126,6 +137,7 @@ export interface ProductionTurnAgentRunInput {
 export async function createProductionTurnAgentRunInput(
   input: ProductionTurnAgentRunInput,
 ) {
+  assertProductionTurnActive(input.runCtx);
   const assembly = await input.assembleGeneratedTurnAction({
     runCtx: input.runCtx,
     trimmedPrompt: input.trimmedPrompt,
@@ -135,6 +147,7 @@ export async function createProductionTurnAgentRunInput(
       : { profileUpdateForTurn: input.profileUpdateForTurn }),
     compactionEpoch: input.compactionEpoch,
   });
+  assertProductionTurnActive(input.runCtx);
   return createTurnAgentRunInputProjection({
     runCtx: input.runCtx,
     createAction: async () => assembly.action,
@@ -154,8 +167,10 @@ export async function createProductionTurnAgentRunInput(
 export async function createProductionTurnAgentOwner(
   input: ProductionTurnAgentOwnerInput,
 ): Promise<ProductionTurnAgentOwner> {
+  assertProductionTurnActive(input.context);
   const runContext = await createTurnAgentRunContext({
     context: input.context,
+    isCancelled: () => input.context.signal.aborted,
     conversationId: input.conversationId,
     requestId: input.requestId,
     inference: input.inference,
@@ -165,6 +180,8 @@ export async function createProductionTurnAgentOwner(
       ? {}
       : { requestSource: input.requestSource }),
     isSubagentRunner: input.isSubagentRunner,
+    isComputerUseSubagent: input.isComputerUseSubagent,
+    isBrowserUseSubagent: input.isBrowserUseSubagent,
     isSilenceAllowed: input.isSilenceAllowed,
     ...(input.hidden === undefined ? {} : { hidden: input.hidden }),
     ...(input.lineage === undefined ? {} : { lineage: input.lineage }),
@@ -187,6 +204,9 @@ export async function createProductionTurnAgentOwner(
     ...(input.profilePromptSnapshot === undefined
       ? {}
       : { profilePromptSnapshot: input.profilePromptSnapshot }),
+    ...(input.systemPromptAssembly === undefined
+      ? {}
+      : { systemPromptAssembly: input.systemPromptAssembly }),
     ...(input.profilePromptSnapshotStore === undefined
       ? {}
       : { profilePromptSnapshotStore: input.profilePromptSnapshotStore }),
@@ -203,8 +223,11 @@ export async function createProductionTurnAgentOwner(
   });
 
   try {
+    assertProductionTurnActive(input.context);
     const baseResourceAccessor = await input.createResourceAccessor(input.context);
+    assertProductionTurnActive(input.context);
     const remoteBoxResourceAccessor = await input.createRemoteBoxResourceAccessor(input.context);
+    assertProductionTurnActive(input.context);
     const turnLocalResourceProjection = createTurnLocalResourceProjection({
       ...input.createTurnLocalResourceProjectionInput(baseResourceAccessor),
       baseAccessor: baseResourceAccessor,

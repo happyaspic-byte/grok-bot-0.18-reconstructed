@@ -190,7 +190,9 @@ export function useComputerExperience(input: {
       if (didConnect) statusStore.noteReconnect();
       else connect();
     });
-    void client.ready.then(connect, () => {});
+    void client.ready.then(() => {
+      if (client.getTransportState() === "connected") connect();
+    }, () => {});
     const onFocus = () => statusStore.noteWindowFocus();
     window.addEventListener("focus", onFocus);
     return () => {

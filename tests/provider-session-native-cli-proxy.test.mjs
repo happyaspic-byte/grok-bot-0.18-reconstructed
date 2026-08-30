@@ -6,6 +6,7 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { build } from "esbuild";
+import { jsonSchema } from "ai";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const config = {
@@ -39,6 +40,7 @@ test("cli-proxy prompt sessions hand native tool calls back to Grok Bot", async 
       stdin: {
         contents: [
           'export { createProviderPromptSession } from "./source/host/extensions/inference/provider-session.ts";',
+          'export { toToolSet } from "./source/host/extensions/inference/provider-session.ts";',
           'export { installCliProxyCredentialLease, clearCliProxyCredentialLease } from "./source/host/extensions/inference/cli-proxy-credential-lease.ts";',
         ].join("\n"),
         resolveDir: repoRoot,
@@ -72,7 +74,16 @@ test("cli-proxy prompt sessions hand native tool calls back to Grok Bot", async 
     assert.equal(session.getModelId(), "provider/native-model");
     const executor = session.getExecutor();
     executor.appendMessages([{ role: "user", content: "inspect the workspace" }]);
-    const first = executor.stream({ signal: new AbortController().signal }, "invocation-1", [{ name: "Shell", parameters: { type: "object" } }]);
+    const shellParameters = {
+      type: "object",
+      properties: { command: { type: "string" } },
+      required: ["command"],
+      additionalProperties: false,
+    };
+    const openRouterTools = loaded.toToolSet([{ name: "Shell", parameters: jsonSchema(shellParameters) }]);
+    assert.deepEqual(openRouterTools.Shell.parameters.jsonSchema, shellParameters);
+    assert.equal(Object.hasOwn(openRouterTools.Shell.parameters.jsonSchema, "jsonSchema"), false);
+    const first = executor.stream({ signal: new AbortController().signal }, "invocation-1", [{ name: "Shell", parameters: jsonSchema(shellParameters) }]);
     assert.deepEqual(await collect(first.fullStream), [{ type: "tool-call", toolCallId: "shell-1", toolName: "Shell", args: { command: "pwd" } }]);
     const firstResponse = await first.response;
     executor.appendMessages(firstResponse.messages);
@@ -91,6 +102,8 @@ test("cli-proxy prompt sessions hand native tool calls back to Grok Bot", async 
       { role: "assistant", content: null, tool_calls: [{ id: "shell-1", type: "function", function: { name: "Shell", arguments: '{"command":"pwd"}' } }] },
       { role: "tool", tool_call_id: "shell-1", content: "/workspace" },
     ]);
+    assert.deepEqual(requests[0].tools[0].function.parameters, shellParameters);
+    assert.equal(Object.hasOwn(requests[0].tools[0].function.parameters, "jsonSchema"), false);
     assert.equal(JSON.stringify(requests).includes(config.apiKey), false);
     loaded.clearCliProxyCredentialLease();
   } finally {

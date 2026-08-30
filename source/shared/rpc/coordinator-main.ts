@@ -6,6 +6,7 @@ export const COORDINATOR_MAIN_METHOD_TABLE = {
   getHostSettings: { args: "none" },
   setHostSettings: { args: "object" },
   leaseCliProxyCredential: { args: "object" },
+  probeCliProxyModels: { args: "object" },
   setBoxSecrets: { args: "object" },
   refreshMcp: { args: "object" },
   listBoxMcpServers: { args: "object" },

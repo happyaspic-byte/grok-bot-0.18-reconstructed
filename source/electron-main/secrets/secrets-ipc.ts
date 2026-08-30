@@ -12,7 +12,10 @@ import {
 } from "./user-secrets-store.js";
 import { SandCliProxySecretStore } from "./cli-proxy-secret-store.js";
 import { fetchCliProxyModels } from "../../shared/node/cli-proxy-models.js";
-import { normalizeCliProxySaveRequest } from "../../shared/cli-proxy.js";
+import {
+  CLI_PROXY_PERSISTED_CHANNEL,
+  normalizeCliProxySaveRequest,
+} from "../../shared/cli-proxy.js";
 
 export class SandBoxSecretsPushQuiescedError extends Error {
   constructor() { super("Box secrets pushes are quiesced for quit"); }
@@ -112,6 +115,23 @@ export interface SecretsIpcMain {
   handle(channel: string, listener: (event: any, request: any) => unknown): void;
 }
 
+function cliProxyPersistenceRequestId(value: unknown): string | null {
+  if (typeof value !== "object" || value == null || Array.isArray(value)) return null;
+  const requestId = Reflect.get(value, "persistenceRequestId");
+  return typeof requestId === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(requestId)
+    ? requestId
+    : null;
+}
+
+function publishCliProxyPersisted(event: unknown, requestId: string | null): void {
+  if (requestId == null || typeof event !== "object" || event == null) return;
+  const sender = Reflect.get(event, "sender");
+  const send = typeof sender === "object" && sender != null ? Reflect.get(sender, "send") : undefined;
+  if (typeof send !== "function") return;
+  try { send.call(sender, CLI_PROXY_PERSISTED_CHANNEL, { requestId }); }
+  catch { /* The encrypted source is already authoritative; renderer teardown is harmless. */ }
+}
+
 export function registerSecretsIpc(deps: {
   readonly ipcMain: SecretsIpcMain;
   readonly guards: ReturnType<typeof createTrustedSenderGuards>;
@@ -128,10 +148,15 @@ export function registerSecretsIpc(deps: {
 }): void {
   const { ipcMain, guards, pushBoxSecrets } = deps;
   const { userSecretsStore, clientPersistenceStore, cliProxySecretStore } = deps.stores;
-  const mutateCliProxySecret = async <T>(mutation: () => Promise<T>): Promise<T> => {
+  const mutateCliProxySecret = async <T>(
+    mutation: () => Promise<T>,
+    onPersisted?: () => void,
+  ): Promise<T> => {
     try {
       await deps.beforeCliProxyMutation?.();
-      return await mutation();
+      const result = await mutation();
+      onPersisted?.();
+      return result;
     } finally {
       await deps.afterCliProxyMutation?.();
     }
@@ -165,8 +190,12 @@ export function registerSecretsIpc(deps: {
   });
   ipcMain.handle("sand:cli-proxy-save", async (event, request) => {
     guards.assertTrustedSecretsSender(event);
+    const persistenceRequestId = cliProxyPersistenceRequestId(request);
     const validated = normalizeCliProxySaveRequest(request);
-    return await mutateCliProxySecret(() => cliProxySecretStore.save(validated));
+    return await mutateCliProxySecret(
+      () => cliProxySecretStore.save(validated),
+      () => publishCliProxyPersisted(event, persistenceRequestId),
+    );
   });
   ipcMain.handle("sand:cli-proxy-delete", async (event) => {
     guards.assertTrustedSecretsSender(event);

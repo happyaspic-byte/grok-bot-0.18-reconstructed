@@ -1,10 +1,16 @@
-export const SAND_BROWSER_DRIVER_VERSION = 2;
+export const SAND_BROWSER_DRIVER_VERSION = 4;
 export const SAND_BROWSER_DRIVER_BOX_DIR = "/tmp/.sand-browser";
 export const SAND_BROWSER_DRIVER_BOX_PATH = SAND_BROWSER_DRIVER_BOX_DIR + "/driver-v" + String(SAND_BROWSER_DRIVER_VERSION) + ".mjs";
 export const SAND_BROWSER_RESULT_MARKER = "__SAND_BROWSER_RESULT__";
+export const SAND_BROWSER_STDIN_READY_MARKER = "__SAND_BROWSER_STDIN_READY__";
+export const SAND_BROWSER_ENCRYPTED_RESULT_MARKER = "__SAND_BROWSER_ENCRYPTED_RESULT__";
 export const SAND_BROWSER_DRIVER_SOURCE = `
 import { spawn } from "node:child_process";
+import { createCipheriv, createHash, randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
+
+const requireFromDriver = createRequire(import.meta.url);
 
 const RESULT_MARKER = "__SAND_BROWSER_RESULT__";
 const STATE_DIR = "/tmp/.sand-browser";
@@ -19,18 +25,46 @@ function statePath(display) {
   return STATE_DIR + "/views-" + String(display) + ".json";
 }
 
+function urlFingerprint(url) {
+  return createHash("sha256").update(String(url), "utf8").digest("hex");
+}
+
+const ABOUT_BLANK_FINGERPRINT = urlFingerprint("about:blank");
+
+function loadedUrlFingerprints(parsed) {
+  const fingerprints = {};
+  if (parsed.urlFingerprints && typeof parsed.urlFingerprints === "object") {
+    for (const [viewId, fingerprint] of Object.entries(parsed.urlFingerprints)) {
+      if (typeof fingerprint === "string" && /^[a-f0-9]{64}$/.test(fingerprint)) {
+        fingerprints[viewId] = fingerprint;
+      }
+    }
+  }
+  // v4 and earlier stored full page URLs. Convert them only in memory; every
+  // subsequent save writes the fingerprint-only schema and atomically
+  // replaces the legacy plaintext file.
+  if (parsed.urls && typeof parsed.urls === "object") {
+    for (const [viewId, url] of Object.entries(parsed.urls)) {
+      if (fingerprints[viewId] === undefined && typeof url === "string") {
+        fingerprints[viewId] = urlFingerprint(url);
+      }
+    }
+  }
+  return fingerprints;
+}
+
 function loadState(display) {
   try {
     const parsed = JSON.parse(readFileSync(statePath(display), "utf8"));
     if (parsed && typeof parsed === "object") {
       return {
         views: parsed.views && typeof parsed.views === "object" ? parsed.views : {},
-        urls: parsed.urls && typeof parsed.urls === "object" ? parsed.urls : {},
+        urlFingerprints: loadedUrlFingerprints(parsed),
         lastViewId: typeof parsed.lastViewId === "string" ? parsed.lastViewId : undefined,
       };
     }
   } catch {}
-  return { views: {}, urls: {}, lastViewId: undefined };
+  return { views: {}, urlFingerprints: {}, lastViewId: undefined };
 }
 
 function saveState(display, state) {
@@ -38,16 +72,22 @@ function saveState(display, state) {
     mkdirSync(STATE_DIR, { recursive: true });
     const current = loadState(display);
     const views = { ...current.views, ...state.views };
-    const urls = { ...current.urls, ...state.urls };
+    const urlFingerprints = {
+      ...current.urlFingerprints,
+      ...state.urlFingerprints,
+    };
     for (const removed of state.deletedViews ?? []) {
       delete views[removed];
-      delete urls[removed];
+      delete urlFingerprints[removed];
     }
     let lastViewId = state.lastViewId ?? current.lastViewId;
     if (lastViewId !== undefined && (state.deletedViews ?? []).includes(lastViewId)) {
       lastViewId = undefined;
     }
-    const merged = { views, urls, lastViewId };
+    // Persist only irreversible URL fingerprints. Full URLs (including query
+    // tokens) remain available from the live CDP target when an action needs
+    // them, but never become Browser-driver state at rest.
+    const merged = { views, urlFingerprints, lastViewId };
     const tmp = statePath(display) + "." + String(process.pid) + ".tmp";
     writeFileSync(tmp, JSON.stringify(merged));
     renameSync(tmp, statePath(display));
@@ -128,8 +168,7 @@ async function ensureChrome(port, display) {
 async function openCdpSocket(wsUrl) {
   let WS;
   try {
-    const { createRequire } = await import("node:module");
-    WS = createRequire(import.meta.url)("playwright-core/lib/utilsBundle").ws;
+    WS = requireFromDriver("playwright-core/lib/utilsBundle").ws;
   } catch {
     return undefined;
   }
@@ -327,8 +366,14 @@ async function resolvePage(request, context, state) {
   // by its last recorded URL instead of falling through to a blank new tab \u2014
   // only a tab no other view claims, so two same-URL views cannot collapse.
   if (page === undefined && mappedTarget !== undefined) {
-    const lastUrl = state.urls !== undefined ? state.urls[viewId] : undefined;
-    if (typeof lastUrl === "string" && lastUrl.length > 0 && lastUrl !== "about:blank") {
+    const lastUrlFingerprint = state.urlFingerprints !== undefined
+      ? state.urlFingerprints[viewId]
+      : undefined;
+    if (
+      typeof lastUrlFingerprint === "string"
+      && lastUrlFingerprint.length > 0
+      && lastUrlFingerprint !== ABOUT_BLANK_FINGERPRINT
+    ) {
       await withViewClaimLock(request.display, async () => {
         // Re-read the persisted views inside the lock: a concurrent driver
         // process may have claimed a candidate after this one loaded state.
@@ -338,7 +383,10 @@ async function resolvePage(request, context, state) {
           ...Object.values(persisted.views),
         ]);
         for (const [candidateId, candidate] of byTarget) {
-          if (candidate.url() === lastUrl && !claimed.has(candidateId)) {
+          if (
+            urlFingerprint(candidate.url()) === lastUrlFingerprint
+            && !claimed.has(candidateId)
+          ) {
             page = candidate;
             state.views[viewId] = candidateId;
             saveState(request.display, { views: { [viewId]: candidateId } });
@@ -817,7 +865,10 @@ const OPS = {
 async function run(request) {
   await ensureChrome(request.cdpPort, request.display);
   await reviveDiscardedTabs(request.cdpPort);
-  const { chromium } = await import("playwright-core");
+  // The local Docker image publishes runtime packages through NODE_PATH
+  // (/home/box/deps). Node's ESM resolver ignores NODE_PATH, while the CJS
+  // resolver created here honors the image's package lookup contract.
+  const { chromium } = requireFromDriver("playwright-core");
   const browser = await chromium.connectOverCDP(
     "http://127.0.0.1:" + String(request.cdpPort),
     { timeout: 10000 }
@@ -826,15 +877,15 @@ async function run(request) {
     const context = browser.contexts()[0] ?? (await browser.newContext());
     const state = loadState(request.display);
     const loadedViews = { ...state.views };
-    const loadedUrls = { ...state.urls };
+    const loadedUrlFingerprints = { ...state.urlFingerprints };
     const loadedLastViewId = state.lastViewId;
     const op = OPS[request.op];
     if (op === undefined) throw new Error("Unknown op: " + String(request.op));
     const result = await op({ request, context, state });
-    // Record the view's URL so a discard-churned target can be re-adopted by
-    // URL on a later call (see resolvePage).
+    // Record an irreversible URL fingerprint so a discard-churned target can
+    // be re-adopted later without persisting the page URL or query tokens.
     if (result.viewId !== undefined && result.page !== undefined) {
-      state.urls[result.viewId] = result.page.url();
+      state.urlFingerprints[result.viewId] = urlFingerprint(result.page.url());
     }
     // Persist only the entries THIS process changed. state holds a snapshot of
     // the whole file from loadState, and writing it back wholesale would let
@@ -844,13 +895,15 @@ async function run(request) {
     for (const key of Object.keys(state.views)) {
       if (state.views[key] !== loadedViews[key]) dirtyViews[key] = state.views[key];
     }
-    const dirtyUrls = {};
-    for (const key of Object.keys(state.urls)) {
-      if (state.urls[key] !== loadedUrls[key]) dirtyUrls[key] = state.urls[key];
+    const dirtyUrlFingerprints = {};
+    for (const key of Object.keys(state.urlFingerprints)) {
+      if (state.urlFingerprints[key] !== loadedUrlFingerprints[key]) {
+        dirtyUrlFingerprints[key] = state.urlFingerprints[key];
+      }
     }
     saveState(request.display, {
       views: dirtyViews,
-      urls: dirtyUrls,
+      urlFingerprints: dirtyUrlFingerprints,
       deletedViews: state.deletedViews,
       // Only when THIS op changed it: an op that never resolves a view (e.g.
       // tabs list) must not write the loaded value back over a concurrent
@@ -883,28 +936,110 @@ async function run(request) {
   }
 }
 
+const STDIN_READY_MARKER = "__SAND_BROWSER_STDIN_READY__";
+const ENCRYPTED_RESULT_MARKER = "__SAND_BROWSER_ENCRYPTED_RESULT__";
+const RESULT_AAD = Buffer.from("sand-browser-result-v1", "utf8");
+
+function emitResult(result, responseKey) {
+  if (responseKey === undefined) {
+    process.stdout.write("\\n" + RESULT_MARKER + JSON.stringify(result) + "\\n");
+    return;
+  }
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", responseKey, iv);
+  cipher.setAAD(RESULT_AAD);
+  const ciphertext = Buffer.concat([
+    cipher.update(JSON.stringify(result), "utf8"),
+    cipher.final(),
+  ]);
+  const packet = Buffer.concat([Buffer.from([1]), iv, cipher.getAuthTag(), ciphertext]);
+  process.stdout.write("\\n" + ENCRYPTED_RESULT_MARKER + packet.toString("base64") + "\\n");
+}
+
+async function readRequestEnvelope() {
+  if (process.stdin.isTTY && typeof process.stdin.setRawMode === "function") {
+    process.stdin.setRawMode(true);
+  }
+  process.stdin.setEncoding("utf8");
+  process.stdout.write("\\n" + STDIN_READY_MARKER + "\\n");
+  const encoded = await new Promise((resolve, reject) => {
+    let buffered = "";
+    const cleanup = () => {
+      process.stdin.off("data", onData);
+      process.stdin.off("error", onError);
+      process.stdin.pause();
+    };
+    const onError = (error) => { cleanup(); reject(error); };
+    const onData = (chunk) => {
+      buffered += String(chunk);
+      if (buffered.length > 8 * 1024 * 1024) {
+        cleanup();
+        reject(new Error("Browser request input exceeded the size limit"));
+        return;
+      }
+      const newline = buffered.indexOf("\\n");
+      if (newline < 0) return;
+      const line = buffered.slice(0, newline).trim();
+      cleanup();
+      resolve(line);
+    };
+    process.stdin.on("data", onData);
+    process.stdin.on("error", onError);
+    process.stdin.resume();
+  });
+  if (typeof encoded !== "string" || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) {
+    throw new Error("Browser driver received invalid request input");
+  }
+  const envelope = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
+  if (
+    envelope === null
+    || typeof envelope !== "object"
+    || envelope.request === null
+    || typeof envelope.request !== "object"
+    || typeof envelope.responseKey !== "string"
+    || !/^[a-f0-9]{64}$/.test(envelope.responseKey)
+  ) {
+    throw new Error("Browser driver received an invalid request envelope");
+  }
+  return {
+    request: envelope.request,
+    responseKey: Buffer.from(envelope.responseKey, "hex"),
+  };
+}
+
+let activeResponseKey;
 const watchdog = setTimeout(() => {
-  process.stdout.write(
-    "\\n" + RESULT_MARKER + JSON.stringify({ ok: false, error: "Browser driver timed out after 90s" }) + "\\n"
+  emitResult(
+    { ok: false, error: "Browser driver timed out after 90s" },
+    activeResponseKey
   );
+  activeResponseKey?.fill(0);
   process.exit(0);
 }, 90000);
 
 (async () => {
   let result;
   try {
-    const raw = process.argv[2] ?? "";
-    const request = JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
-    result = await run(request);
+    if (process.argv[2] !== "--request-stdin") {
+      throw new Error("Browser driver requires the private stdin request channel");
+    }
+    const envelope = await readRequestEnvelope();
+    activeResponseKey = envelope.responseKey;
+    result = await run(envelope.request);
   } catch (error) {
     result = {
       ok: false,
-      error: error instanceof Error ? error.message : String(error),
+      // Before the response key is bound, even a parser error can contain an
+      // excerpt of malformed stdin. Keep that unauthenticated terminal output
+      // generic; normal Browser/runtime errors are encrypted below.
+      error: activeResponseKey === undefined
+        ? "Browser driver request channel failed"
+        : error instanceof Error ? error.message : String(error),
     };
   }
   clearTimeout(watchdog);
-  process.stdout.write("\\n" + RESULT_MARKER + JSON.stringify(result) + "\\n");
+  emitResult(result, activeResponseKey);
+  activeResponseKey?.fill(0);
   process.exit(0);
 })();
 `;
-

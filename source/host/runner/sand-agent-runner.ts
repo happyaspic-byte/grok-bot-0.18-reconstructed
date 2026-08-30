@@ -144,6 +144,33 @@ export type RunnerUpdate =
   | { readonly type: "request-id"; readonly requestId: string }
   | { readonly type: "retrying" };
 
+function isRunnerUpdate(
+  update: ForwardedUpdate,
+): update is ForwardedUpdate & RunnerUpdate {
+  switch (update.type) {
+    case "text-delta":
+    case "thinking-delta":
+      return typeof update.text === "string";
+    case "tool-call":
+      return typeof update.id === "string";
+    case "send-message":
+      return typeof update.message === "object"
+        && update.message != null
+        && typeof Reflect.get(update.message, "type") === "string"
+        && typeof update.timestampMs === "number";
+    case "react-to-message":
+      return typeof update.messageAddress === "string"
+        && typeof update.emoji === "string";
+    case "request-id":
+      return typeof update.requestId === "string";
+    case "turn-ended":
+    case "retrying":
+      return true;
+    default:
+      return false;
+  }
+}
+
 export interface SandAgentRunnerResult {
   readonly text: string;
   readonly sentMessageCount: number;
@@ -304,6 +331,7 @@ export class SandAgentRunner<T = unknown> {
     | undefined;
   #shellWatchWatermarkCache: ConfirmedUserTurnWatermark | undefined;
   #backgroundWatches: RunnerBackgroundWatches | undefined;
+  #shutdownStarted = false;
   #disposed = false;
   #productionTurnRunShell?: ReturnType<typeof createProductionTurnRunShellAdapter>;
 
@@ -419,9 +447,11 @@ export class SandAgentRunner<T = unknown> {
       resolveBoxId: () => this.resolveBoxId(),
       emitAsyncTasksChanged: () =>
         this.observation.emitAsyncTasksChanged?.(),
-      computerUse: this.#computerUse ?? {
-        freeWindow: (subagentAgentId) =>
-          options.freeComputerUseWindow?.(subagentAgentId),
+      computerUse: {
+        freeWindow: (subagentAgentId) => {
+          this.#computerUse?.freeWindow(subagentAgentId);
+          options.freeComputerUseWindow?.(subagentAgentId);
+        },
       },
       ...(options.now == null ? {} : { now: options.now }),
       ...(options.actionAuditor == null
@@ -480,7 +510,10 @@ export class SandAgentRunner<T = unknown> {
         },
         isAwaitingUserSelection: () => this.#awaitingUserSelection,
         emitRunLifecycle: event => this.emitRunLifecycle(event),
-        emitUpdate: update => this.options.transport?.onUpdate(update),
+        emitUpdate: update => {
+          if (isRunnerUpdate(update)) this.emitUpdate(update);
+          else this.options.transport?.onUpdate(update);
+        },
         onRunUnwind: () => {
           this.#activeTurnRequestSource = undefined;
           this.#activeTurnAutomationId = undefined;
@@ -887,6 +920,7 @@ export class SandAgentRunner<T = unknown> {
 
   dispose(): void {
     if (this.#disposed) return;
+    this.beginShutdown("runner disposed");
     this.#disposed = true;
     this.#backgroundWatches?.cancelBackgroundWatches();
     this.options.cancelBackgroundShellRewatches?.();
@@ -1164,10 +1198,33 @@ export class SandAgentRunner<T = unknown> {
 
   interruptAll(reason: string): boolean {
     const interrupted = this.interrupt(reason);
-    for (const session of this.subagents.sessions.values()) {
-      session.interrupt(reason);
+    for (const [agentId, session] of this.subagents.sessions) {
+      // A plain child interrupt is steer-shaped: SubagentRuntime may consume a
+      // queued MessageSubagent instruction and immediately start another turn.
+      // Whole-runner shutdown is terminal, so mark every active child aborting
+      // and clear its pending steer before its current turn can settle.
+      if (this.subagents.abortSubagent(agentId) === "not-running") {
+        session.interrupt(reason);
+      }
     }
     return interrupted;
+  }
+
+  /** Closes admission and invalidates current persistence before any await. */
+  beginShutdown(reason: string): void {
+    if (this.#shutdownStarted) return;
+    this.#shutdownStarted = true;
+    this.#runGeneration += 1;
+    if (this.#productionTurnRunShell !== undefined) {
+      this.#productionTurnRunShell.beginShutdown(reason);
+    }
+    // Preserve the public whole-runner interrupt lifecycle (including child
+    // steer cancellation) after the shell's sticky all-root cancellation.
+    this.interruptAll(reason);
+  }
+
+  drainActiveRun(): Promise<void> {
+    return this.#productionTurnRunShell?.drainActiveRun() ?? Promise.resolve();
   }
 
   drainBackgroundSubagents(): Promise<void> {
@@ -1191,6 +1248,12 @@ export class SandAgentRunner<T = unknown> {
       readonly requestSource?: string;
     } = {},
   ): Promise<T | SandAgentRunnerResult | undefined> {
+    if (this.#shutdownStarted) {
+      throw new Error("Sand agent runner is shutting down");
+    }
+    if (this.#disposed) {
+      throw new Error("Sand agent runner is disposed");
+    }
     const trimmed = prompt.trim();
     if (
       trimmed.length === 0

@@ -1,4 +1,5 @@
 import { CLIENT_PERSISTENCE_CHANNELS } from "../shared/persistence.js";
+import { CLI_PROXY_PERSISTED_CHANNEL } from "../shared/cli-proxy.js";
 import {
   createCoordinatorPortBroker,
   wrapTransferredCoordinatorPort,
@@ -109,6 +110,72 @@ export function createDesktopPreloadBridge(options: {
   const edge = (method: string, ...args: any[]): any => mainEdge[method]!(...args);
   const subscribe = (event: string, listener: (payload: any) => void): (() => void) => mainEdge.subscribe({ [event]: listener });
   const initialState = options.initialState ?? readPrimaryPreloadInitialState(ipc);
+  let cliProxyPersistenceSequence = 0;
+  const saveCliProxy = (config: unknown, onCredentialPersisted?: () => void): Promise<any> => {
+    if (typeof onCredentialPersisted !== "function") return ipc.invoke("sand:cli-proxy-save", config);
+    const requestId = `${Date.now().toString(36)}_${(++cliProxyPersistenceSequence).toString(36)}`;
+    const request = {
+      ...(typeof config === "object" && config != null && !Array.isArray(config)
+        ? config as Record<string, unknown>
+        : {}),
+      persistenceRequestId: requestId,
+    };
+    let notified = false;
+    let listenerAttached = false;
+    let lateAcknowledgementTimer: NodeJS.Timeout | undefined;
+    const detach = (): void => {
+      if (lateAcknowledgementTimer != null) {
+        clearTimeout(lateAcknowledgementTimer);
+        lateAcknowledgementTimer = undefined;
+      }
+      if (!listenerAttached) return;
+      listenerAttached = false;
+      ipc.off(CLI_PROXY_PERSISTED_CHANNEL, listener);
+    };
+    const acknowledge = (): void => {
+      if (notified) return;
+      notified = true;
+      detach();
+      try { onCredentialPersisted(); } catch {}
+    };
+    const listener = (_event: unknown, payload: unknown): void => {
+      if (
+        notified
+        || typeof payload !== "object"
+        || payload == null
+        || Reflect.get(payload, "requestId") !== requestId
+      ) return;
+      acknowledge();
+    };
+    ipc.on(CLI_PROXY_PERSISTED_CHANNEL, listener);
+    listenerAttached = true;
+    let invoked: Promise<any>;
+    try {
+      invoked = ipc.invoke("sand:cli-proxy-save", request);
+    } catch (error) {
+      detach();
+      throw error;
+    }
+    return invoked.then(
+      (result) => {
+        // A fulfilled, request-scoped invoke is itself authoritative evidence
+        // that encrypted persistence completed. This idempotent fallback closes
+        // the race where its separately delivered event is still queued.
+        acknowledge();
+        return result;
+      },
+      (error) => {
+        if (!notified) {
+          // Persistence can succeed before coordinator restart fails. Keep the
+          // correlated event arm alive briefly so an already-sent acknowledgement
+          // still zeroizes the submitted draft after the invoke rejects.
+          lateAcknowledgementTimer = setTimeout(detach, 5_000);
+          lateAcknowledgementTimer.unref?.();
+        }
+        throw error;
+      },
+    );
+  };
   const desktop: Record<string, any> = {
     resolveAttachmentMedia: (url: string) => edge("resolveAttachmentMedia", { source: url }),
     readAttachmentText: (path: string) => edge("readAttachmentText", { path }),
@@ -142,7 +209,7 @@ export function createDesktopPreloadBridge(options: {
       toggleToolDisabled: (args: unknown) => ipc.invoke("sand:mcp-toggle-tool-disabled", args),
       onAuthCompleted: (listener: (payload: unknown) => void) => subscribeIpc(ipc, "sand:mcp-auth-event", listener),
     },
-    async forceGatewayReconnect() { await edge("forceReconnectGateway"); },
+    forceGatewayReconnect: () => edge("forceReconnectGateway"),
     pickAvatarSource: () => edge("pickAvatarSource"),
     pickAvatarFile: () => edge("pickAvatarFile"),
     generateAgentAvatarImage: (description: string) => edge("generateAgentAvatarImage", { description }),
@@ -252,7 +319,7 @@ export function createDesktopPreloadBridge(options: {
     },
     cliProxy: {
       status: (options?: { readonly testConnection?: boolean }) => ipc.invoke("sand:cli-proxy-status", options ?? {}),
-      save: (config: unknown) => ipc.invoke("sand:cli-proxy-save", config),
+      save: saveCliProxy,
       remove: () => ipc.invoke("sand:cli-proxy-delete"),
     },
     agent: {

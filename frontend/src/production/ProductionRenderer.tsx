@@ -1,5 +1,5 @@
 import { Component, lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ErrorInfo, type ReactNode } from "react";
-import type { CoordinatorPortBridge, CursorAuthStatus, DesktopAutoReviewInstructions, DesktopBridge, SidebarSection, ThemePreference } from "../recovered/contracts/desktop-bridge";
+import type { CoordinatorPortBridge, CursorAuthStatus, DesktopAutoReviewInstructions, DesktopBridge, DesktopLocalWorkspaceStatus, SidebarSection, ThemePreference } from "../recovered/contracts/desktop-bridge";
 import computerEntrypoint from "../recovered/features/computer/overlay/entrypoint";
 import { ConversationComposer } from "../recovered/features/conversation/workspace/composer";
 import { commitComposerAttachments, stageComposerFiles } from "../recovered/features/conversation/workspace/desktop";
@@ -134,6 +134,9 @@ import { createProductionReactionRootScope } from "./reaction-root";
 import { createStrictModeDisposalGuard, type StrictModeDisposable } from "./strict-mode-disposal";
 import {
   LOCAL_WORKSPACE_CHANGED_EVENT,
+  isLocalWorkspaceClaimReady,
+  localWorkspaceConfigurationReady,
+  localWorkspaceNextAction,
   projectWorkspaceSession,
   readLocalWorkspaceReadiness,
   type LocalWorkspaceReadiness
@@ -595,9 +598,10 @@ function useStrictModeSafeDisposal(resource: StrictModeDisposable | null | undef
   useEffect(() => guardRef.current!.attach(resource), [resource]);
 }
 
-function SignInLanding({ account, bridge, onOpenRouterSettings, onStatus }: {
+function SignInLanding({ account, bridge, localWorkspace, onOpenRouterSettings, onStatus }: {
   account: CursorAuthStatus;
   bridge: DesktopBridge;
+  localWorkspace: LocalWorkspaceReadiness;
   onOpenRouterSettings(): void;
   onStatus(status: CursorAuthStatus): void;
 }) {
@@ -616,9 +620,15 @@ function SignInLanding({ account, bridge, onOpenRouterSettings, onStatus }: {
           reopenLabel={UI_TEXT.reopenLink}
           signInLabel={UI_TEXT.signIn}
         />
-        <div style={{ alignItems: "center", display: "flex", flexDirection: "column", gap: 8 }}>
-          <small>Using 9Router or another OpenAI-compatible endpoint?</small>
-          <SandButton aria-label="Configure 9Router" onClick={onOpenRouterSettings} size="sm" variant="secondary">Configure 9Router</SandButton>
+        <div aria-live="polite" style={{ alignItems: "center", display: "flex", flexDirection: "column", gap: 8, maxWidth: 420, textAlign: "center" }}>
+          <strong>Continue without signing in</strong>
+          <small>{localWorkspaceNextAction(localWorkspace)}</small>
+          {localWorkspace.kind === "disabled" && localWorkspace.blockers.length > 1
+            ? <small>{localWorkspace.blockers.length} setup items remain.</small>
+            : null}
+          <SandButton aria-label="Configure 9Router" onClick={onOpenRouterSettings} size="sm" variant="primary">
+            {localWorkspace.kind === "disabled" ? "Finish 9Router setup" : "Configure 9Router"}
+          </SandButton>
         </div>
       </section>
     </div>
@@ -897,6 +907,8 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [account, setAccount] = useState<CursorAuthStatus | null>(null);
   const [localWorkspace, setLocalWorkspace] = useState<LocalWorkspaceReadiness>({ kind: "checking" });
+  const localWorkspaceClaimRef = useRef<DesktopLocalWorkspaceStatus>({ kind: "disabled" });
+  const localWorkspaceActivationRef = useRef<Promise<DesktopLocalWorkspaceStatus> | null>(null);
   const [sandAccess, setSandAccess] = useState(SAND_ACCESS_UNKNOWN);
   const [accessFirstBox, setAccessFirstBox] = useState(INITIAL_FIRST_BOX_GATE);
   const [privacyBlocked, setPrivacyBlocked] = useState(false);
@@ -2365,9 +2377,14 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     client.ready.then(() => {
       if (!isCurrent() || !workspaceReadyRef.current) return;
       transportScopeGenerationRef.current += 1;
-      setTransport("connected");
-      void refreshRoster().catch((error: unknown) => setNotice(error instanceof Error ? error.message : String(error)));
-      if (accountRef.current?.kind === "logged-in") void refreshAgentNetworkAvailability();
+      const state = client.getTransportState();
+      setTransport(state);
+      if (state === "connected") {
+        void refreshRoster().catch((error: unknown) => setNotice(error instanceof Error ? error.message : String(error)));
+        if (accountRef.current?.kind === "logged-in") void refreshAgentNetworkAvailability();
+      } else {
+        setRosterLoadFailed(true);
+      }
     }, () => {
       if (!isCurrent() || !workspaceReadyRef.current) return;
       transportScopeGenerationRef.current += 1;
@@ -2754,26 +2771,84 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
 
   useStrictModeSafeDisposal(linkMetadataProvider);
 
+  const activateLocalWorkspace = useCallback(async (): Promise<DesktopLocalWorkspaceStatus> => {
+    if (client == null) return { kind: "disabled" };
+    const existing = localWorkspaceActivationRef.current;
+    if (existing != null) return await existing;
+    localWorkspaceClaimRef.current = { kind: "disabled" };
+    const pending = (async (): Promise<DesktopLocalWorkspaceStatus> => {
+      const claimed = await bridge.forceGatewayReconnect();
+      const normalized: DesktopLocalWorkspaceStatus = isLocalWorkspaceClaimReady(claimed)
+        ? claimed
+        : { kind: "disabled" };
+      localWorkspaceClaimRef.current = normalized;
+      if (normalized.kind !== "ready") return normalized;
+      await client.waitForTransportConnected(20_000);
+      return normalized;
+    })();
+    localWorkspaceActivationRef.current = pending;
+    try {
+      return await pending;
+    } finally {
+      if (localWorkspaceActivationRef.current === pending) localWorkspaceActivationRef.current = null;
+    }
+  }, [bridge, client]);
+
   useEffect(() => {
     let active = true;
     let requestGeneration = 0;
-    const refresh = async () => {
-      const generation = ++requestGeneration;
-      const next = await readLocalWorkspaceReadiness(bridge);
-      if (active && generation === requestGeneration) setLocalWorkspace(next);
+    let retryTimer: number | null = null;
+    let activationAttempted = false;
+    const activationState = () => ({
+      transportState: client?.getTransportState() ?? "down",
+      claimStatus: localWorkspaceClaimRef.current
+    });
+    const scheduleRetry = (next: LocalWorkspaceReadiness) => {
+      if (retryTimer != null) window.clearTimeout(retryTimer);
+      const shouldRetry = next.kind === "disabled" && next.blockers.some((blocker) => blocker.code === "local-docker-not-ready"
+        || blocker.code === "docker-status-unavailable"
+        || blocker.code === "provider-status-unavailable"
+        || blocker.code === "credential-status-unavailable");
+      if (shouldRetry) retryTimer = window.setTimeout(() => { void refresh(true); }, 1_000);
     };
-    const onWorkspaceChanged = () => { void refresh(); };
-    const onWindowFocus = () => { void refresh(); };
-    void refresh();
+    const refresh = async (allowActivation = false) => {
+      const generation = ++requestGeneration;
+      const next = await readLocalWorkspaceReadiness(bridge, activationState());
+      if (!active || generation !== requestGeneration) return;
+      setLocalWorkspace(next);
+      scheduleRetry(next);
+      if (!allowActivation || activationAttempted || account?.kind !== "logged-out" || client == null
+        || !localWorkspaceConfigurationReady(next) || next.kind === "ready") return;
+      activationAttempted = true;
+      try { await activateLocalWorkspace(); }
+      catch { /* The final fail-closed reread below supplies the stable blocker. */ }
+      if (active) await refresh(false);
+    };
+    const retryActivation = () => {
+      activationAttempted = false;
+      void refresh(true);
+    };
+    const onWorkspaceChanged = () => retryActivation();
+    const onWindowFocus = () => retryActivation();
+    const stopTransport = client?.subscribeTransport((state) => {
+      if (state === "down") localWorkspaceClaimRef.current = { kind: "disabled" };
+      // Both edges reopen activation. A connected edge can race and supersede
+      // the readiness read started by the preceding down edge; a fail-closed
+      // claim must still be reclaimable in that ordering.
+      retryActivation();
+    });
+    void refresh(true);
     window.addEventListener(LOCAL_WORKSPACE_CHANGED_EVENT, onWorkspaceChanged);
     window.addEventListener("focus", onWindowFocus);
     return () => {
       active = false;
       requestGeneration += 1;
+      if (retryTimer != null) window.clearTimeout(retryTimer);
+      stopTransport?.();
       window.removeEventListener(LOCAL_WORKSPACE_CHANGED_EVENT, onWorkspaceChanged);
       window.removeEventListener("focus", onWindowFocus);
     };
-  }, [bridge]);
+  }, [account?.kind, activateLocalWorkspace, bridge, client]);
 
   useEffect(() => {
     if (bridge == null) return;
@@ -3439,15 +3514,24 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     setIsRosterRetrying(true);
     setTransport("connecting");
     try {
-      await bridge.forceGatewayReconnect();
-      setLocalWorkspace(await readLocalWorkspaceReadiness(bridge));
+      const claimed = await activateLocalWorkspace();
+      const next = await readLocalWorkspaceReadiness(bridge, {
+        transportState: client?.getTransportState() ?? "down",
+        claimStatus: claimed
+      });
+      setLocalWorkspace(next);
+      if (next.kind !== "ready") {
+        throw new Error(next.kind === "disabled"
+          ? next.blockers[0]?.message ?? "Local 9Router did not become ready."
+          : "Local 9Router status is still being checked.");
+      }
     } catch (error) {
       setTransport("down");
       setNotice(error instanceof Error ? error.message : String(error));
     } finally {
       setIsRosterRetrying(false);
     }
-  }, [bridge, isRosterRetrying, workspaceSession.source]);
+  }, [activateLocalWorkspace, bridge, client, isRosterRetrying, workspaceSession.source]);
   const rosterListStatus = workspaceSession.source === "local-9router" && transport === "connecting" && !hasLoadedAgents
     ? <RosterStatus kind="loading" />
     : workspaceSession.source === "local-9router" && (transport === "down" || rosterFailure != null || rosterLoadFailed)
@@ -3703,7 +3787,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       />}
 
       {overlay === "hidden-chats" ? <div style={OVERLAY_FRAME_STYLE}><Suspense fallback={null}><HiddenChatsDialog hiddenAgents={hiddenAgents} isOpen onClose={() => setOverlay(null)} onOpenAgent={(id) => void openAgent(id)} onUnhide={(id) => void unhide(id)} /></Suspense></div> : null}
-      {overlay === "settings" && bridge != null ? <div style={OVERLAY_FRAME_STYLE}><Suspense fallback={overlayFallback(UI_TEXT.settings)}><SettingsOverlayErrorBoundary onClose={() => setOverlay(null)}><SettingsDesktopSurface bridge={bridge} computer={settingsComputerMount} coordinatorClient={client} initialSection={settingsSection} isOpen onClose={() => setOverlay(null)} onNotice={publishSettingsNotice} /></SettingsOverlayErrorBoundary></Suspense></div> : null}
+      {overlay === "settings" && bridge != null ? <div style={OVERLAY_FRAME_STYLE}><Suspense fallback={overlayFallback(UI_TEXT.settings)}><SettingsOverlayErrorBoundary onClose={() => setOverlay(null)}><SettingsDesktopSurface bridge={bridge} computer={settingsComputerMount} coordinatorClient={client} initialLocalWorkspace={localWorkspace} initialSection={settingsSection} isOpen onClose={() => setOverlay(null)} onLocalWorkspaceReady={(readiness) => { localWorkspaceClaimRef.current = { kind: "ready", workspaceId: readiness.workspaceId }; setLocalWorkspace(readiness); setOverlay(null); }} onNotice={publishSettingsNotice} /></SettingsOverlayErrorBoundary></Suspense></div> : null}
       {overlay === "plugins" && bridge != null && isCursorLoggedIn ? <div style={OVERLAY_FRAME_STYLE}><Suspense fallback={overlayFallback(UI_TEXT.plugins)}><PluginsDesktopSurface activeAgentId={activeAgent?.id ?? null} bridge={bridge} githubAuth={pluginAuthBanner} initialQuery={pluginQuery} isOpen key={pluginQuery} onClose={() => setOverlay(null)} onNotice={publishSettingsNotice} privateSkillEnableSource={privateSkillEnableSource} privateSkillSource={pluginPrivateSkillSource} /></Suspense></div> : null}
       {overlay === "about" && bridge != null ? <div style={OVERLAY_FRAME_STYLE}><RecoveredAboutDialog
         bridge={bridge}
@@ -3759,6 +3843,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       {showSignIn && overlay !== "settings" && bridge != null && account != null ? <SignInLanding
         account={account}
         bridge={bridge}
+        localWorkspace={localWorkspace}
         onOpenRouterSettings={() => { setSettingsSection("router"); setManageSharedRoomId(null); setOverlay("settings"); }}
         onStatus={setAccount}
       /> : null}

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -51,6 +51,7 @@ function createResyncDependencies(overrides = {}) {
     detectTimeZone: () => "UTC",
     getUserTimeZoneOverride: () => undefined,
     getInferenceProvider: () => "cli-proxy",
+    getLocalWorkspaceBrowserUseCapability: () => false,
     getComputerUseModel: () => undefined,
     getAutoReviewInstructions: () => ({}),
     getLocalToolPermission: () => "ask",
@@ -101,6 +102,29 @@ test("local workspace claims launch without authorizing or fabricating an accoun
   }
 });
 
+test("local workspace readiness awaits the authenticated in-container model probe", async () => {
+  const source = await readFile(
+    path.join(repoRoot, "source/electron-main/coordinator/production-provider.ts"),
+    "utf8",
+  );
+  const connected = source.indexOf('"transport-connected": (payload) => {');
+  const resync = source.indexOf("resync.onTransportConnected().then(async (summary) => {", connected);
+  const probe = source.indexOf("await probeLocalWorkspaceModels();", resync);
+  const epochFence = source.indexOf("if (!transportEpoch.isCurrent(connectedEpoch)) return;", probe);
+  const publishReady = source.indexOf("publishLocalWorkspaceStatus(ready);", probe);
+  assert.ok(connected >= 0 && resync > connected);
+  assert.ok(probe > resync, "the container probe must run after authenticated host resync");
+  assert.ok(epochFence > probe, "probe completion must be fenced against a replacement transport");
+  assert.ok(publishReady > epochFence, "ready must not publish until the container probe succeeds");
+
+  const helper = source.indexOf("const probeLocalWorkspaceModels = async (): Promise<void> => {");
+  const readCredential = source.indexOf("cliProxySecretStore.getTurnConfig()", helper);
+  const leaseCall = source.indexOf("await leaseCliProxyCredential({ config });", helper);
+  const probeCall = source.indexOf("await probeCliProxyModels({});", helper);
+  assert.ok(helper >= 0 && readCredential > helper && leaseCall > readCredential && probeCall > leaseCall);
+  assert.equal(source.slice(leaseCall, probeCall).includes("getTurnConfig()"), false);
+});
+
 test("local 9Router claim requires signed-out, configured cli-proxy, an exact model, native protocol, and local Docker", async () => {
   const loaded = await loadModule("source/electron-main/coordinator/local-workspace.ts");
   try {
@@ -138,6 +162,16 @@ test("local 9Router claim requires signed-out, configured cli-proxy, an exact mo
       status: { kind: "logged-out" }, settings,
       cliProxyStatus: async () => ({ configured: true, model: "provider/model", protocol: "responses" }),
     }), null);
+    for (const protocol of [undefined, "", "unknown"]) {
+      assert.equal(await loaded.module.resolveLocal9RouterWorkspaceClaim({
+        status: { kind: "logged-out" }, settings,
+        cliProxyStatus: async () => ({ configured: true, model: "provider/model", protocol }),
+      }), null, `invalid protocol ${String(protocol)} must fail closed`);
+    }
+    assert.deepEqual(await loaded.module.resolveLocal9RouterWorkspaceClaim({
+      status: { kind: "logged-out" }, settings,
+      cliProxyStatus: async () => ({ configured: true, model: "provider/model", protocol: "auto" }),
+    }), { kind: "local-workspace", slot: "local:9router" });
   } finally {
     await loaded.dispose();
   }
@@ -262,6 +296,242 @@ test("local connector scopes Cursor credentials and local auth mounts to their e
   }
 });
 
+test("local connector serializes provider generations and never returns a stale provider container", async () => {
+  const loaded = await loadModule("source/electron-main/box/local-docker-host-connector.ts");
+  try {
+    let provider = "codex";
+    let releaseFirst;
+    let noteFirstStarted;
+    const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+    const firstStarted = new Promise((resolve) => { noteFirstStarted = resolve; });
+    const calls = [];
+    const connector = loaded.module.createSettingsRoutedHostConnector({
+      async connect() { return { baseUrl: "https://cloud.invalid" }; },
+    }, {
+      settingsPath: "C:/provider-race/settings.json",
+      getBoxRuntime: () => "local-docker",
+      getInferenceProvider: () => provider,
+    }, {
+      async ensureLocalBox(_settingsPath, credential, options) {
+        calls.push({ credential, options });
+        if (calls.length === 1) {
+          noteFirstStarted();
+          await firstGate;
+          return { baseUrl: "http://127.0.0.1:1340", token: "stale-codex" };
+        }
+        return { baseUrl: "http://127.0.0.1:1340", token: "current-cli-proxy" };
+      },
+    });
+
+    const first = connector.connect();
+    await firstStarted;
+    provider = "cli-proxy";
+    const second = connector.connect();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls.length, 1, "the newer provider ensure must wait for the current Docker mutation");
+    releaseFirst();
+
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    assert.equal(firstResult.token, "current-cli-proxy");
+    assert.equal(secondResult.token, "current-cli-proxy");
+    assert.deepEqual(calls, [
+      { credential: undefined, options: { localAuthProvider: "codex" } },
+      { credential: undefined, options: {} },
+    ]);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("remote transition is serialized behind an in-flight local ensure and leaves no stale container", async () => {
+  const loaded = await loadModule("source/electron-main/box/local-docker-host-connector.ts");
+  try {
+    const settingsPath = "C:/runtime-race/settings.json";
+    let mode = "local-docker";
+    let releaseEnsure;
+    let noteEnsureStarted;
+    let ensureWasSuperseded;
+    const ensureGate = new Promise((resolve) => { releaseEnsure = resolve; });
+    const ensureStarted = new Promise((resolve) => { noteEnsureStarted = resolve; });
+    const order = [];
+    const connector = loaded.module.createSettingsRoutedHostConnector({
+      async connect() { return { baseUrl: "https://cloud.invalid" }; },
+    }, {
+      settingsPath,
+      getBoxRuntime: () => mode,
+      getInferenceProvider: () => "cli-proxy",
+    }, {
+      async ensureLocalBox(_settingsPath, _credential, _options, isSuperseded) {
+        ensureWasSuperseded = isSuperseded;
+        order.push("ensure:start");
+        noteEnsureStarted();
+        await ensureGate;
+        order.push("ensure:created");
+        return { baseUrl: "http://127.0.0.1:1340", token: "stale" };
+      },
+    });
+
+    const connecting = connector.connect();
+    await ensureStarted;
+    mode = "remote";
+    const stopping = loaded.module.serializeLocalDockerLifecycleMutation(
+      settingsPath,
+      async () => { order.push("stop"); },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(order, ["ensure:start"], "stop must wait for the creating ensure");
+    assert.equal(ensureWasSuperseded(), true, "the queued stop must cancel the ensure generation");
+
+    releaseEnsure();
+    await assert.rejects(() => connecting, /Local Docker VM is no longer selected/);
+    await stopping;
+    assert.deepEqual(order, ["ensure:start", "ensure:created", "stop"]);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("quit closes Docker mutation intake before its final serialized stop", async () => {
+  const loaded = await loadModule("source/electron-main/box/local-docker-host-connector.ts");
+  try {
+    const settingsPath = path.join(
+      os.tmpdir(),
+      `grok-quit-lifecycle-${process.pid}-${Date.now()}`,
+      "settings.json",
+    );
+    const held = Promise.withResolvers();
+    const started = Promise.withResolvers();
+    const order = [];
+    const admitted = loaded.module.serializeLocalDockerLifecycleMutation(
+      settingsPath,
+      async () => {
+        order.push("ensure:start");
+        started.resolve();
+        await held.promise;
+        order.push("ensure:end");
+      },
+    );
+    await started.promise;
+
+    const stopped = loaded.module.stopLocalDockerBoxForQuit(
+      settingsPath,
+      async (args) => {
+        order.push(`docker:${args[0]}`);
+        if (args[0] === "inspect") {
+          return {
+            ok: true,
+            output: JSON.stringify({
+              State: { Running: true },
+              Config: {
+                Image: loaded.module.LOCAL_DOCKER_BOX_IMAGE,
+                Env: [],
+                Labels: { "com.grok-bot.local-vm": "1" },
+              },
+              HostConfig: { NetworkMode: loaded.module.LOCAL_DOCKER_NETWORK },
+            }),
+          };
+        }
+        return { ok: true, output: "stopped" };
+      },
+    );
+    await assert.rejects(
+      () => loaded.module.serializeLocalDockerLifecycleMutation(
+        settingsPath,
+        async () => { order.push("late:ensure"); },
+      ),
+      (error) => error.name === "LocalDockerLifecycleClosedError",
+    );
+
+    held.resolve();
+    await admitted;
+    await stopped;
+    assert.deepEqual(order, [
+      "ensure:start",
+      "ensure:end",
+      "docker:inspect",
+      "docker:stop",
+    ]);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("local connector generations distinguish Cursor credential modes", async () => {
+  const loaded = await loadModule("source/electron-main/box/local-docker-host-connector.ts");
+  try {
+    let credentialCalls = 0;
+    let releaseFirst;
+    let noteFirstStarted;
+    const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+    const firstStarted = new Promise((resolve) => { noteFirstStarted = resolve; });
+    const calls = [];
+    const credential = { accessToken: "cursor", backendUrl: "https://cloud.invalid", expiresAtMs: Date.now() + 60_000 };
+    const connector = loaded.module.createSettingsRoutedHostConnector({
+      async connect() { return { baseUrl: "https://cloud.invalid" }; },
+      async issueInferenceCredential() {
+        credentialCalls += 1;
+        return credentialCalls === 1 ? undefined : credential;
+      },
+    }, {
+      settingsPath: "C:/credential-race/settings.json",
+      getBoxRuntime: () => "local-docker",
+      getInferenceProvider: () => "cursor",
+    }, {
+      optionalCredentialTimeoutMs: 100,
+      async ensureLocalBox(_settingsPath, issued) {
+        calls.push(issued);
+        if (calls.length === 1) {
+          noteFirstStarted();
+          await firstGate;
+          return { baseUrl: "http://127.0.0.1:1340", token: "stale-no-credential" };
+        }
+        return { baseUrl: "http://127.0.0.1:1340", token: "current-credential" };
+      },
+    });
+
+    const first = connector.connect();
+    await firstStarted;
+    const second = connector.connect();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls.length, 1);
+    releaseFirst();
+
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    assert.equal(firstResult.token, "current-credential");
+    assert.equal(secondResult.token, "current-credential");
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0], undefined);
+    assert.deepEqual(calls[1], credential);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("Docker commands hide Windows child windows and fail within their deadline", async () => {
+  const loaded = await loadModule("source/electron-main/box/local-docker-host-connector.ts");
+  try {
+    let observedWindowsHide = false;
+    const startedAt = Date.now();
+    const result = await loaded.module.runDockerCommand(["info"], undefined, {
+      timeoutMs: 25,
+      spawn(_command, _args, options) {
+        observedWindowsHide = options.windowsHide === true;
+        return spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], options);
+      },
+    });
+    assert.equal(observedWindowsHide, true);
+    assert.equal(result.ok, false);
+    assert.match(result.output, /timed out after 25 ms/);
+    assert.ok(Date.now() - startedAt < 2_000, "a timed-out Docker child must be terminated promptly");
+    assert.equal(loaded.module.resolveDockerCommandTimeoutMs(["info"]), 30_000);
+    assert.equal(loaded.module.resolveDockerCommandTimeoutMs(["container", "ls"]), 30_000);
+    assert.equal(loaded.module.resolveDockerCommandTimeoutMs(["run"]), 10 * 60_000);
+    assert.equal(loaded.module.resolveDockerCommandTimeoutMs(["start"]), 120_000);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
 test("transport resync selects cli-proxy inside the local host before turns", async () => {
   const loaded = await loadModule("source/electron-main/coordinator/coordinator-resync.ts");
   try {
@@ -279,6 +549,7 @@ test("transport resync selects cli-proxy inside the local host before turns", as
       detectTimeZone: () => "UTC",
       getUserTimeZoneOverride: () => undefined,
       getInferenceProvider: () => "cli-proxy",
+      getLocalWorkspaceBrowserUseCapability: () => true,
       getComputerUseModel: () => undefined,
       getAutoReviewInstructions: () => ({}),
       getLocalToolPermission: () => "ask",
@@ -289,6 +560,7 @@ test("transport resync selects cli-proxy inside the local host before turns", as
     });
     await chain.onTransportConnected();
     assert.ok(updates.some((update) => update.inferenceProvider === "cli-proxy"));
+    assert.ok(updates.some((update) => update.localWorkspaceBrowserUse === true));
   } finally {
     await loaded.dispose();
   }
@@ -347,6 +619,291 @@ test("native turn preparation fails closed when any full-resync step fails", asy
       },
     );
     assert.equal(leased, false);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("coordinator readiness ignores prior launches and rejects resync failure and timeout", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/production-provider.ts");
+  try {
+    const ready = { kind: "ready", workspaceId: "local:9router" };
+    const gate = loaded.module.createCoordinatorReadinessGate(1_000);
+    const current = gate.begin(2);
+    let settled = false;
+    void current.promise.finally(() => { settled = true; });
+    gate.resolve(current.generation, 1, ready);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false, "a previous ready launch cannot satisfy a new restart");
+    gate.resolve(current.generation, 2, ready);
+    assert.deepEqual(await current.promise, ready);
+
+    const failed = gate.begin(3);
+    const resyncError = new Error("Coordinator resync failed at: box_secrets");
+    gate.reject(failed.generation, 3, resyncError);
+    await assert.rejects(() => failed.promise, (error) => error === resyncError);
+
+    const timeoutGate = loaded.module.createCoordinatorReadinessGate(10);
+    const timedOut = timeoutGate.begin(4);
+    await assert.rejects(
+      () => timedOut.promise,
+      (error) => error.name === "CoordinatorReadyTimeoutError",
+    );
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("restart readiness is rejection-handled before the old coordinator can exit", async () => {
+  const source = await readFile(
+    path.join(repoRoot, "source/electron-main/coordinator/production-provider.ts"),
+    "utf8",
+  );
+  const begin = source.indexOf("const readiness = coordinatorReadiness.begin(expectedLaunchSequence);");
+  const guarded = source.indexOf("void readiness.promise.catch(() => undefined);", begin);
+  const restart = source.indexOf("await accountRuntime.restart();", begin);
+  assert.ok(begin >= 0 && guarded > begin && guarded < restart);
+});
+
+test("transport epochs reject stale resync completions after down or a newer connection", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/production-provider.ts");
+  try {
+    const fence = loaded.module.createCoordinatorTransportEpochFence();
+    const first = fence.begin();
+    assert.equal(fence.isCurrent(first), true);
+    const held = Promise.withResolvers();
+    let published = { kind: "disabled" };
+    const staleCompletion = (async () => {
+      await held.promise;
+      if (fence.isCurrent(first)) published = ready;
+    })();
+    fence.invalidate();
+    held.resolve();
+    await staleCompletion;
+    assert.deepEqual(published, { kind: "disabled" });
+    assert.equal(fence.isCurrent(first), false);
+    const second = fence.begin();
+    const third = fence.begin();
+    assert.equal(fence.isCurrent(second), false);
+    assert.equal(fence.isCurrent(third), true);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("replacement launch invalidates the previous transport resync before adopting its port", async () => {
+  const source = await readFile(
+    path.join(repoRoot, "source/electron-main/coordinator/production-provider.ts"),
+    "utf8",
+  );
+  const mainPort = source.indexOf("onMainDataPort: (port) => {");
+  const invalidate = source.indexOf("transportEpoch.invalidate();", mainPort);
+  const sequence = source.indexOf("coordinatorLaunchSequence += 1;", mainPort);
+  assert.ok(mainPort >= 0 && invalidate > mainPort && invalidate < sequence);
+});
+
+test("replacement coordinator launch ignores late events and problems from the old child", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-runtime.ts");
+  try {
+    const launches = [];
+    const observed = [];
+    const problems = [];
+    let failNextLaunch = false;
+    const runtime = loaded.module.createCoordinatorRuntime({
+      fork() { assert.fail("custom launch should be used"); },
+      createChannel() { assert.fail("custom launch should be used"); },
+      executors: {},
+      onEvent: {
+        "agents-event": (payload) => observed.push(["agents", payload]),
+        "transport-connected": (payload) => observed.push(["connected", payload]),
+        "transport-down": (payload) => observed.push(["down", payload]),
+      },
+      onProblem: (problem) => problems.push(problem),
+      processConfig: {},
+      artifactPath: "/coordinator.cjs",
+      monotonicNow: () => 1_000,
+      onMainDataPort() {},
+      onLifecycle() {},
+      relaunchBackoff: {
+        schedule() { assert.fail("replacement overlap must not schedule a relaunch"); },
+      },
+      launch(dependencies) {
+        if (failNextLaunch) {
+          failNextLaunch = false;
+          throw new Error("replacement launch failed");
+        }
+        const exited = Promise.withResolvers();
+        const record = { dependencies, exited, disposeCalls: 0 };
+        launches.push(record);
+        return {
+          rendererDataPort: {},
+          mainDataPort: {},
+          controlSettled: Promise.resolve(),
+          processExited: exited.promise,
+          dispose() { record.disposeCalls += 1; },
+        };
+      },
+    });
+
+    const first = launches[0];
+    first.dependencies.onEvent["transport-connected"]({ generation: 1 });
+    assert.deepEqual(observed.map(([kind]) => kind), ["connected"]);
+
+    const restarted = runtime.restart();
+    const second = launches[1];
+    assert.equal(first.disposeCalls, 1);
+    first.dependencies.onEvent["transport-down"]({ generation: 2, reason: "old child exit" });
+    first.dependencies.onEvent["agents-event"]({ stale: true });
+    first.dependencies.onProblem("old child control port closed");
+    second.dependencies.onEvent["transport-connected"]({ generation: 1 });
+
+    assert.deepEqual(observed.map(([kind]) => kind), ["connected", "connected"]);
+    assert.deepEqual(problems, []);
+
+    failNextLaunch = true;
+    assert.throws(() => runtime.restart(), /replacement launch failed/);
+    second.dependencies.onEvent["transport-down"]({ generation: 2, reason: "current down" });
+    second.dependencies.onEvent["agents-event"]({ current: true });
+    second.dependencies.onProblem("current child problem");
+    assert.deepEqual(observed.map(([kind]) => kind), [
+      "connected",
+      "connected",
+      "down",
+      "agents",
+    ]);
+    assert.deepEqual(problems, ["current child problem"]);
+
+    first.exited.resolve({ code: 0 });
+    await restarted;
+    const disposed = runtime.dispose();
+    second.dependencies.onEvent["transport-down"]({ generation: 3, reason: "disposed" });
+    second.dependencies.onProblem("disposed child problem");
+    assert.deepEqual(observed.map(([kind]) => kind), [
+      "connected",
+      "connected",
+      "down",
+      "agents",
+    ]);
+    assert.deepEqual(problems, ["current child problem"]);
+    second.exited.resolve({ code: 0 });
+    await disposed;
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("a hung old coordinator is force-isolated without pinning later restarts", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-runtime.ts");
+  try {
+    const launches = [];
+    const problems = [];
+    const runtime = loaded.module.createCoordinatorRuntime({
+      fork() { assert.fail("custom launch should be used"); },
+      createChannel() { assert.fail("custom launch should be used"); },
+      executors: {},
+      onEvent: {
+        "transport-connected"() {},
+        "transport-down"() {},
+      },
+      onProblem: (problem) => problems.push(problem),
+      processConfig: {},
+      artifactPath: "/coordinator.cjs",
+      monotonicNow: () => 1_000,
+      onMainDataPort() {},
+      onLifecycle() {},
+      relaunchBackoff: {
+        schedule() { assert.fail("replacement overlap must not schedule a relaunch"); },
+      },
+      restartExitGraceMs: 5,
+      restartForceExitGraceMs: 5,
+      launch(dependencies) {
+        const exited = Promise.withResolvers();
+        const record = { dependencies, exited, disposeCalls: 0, forceDisposeCalls: 0 };
+        launches.push(record);
+        return {
+          rendererDataPort: {},
+          mainDataPort: {},
+          controlSettled: Promise.resolve(),
+          processExited: exited.promise,
+          dispose() { record.disposeCalls += 1; },
+          forceDispose() { record.forceDisposeCalls += 1; },
+        };
+      },
+    });
+
+    const first = launches[0];
+    await runtime.restart();
+    assert.equal(first.disposeCalls, 1);
+    assert.equal(first.forceDisposeCalls, 1);
+    assert.match(problems[0], /forcing termination/);
+    assert.match(problems[1], /continuing with the isolated replacement/);
+
+    const second = launches[1];
+    const restartedAgain = runtime.restart();
+    second.exited.resolve({ code: 0 });
+    await restartedAgain;
+    assert.equal(second.forceDisposeCalls, 0);
+
+    const third = launches[2];
+    const disposed = runtime.dispose();
+    third.exited.resolve({ code: 0 });
+    await disposed;
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("quit quiescence fences native preparation before the final lease clear", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/production-provider.ts");
+  try {
+    const gate = loaded.module.createCliProxyNativePrepareGate();
+    let releasePrepare;
+    let notePrepareStarted;
+    const prepareGate = new Promise((resolve) => { releasePrepare = resolve; });
+    const prepareStarted = new Promise((resolve) => { notePrepareStarted = resolve; });
+    const order = [];
+    const first = gate.run(async () => {
+      order.push("prepare:start");
+      notePrepareStarted();
+      await prepareGate;
+      order.push("lease:installed");
+    });
+    await prepareStarted;
+
+    const quiesced = gate.quiesce().then(() => { order.push("prepare:quiesced"); });
+    await assert.rejects(
+      () => gate.run(async () => { order.push("lease:late"); }),
+      /preparation is quiesced/,
+    );
+    releasePrepare();
+    await first;
+    await quiesced;
+    order.push("lease:cleared");
+
+    assert.deepEqual(order, [
+      "prepare:start",
+      "lease:installed",
+      "prepare:quiesced",
+      "lease:cleared",
+    ]);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("coordinator runtime disposal starts even while native-turn quiescence is stuck", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/production-provider.ts");
+  try {
+    const held = Promise.withResolvers();
+    let disposalStarted = false;
+    const shutdown = loaded.module.quiesceNativeTurnsAndDisposeCoordinatorRuntime(
+      () => held.promise,
+      async () => { disposalStarted = true; },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(disposalStarted, true);
+    held.resolve();
+    await shutdown;
   } finally {
     await loaded.dispose();
   }
@@ -449,6 +1006,86 @@ test("lease revocation failure stops the owned local Docker host and fails if bo
   }
 });
 
+test("lease revoke fallback fails closed on generic Docker inspect and absence-list failures", async (t) => {
+  const loaded = await loadModule("source/electron-main/box/local-docker-host-connector.ts");
+  try {
+    await t.test("generic inspect failure", async () => {
+      const commands = [];
+      await assert.rejects(
+        () => loaded.module.revokeCliProxyLeaseOrStopOwnedLocalDocker(
+          async () => { throw new Error("host unavailable"); },
+          async () => loaded.module.stopLocalDockerBoxNow(async (args) => {
+            commands.push([...args]);
+            return args[0] === "inspect"
+              ? { ok: false, output: "permission denied while inspecting Docker state" }
+              : { ok: true, output: loaded.module.LOCAL_DOCKER_BOX_CONTAINER };
+          }),
+        ),
+        (error) => {
+          assert.equal(error.name, "AggregateError");
+          assert.equal(error.errors.length, 2);
+          assert.match(error.errors[0].message, /host unavailable/);
+          assert.match(error.errors[1].message, /could not inspect the existing local container/);
+          return true;
+        },
+      );
+      assert.deepEqual(commands.map(args => args.slice(0, 2)), [["inspect", "--format"], ["container", "ls"]]);
+    });
+
+    await t.test("absence confirmation list failure", async () => {
+      const commands = [];
+      await assert.rejects(
+        () => loaded.module.revokeCliProxyLeaseOrStopOwnedLocalDocker(
+          async () => { throw new Error("host unavailable"); },
+          async () => loaded.module.stopLocalDockerBoxNow(async (args) => {
+            commands.push([...args]);
+            return args[0] === "inspect"
+              ? { ok: false, output: `Error: No such object: ${loaded.module.LOCAL_DOCKER_BOX_CONTAINER}` }
+              : { ok: false, output: "Docker daemon disconnected during list" };
+          }),
+        ),
+        (error) => {
+          assert.equal(error.name, "AggregateError");
+          assert.equal(error.errors.length, 2);
+          assert.match(error.errors[1].message, /absence could not be confirmed/);
+          return true;
+        },
+      );
+      assert.deepEqual(commands.map(args => args.slice(0, 2)), [["inspect", "--format"], ["container", "ls"]]);
+    });
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("lease revoke fallback treats only a confirmed missing container as a no-op", async () => {
+  const loaded = await loadModule("source/electron-main/box/local-docker-host-connector.ts");
+  try {
+    const commands = [];
+    await loaded.module.revokeCliProxyLeaseOrStopOwnedLocalDocker(
+      async () => { throw new Error("host unavailable"); },
+      async () => loaded.module.stopLocalDockerBoxNow(async (args) => {
+        commands.push([...args]);
+        if (args[0] === "inspect") {
+          return { ok: false, output: "[]\n오류: 요청한 Docker 개체를 찾을 수 없습니다" };
+        }
+        if (args[0] === "container" && args[1] === "ls") return { ok: true, output: "" };
+        assert.fail(`confirmed-absent stop must not invoke ${args.join(" ")}`);
+      }),
+    );
+    assert.deepEqual(commands, [
+      ["inspect", "--format", "{{json .}}", loaded.module.LOCAL_DOCKER_BOX_CONTAINER],
+      [
+        "container", "ls", "--all",
+        "--filter", `name=^/${loaded.module.LOCAL_DOCKER_BOX_CONTAINER}$`,
+        "--format", "{{.Names}}",
+      ],
+    ]);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
 test("local Docker isolates its network and model shell before carrying a 9Router lease", async () => {
   const source = await readFile(path.join(repoRoot, "source/electron-main/box/local-docker-host-connector.ts"), "utf8");
   assert.match(source, /cursorenvironments\/universal@sha256:3f9e25e1e382b7c4b71e08eb549098a6106fadc615feba848e6cc5c1ef4be3b6/);
@@ -456,7 +1093,7 @@ test("local Docker isolates its network and model shell before carrying a 9Route
   assert.match(source, /LOCAL_DOCKER_SCHEMA_VERSION = "11"/);
   assert.match(source, /LOCAL_DOCKER_NETWORK = "grok-bot-local-vm-net"/);
   assert.match(source, /com\.docker\.network\.bridge\.enable_icc=false/);
-  assert.match(source, /foreignContainers\.length > 0/);
+  assert.match(source, /foreignContainers\.length === 0/);
   assert.match(source, /"--network", LOCAL_DOCKER_NETWORK/);
   assert.match(source, /"--security-opt", "no-new-privileges:true"/);
   assert.match(source, /"--cap-drop", "NET_RAW"/);
@@ -484,9 +1121,21 @@ test("local Docker isolates its network and model shell before carrying a 9Route
   assert.match(source, /"127\.0\.0\.1:6081:6081"/);
   assert.match(source, /com\.grok-bot\.local-vm\.local-auth-provider=\$\{localAuthProviderLabel\}/);
   assert.match(source, /localDockerStartOptionsForProvider\(inferenceProvider\)/);
+  assert.match(source, /inspected\.image === LOCAL_DOCKER_BOX_IMAGE/);
+  assert.match(source, /inspected\.schemaVersion === LOCAL_DOCKER_SCHEMA_VERSION/);
+  assert.match(source, /inspected\.networkMode === LOCAL_DOCKER_NETWORK/);
+  assert.match(source, /inspected\.hostSha256 === bundle\.sha256/);
+  assert.match(source, /inspected\.boxExecDaemonSha256 === bundle\.boxExecDaemonSha256/);
+  assert.match(source, /inspected\.execDaemonWrapperSha256 === bundle\.execDaemonWrapperSha256/);
+  assert.match(source, /inspected\.gatewayTokenSha256 === expectedTokenSha256/);
+  assert.match(source, /inspected\.hasInferenceCredential === expectedInferenceCredential/);
+  assert.match(source, /inspected\.localAuthProvider === \(localAuthProvider \?\? "none"\)/);
+  assert.match(source, /inspected\.hasIsolatedModelShell === expectedIsolatedModelShell/);
   assert.match(source, /provider === "codex" \|\| provider === "claude-code" \? provider : undefined/);
   assert.match(source, /provider === "codex"[\s\S]*\["\.codex", "\/root\/\.codex"\][\s\S]*\["\.claude", "\/root\/\.claude"\]/);
   assert.match(source, /inspected\.localAuthProvider !== localAuthProviderLabel/);
+  assert.match(source, /hardenWindowsPrivatePath\(temporary\)[\s\S]*rename\(temporary, target\)[\s\S]*hardenWindowsPrivatePath\(target\)/);
+  assert.match(source, /if \(inferenceCredential == null\) \{\s*await rm\(inferenceCredentialPath\(settingsPath\), \{ force: true \}\);/);
   assert.doesNotMatch(source, /mountLocalAuth/);
   assert.match(source, /inspected\.boxExecDaemonSha256 !== hostBundle\.boxExecDaemonSha256/);
 });

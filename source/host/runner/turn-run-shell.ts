@@ -39,6 +39,8 @@ import {
 import type { BlobStore } from "../../packages/agent-kv/blob-store.js";
 import {
   createTurnSettle,
+  type ProfileIdentity,
+  type ProfilePromptSnapshot,
   type TurnCheckpoint,
   type TurnSession,
   type TurnSettleHost,
@@ -89,6 +91,8 @@ export interface TurnAgentShellWatchInput<ContextValue> {
 
 export interface TurnAgentRunContextInput<ContextValue> {
   readonly context: ContextValue;
+  /** Rechecked after asynchronous owner setup before creating live sessions. */
+  readonly isCancelled?: () => boolean;
   readonly conversationId: string;
   readonly requestId: string;
   readonly inference: TurnAgentInferenceOwner;
@@ -142,7 +146,7 @@ export interface TurnAgentRunContext<ContextValue> {
   readonly summarizationSession?: SummarizationPromptSession;
   readonly shellWatchHost?: ShellTerminalWatchHost<ContextValue>;
   readonly diskPressureReminderEpisodeId: string | null;
-  readonly profilePromptSnapshot?: unknown;
+  readonly profilePromptSnapshot?: AgentProfilePromptSnapshot;
   readonly profileUpdateForTurn?: {
     readonly text: string;
     readonly identity: { readonly name: string; readonly description: string };
@@ -160,7 +164,13 @@ export interface TurnAgentRunContext<ContextValue> {
 export async function createTurnAgentRunContext<ContextValue>(
   input: TurnAgentRunContextInput<ContextValue>,
 ): Promise<TurnAgentRunContext<ContextValue>> {
+  if (input.isCancelled?.() === true) {
+    throw new SandTurnInterruptedBeforeDispatchError();
+  }
   const privacyMode = await input.inference.resolvePrivacyMode();
+  if (input.isCancelled?.() === true) {
+    throw new SandTurnInterruptedBeforeDispatchError();
+  }
   const diskPressureReminderEpisodeId = input.diskPressureReminder == null
     || input.diskPressureClaimId == null
     ? input.diskPressureReminderEpisodeId ?? null
@@ -388,6 +398,8 @@ export interface TurnStreamCallbacks {
   persistCheckpoint(checkpoint: TurnCheckpoint): Promise<void>;
   pauseForUser(reason: string): void;
   noteDispatched(): void;
+  setProfileSnapshot(snapshot: ProfilePromptSnapshot): void;
+  noteProfileUpdateAppended(identity: ProfileIdentity): void;
 }
 
 export interface TurnRunShellHost {
@@ -469,6 +481,9 @@ interface ActiveRun {
 export function createTurnRunShell(host: TurnRunShellHost) {
   let quiescingForUpgrade = false;
   let activeRun: ActiveRun | null = null;
+  let shutdownCancellation: TurnCancellation | undefined;
+  const activeRuns = new Set<ActiveRun>();
+  const activeRunSettlements = new Set<Promise<void>>();
 
   function cancelRun(run: ActiveRun, cancellation: TurnCancellation): void {
     if (!run.controller.signal.aborted) {
@@ -524,17 +539,36 @@ export function createTurnRunShell(host: TurnRunShellHost) {
   }
 
   function interruptAll(reason: string): boolean {
-    const interrupted = interrupt(reason);
+    let interrupted = false;
+    for (const run of activeRuns) {
+      host.setActiveRunInterrupted(true);
+      cancelRun(run, { intentional: true, reason });
+      interrupted = true;
+    }
     for (const subagent of host.subagents.sessions.values()) {
       subagent.interrupt(reason);
     }
     return interrupted;
   }
 
-  async function run(
+  function beginShutdown(reason: string): boolean {
+    shutdownCancellation ??= { intentional: true, reason };
+    let interrupted = false;
+    for (const run of activeRuns) {
+      host.setActiveRunInterrupted(true);
+      cancelRun(run, shutdownCancellation);
+      interrupted = true;
+    }
+    return interrupted;
+  }
+
+  async function runTurn(
     prompt: string,
     options: TurnRunOptions = {},
   ): Promise<TurnSettleResult> {
+    if (shutdownCancellation !== undefined) {
+      throw new Error("Turn runner is shutting down");
+    }
     const requestSource =
       options.requestSource ?? host.inheritedRequestSource;
     host.setActiveTurnRequestSource(requestSource);
@@ -588,7 +622,11 @@ export function createTurnRunShell(host: TurnRunShellHost) {
       awaitingUserSelection: false,
       quiescedForUpgrade: false,
     };
+    activeRuns.add(runState);
     activeRun = runState;
+    if (shutdownCancellation !== undefined) {
+      cancelRun(runState, shutdownCancellation);
+    }
     host.setActiveRunInterrupted(false);
     host.setAwaitingUserSelection(false);
 
@@ -640,6 +678,9 @@ export function createTurnRunShell(host: TurnRunShellHost) {
     };
 
     try {
+      if (controller.signal.aborted) {
+        throw new SandTurnInterruptedBeforeDispatchError();
+      }
       if (!host.isSubagentRunner) {
         await host.conversationSizeGuard?.();
         if (options.autoReviewEpoch !== "continue") {
@@ -742,6 +783,12 @@ export function createTurnRunShell(host: TurnRunShellHost) {
         noteDispatched(): void {
           runState.dispatched = true;
         },
+        setProfileSnapshot(snapshot): void {
+          settle.setProfileSnapshot(snapshot);
+        },
+        noteProfileUpdateAppended(identity): void {
+          settle.noteProfileUpdateAppended(identity);
+        },
       };
 
       finalState = await host.runPreparedTurn(
@@ -782,15 +829,19 @@ export function createTurnRunShell(host: TurnRunShellHost) {
         host.onRunUnwind?.();
       }
 
-      if (
-        ownsRunner
-        && finalState != null
-        && host.runGeneration() === generation
-        && (host.ownsFinalState?.(generation) ?? true)
-      ) {
-        await settle.persistFinalState(context, finalState);
+      try {
+        if (
+          ownsRunner
+          && finalState != null
+          && host.runGeneration() === generation
+          && (host.ownsFinalState?.(generation) ?? true)
+        ) {
+          await settle.persistFinalState(context, finalState);
+        }
+      } finally {
+        activeRuns.delete(runState);
+        endLifecycle();
       }
-      endLifecycle();
     }
 
     return settle.buildResult({
@@ -803,6 +854,35 @@ export function createTurnRunShell(host: TurnRunShellHost) {
         ? { awaitingUserSelection: true }
         : {}),
     });
+  }
+
+  function run(
+    prompt: string,
+    options: TurnRunOptions = {},
+  ): Promise<TurnSettleResult> {
+    let settleActiveRun!: () => void;
+    const settlement = new Promise<void>((resolve) => {
+      settleActiveRun = resolve;
+    });
+    // Install the marker before runTurn can synchronously emit lifecycle
+    // callbacks that re-enter host disposal.
+    activeRunSettlements.add(settlement);
+    const promise = runTurn(prompt, options);
+    void promise.then(
+      () => {
+        activeRunSettlements.delete(settlement);
+        settleActiveRun();
+      },
+      () => {
+        activeRunSettlements.delete(settlement);
+        settleActiveRun();
+      },
+    );
+    return promise;
+  }
+
+  async function drainActiveRun(): Promise<void> {
+    await Promise.allSettled([...activeRunSettlements]);
   }
 
   return {
@@ -832,11 +912,13 @@ export function createTurnRunShell(host: TurnRunShellHost) {
     },
     interrupt,
     interruptAll,
+    beginShutdown,
     requestQuiesceForUpgrade,
     isQuiescingForUpgrade,
     cancelQuiesceForUpgrade,
     endTurnAwaitingUser,
-    hasActiveRun: (): boolean => activeRun != null,
+    hasActiveRun: (): boolean => activeRuns.size > 0,
     activeRequestId: (): string | undefined => activeRun?.requestId,
+    drainActiveRun,
   };
 }

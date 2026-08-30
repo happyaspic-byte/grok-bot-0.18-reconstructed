@@ -45,12 +45,25 @@ import {
 import {
   createComputerTool,
   createScreenshotTool,
+  toAction as toRawComputerAction,
+  type ComputerActionArgs,
+  type ComputerProtocolAction,
   type ComputerToolDependencies,
+  type ComputerUseResult as RawComputerUseResult,
 } from "./sand-computer-tool.js";
 import {
   createSandBrowserTools,
   type BrowserDriverDependencies,
+  type BrowserDriverOutput,
+  type BrowserToolDefinition,
 } from "./sand-browser-tools.js";
+import {
+  buildErrorResult as buildCommunicateErrorResult,
+  buildSuccessResult as buildCommunicateSuccessResult,
+  completedToolCall as completedCommunicateToolCall,
+  toolCallWrapper as communicateToolCallWrapper,
+  type CommunicateResult,
+} from "./communicate-tool.js";
 import {
   createFileTransferTools,
   type FileTransferController,
@@ -71,7 +84,37 @@ import {
   createWebFetchTool,
   type WebFetchToolDependencies,
 } from "../../../packages/agent/tools/core/web-fetch.js";
-import { createToolCallExecutionTimeoutError } from "../../../packages/agent/tools/common.js";
+import {
+  createToolCallExecutionTimeoutError,
+  createZodAgentTool,
+  withSafeParsedArgs,
+} from "../../../packages/agent/tools/common.js";
+import {
+  createImageResult,
+  createStringResult,
+} from "../../../packages/chat-inference/prompt-executor.js";
+import { displaySpaceSentence } from "../../box/box-monitor-layout.js";
+import { ToolCall } from "../../../packages/proto/generated/agent/v1/agent_pb.js";
+import {
+  ComputerUseArgs,
+  ComputerUseAction,
+  ComputerUseError,
+  ComputerUseResult,
+  ComputerUseSuccess,
+  ComputerUseToolCall,
+  Coordinate,
+  ClickAction,
+  DragAction,
+  KeyAction,
+  MouseButton,
+  MouseMoveAction,
+  ScreenshotAction,
+  ScrollAction,
+  ScrollDirection,
+  TypeAction,
+  WaitAction,
+} from "../../../packages/proto/generated/agent/v1/computer_use_tool_pb.js";
+import { z, type ZodTypeAny } from "zod";
 import {
   createAwaitTool,
   type AwaitToolOptions,
@@ -190,6 +233,7 @@ export interface ToolExecutionContext {
 
 export interface ToolMetadata {
   readonly toolCallId: string;
+  readonly signal?: AbortSignal;
   readonly stateHandler?: unknown;
   readonly workspacePaths?: readonly string[];
 }
@@ -809,6 +853,716 @@ function asTurnTool<T extends object>(value: T): T & TurnTool {
   return value;
 }
 
+interface AbortSignalInteractionHandler {
+  getAbortSignal?(context: Context): AbortSignal;
+}
+
+interface ComputerUseCarrierInteractionHandler extends AbortSignalInteractionHandler {
+  executeToolCall?(
+    context: Context,
+    toolCall: ToolCall,
+    toolCallId: string,
+    run: (context: Context) => Promise<ComputerUseResult>,
+    merge: (result: ComputerUseResult) => ToolCall,
+  ): Promise<ComputerUseResult>;
+}
+
+interface CommunicateCarrierInteractionHandler extends AbortSignalInteractionHandler {
+  executeToolCall?(
+    context: Context,
+    toolCall: ToolCall,
+    toolCallId: string,
+    run: (context: Context) => Promise<CommunicateResult>,
+    merge: (result: CommunicateResult) => ToolCall,
+  ): Promise<CommunicateResult>;
+}
+
+interface RawComputerTool {
+  readonly id: string;
+  readonly name: string;
+  readonly parameters: ZodTypeAny;
+  execute(
+    args: unknown,
+    metadata: {
+      readonly context: unknown;
+      readonly toolCallId?: string;
+      readonly signal?: AbortSignal;
+      readonly stateHandler?: unknown;
+      readonly workspacePaths?: readonly string[];
+    },
+  ): Promise<RawComputerUseResult>;
+}
+
+function messageFromError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function createComputerUseCarrier(
+  args: ComputerUseArgs | undefined,
+  result?: ComputerUseResult,
+): ToolCall {
+  return new ToolCall({
+    tool: {
+      case: "computerUseToolCall",
+      value: new ComputerUseToolCall({
+        ...(args === undefined ? {} : { args }),
+        ...(result === undefined ? {} : { result }),
+      }),
+    },
+  });
+}
+
+function generatedMouseButton(value: unknown): MouseButton {
+  if (value === "RIGHT") return MouseButton.RIGHT;
+  if (value === "MIDDLE") return MouseButton.MIDDLE;
+  if (value === "BACK") return MouseButton.BACK;
+  if (value === "FORWARD") return MouseButton.FORWARD;
+  return MouseButton.LEFT;
+}
+
+function generatedScrollDirection(value: unknown): ScrollDirection {
+  if (value === "UP") return ScrollDirection.UP;
+  if (value === "LEFT") return ScrollDirection.LEFT;
+  if (value === "RIGHT") return ScrollDirection.RIGHT;
+  return ScrollDirection.DOWN;
+}
+
+function generatedCoordinate(value: unknown): Coordinate | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const x = optionalRecordNumber(record, "x");
+  const y = optionalRecordNumber(record, "y");
+  return x === undefined || y === undefined ? undefined : new Coordinate({ x, y });
+}
+
+function toGeneratedComputerAction(action: ComputerProtocolAction): ComputerUseAction {
+  const value = action.action.value;
+  switch (action.action.case) {
+    case "mouseMove": {
+      const coordinate = generatedCoordinate(value.coordinate);
+      return new ComputerUseAction({
+        action: {
+          case: "mouseMove",
+          value: new MouseMoveAction({
+            ...(coordinate === undefined ? {} : { coordinate }),
+          }),
+        },
+      });
+    }
+    case "click": {
+      const coordinate = generatedCoordinate(value.coordinate);
+      return new ComputerUseAction({
+        action: {
+          case: "click",
+          value: new ClickAction({
+            ...(coordinate === undefined ? {} : { coordinate }),
+            button: generatedMouseButton(value.button),
+            count: optionalRecordNumber(value, "count") ?? 1,
+          }),
+        },
+      });
+    }
+    case "drag": {
+      const path = Array.isArray(value.path)
+        ? value.path.flatMap((point) => generatedCoordinate(point) ?? [])
+        : [];
+      return new ComputerUseAction({
+        action: {
+          case: "drag",
+          value: new DragAction({
+            path,
+            button: generatedMouseButton(value.button),
+          }),
+        },
+      });
+    }
+    case "scroll": {
+      const coordinate = generatedCoordinate(value.coordinate);
+      return new ComputerUseAction({
+        action: {
+          case: "scroll",
+          value: new ScrollAction({
+            ...(coordinate === undefined ? {} : { coordinate }),
+            direction: generatedScrollDirection(value.direction),
+            amount: optionalRecordNumber(value, "amount") ?? 3,
+          }),
+        },
+      });
+    }
+    case "type": return new ComputerUseAction({
+      action: {
+        case: "type",
+        value: new TypeAction({ text: optionalRecordString(value, "text") ?? "" }),
+      },
+    });
+    case "key": return new ComputerUseAction({
+      action: {
+        case: "key",
+        value: new KeyAction({ key: optionalRecordString(value, "key") ?? "" }),
+      },
+    });
+    case "wait": return new ComputerUseAction({
+      action: {
+        case: "wait",
+        value: new WaitAction({ durationMs: optionalRecordNumber(value, "durationMs") ?? 1_000 }),
+      },
+    });
+    case "screenshot": return new ComputerUseAction({
+      action: { case: "screenshot", value: new ScreenshotAction() },
+    });
+    default: throw new TypeError(`Unsupported computer action: ${action.action.case}`);
+  }
+}
+
+function createComputerUseArgs(
+  operation: "computer" | "screenshot",
+  rawArgs: unknown,
+  metadata: ToolMetadata,
+  bindUnmappedCharacters: boolean,
+): ComputerUseArgs {
+  const input = rawArgs as ComputerActionArgs;
+  const sequence = operation === "screenshot"
+    ? [{ action: "screenshot" } as const]
+    : (() => {
+        const { then, ...primary } = input;
+        return [primary, ...(then ?? [])];
+      })();
+  const actions = sequence.map((action) => toGeneratedComputerAction(
+    toRawComputerAction(action as ComputerActionArgs),
+  ));
+  if (sequence.at(-1)?.action !== "screenshot") {
+    actions.push(toGeneratedComputerAction(toRawComputerAction({ action: "screenshot" })));
+  }
+  const description = operation === "computer" ? input.description?.trim() : undefined;
+  return new ComputerUseArgs({
+    toolCallId: metadata.toolCallId,
+    actions,
+    ...(bindUnmappedCharacters ? { bindUnmappedCharacters: true } : {}),
+    ...(description === undefined || description.length === 0 ? {} : { description }),
+  });
+}
+
+function createComputerUseErrorResult(error: unknown): ComputerUseResult {
+  return new ComputerUseResult({
+    result: {
+      case: "error",
+      value: new ComputerUseError({ error: messageFromError(error) }),
+    },
+  });
+}
+
+function optionalRecordString(
+  record: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  const value = record[key];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function optionalRecordNumber(
+  record: Record<string, unknown>,
+  key: string,
+): number | undefined {
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function toComputerUseResult(output: RawComputerUseResult): ComputerUseResult {
+  if (output instanceof ComputerUseResult) return output;
+  if (output.result.case === "success") {
+    const value = output.result.value as Record<string, unknown>;
+    const screenshot = optionalRecordString(value, "screenshot");
+    const screenshotPath = optionalRecordString(value, "screenshotPath");
+    const log = optionalRecordString(value, "log");
+    const cursor = value.cursorPosition;
+    const cursorRecord = cursor !== null && typeof cursor === "object"
+      ? cursor as Record<string, unknown>
+      : undefined;
+    const x = cursorRecord === undefined ? undefined : optionalRecordNumber(cursorRecord, "x");
+    const y = cursorRecord === undefined ? undefined : optionalRecordNumber(cursorRecord, "y");
+    return new ComputerUseResult({
+      result: {
+        case: "success",
+        value: new ComputerUseSuccess({
+          actionCount: optionalRecordNumber(value, "actionCount") ?? 0,
+          durationMs: optionalRecordNumber(value, "durationMs") ?? 0,
+          ...(screenshot === undefined ? {} : { screenshot }),
+          ...(screenshotPath === undefined ? {} : { screenshotPath }),
+          ...(log === undefined ? {} : { log }),
+          ...(x === undefined || y === undefined
+            ? {}
+            : { cursorPosition: new Coordinate({ x, y }) }),
+        }),
+      },
+    });
+  }
+  if (output.result.case === "error") {
+    const value = output.result.value as Record<string, unknown>;
+    const screenshot = optionalRecordString(value, "screenshot");
+    const screenshotPath = optionalRecordString(value, "screenshotPath");
+    const log = optionalRecordString(value, "log");
+    return new ComputerUseResult({
+      result: {
+        case: "error",
+        value: new ComputerUseError({
+          error: optionalRecordString(value, "error") ?? "Computer action failed.",
+          actionCount: optionalRecordNumber(value, "actionCount") ?? 0,
+          durationMs: optionalRecordNumber(value, "durationMs") ?? 0,
+          ...(screenshot === undefined ? {} : { screenshot }),
+          ...(screenshotPath === undefined ? {} : { screenshotPath }),
+          ...(log === undefined ? {} : { log }),
+        }),
+      },
+    });
+  }
+  return createComputerUseErrorResult("Computer action returned an unknown result.");
+}
+
+interface BrowserRenderEnvelope {
+  readonly text: string;
+}
+
+const browserResultImages = new WeakMap<CommunicateResult, string>();
+
+function encodeBrowserRenderEnvelope(output: BrowserDriverOutput): string {
+  return JSON.stringify({ text: output.text } satisfies BrowserRenderEnvelope);
+}
+
+function decodeBrowserRenderEnvelope(value: string): BrowserRenderEnvelope {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (
+      parsed !== null
+      && typeof parsed === "object"
+      && !Array.isArray(parsed)
+      && "text" in parsed
+      && typeof parsed.text === "string"
+    ) {
+      return { text: parsed.text };
+    }
+  } catch {}
+  return { text: value };
+}
+
+function toBrowserCommunicateResult(output: BrowserDriverOutput): CommunicateResult {
+  if (output.isError === true) return buildCommunicateErrorResult(output.text);
+  const result = buildCommunicateSuccessResult(encodeBrowserRenderEnvelope(output));
+  if (output.imageB64 !== undefined && output.imageB64.length > 0) {
+    browserResultImages.set(result, output.imageB64);
+  }
+  return result;
+}
+
+function completedBrowserToolCall(result: CommunicateResult): ToolCall {
+  if (result.result.case !== "success") return completedCommunicateToolCall(result);
+  const envelope = decodeBrowserRenderEnvelope(result.result.value.currentStep);
+  const carrier = completedCommunicateToolCall(
+    buildCommunicateSuccessResult(envelope.text),
+  );
+  if (carrier.tool.case === "communicateUpdateToolCall") {
+    carrier.tool.value.result = result;
+  }
+  return carrier;
+}
+
+function renderComputerUseResult(
+  result: ComputerUseResult,
+  operation: "computer" | "screenshot",
+) {
+  if (result.result.case === "error") {
+    const text = `${operation === "screenshot" ? "Screenshot" : "Computer action"} failed: ${result.result.value.error}`;
+    const screenshot = result.result.value.screenshot;
+    return screenshot === undefined || screenshot.length === 0
+      ? createStringResult(text, true)
+      : createImageResult(screenshot, "image/webp", text, true);
+  }
+  if (result.result.case !== "success") return createStringResult("Computer action returned an unknown result.", true);
+  const value = result.result.value;
+  const lines = [operation === "screenshot"
+    ? "Screenshot captured from the box desktop."
+    : "Computer action ran on the box desktop."];
+  if (value.screenshotPath !== undefined && value.screenshotPath.length > 0) {
+    lines.push(`Screenshot saved to ${value.screenshotPath}.`);
+  }
+  if (value.cursorPosition !== undefined) {
+    lines.push(`Cursor is at (${value.cursorPosition.x}, ${value.cursorPosition.y}).`);
+  }
+  if (value.log !== undefined && value.log.length > 0) lines.push(value.log);
+  const text = lines.join("\n");
+  return value.screenshot === undefined || value.screenshot.length === 0
+    ? createStringResult(text)
+    : createImageResult(value.screenshot, "image/webp", text);
+}
+
+function renderBrowserResult(result: CommunicateResult) {
+  if (result.result.case === "error") {
+    return createStringResult(result.result.value.error || "The browser action failed.", true);
+  }
+  if (result.result.case !== "success") return createStringResult("Browser action returned an unknown result.", true);
+  const envelope = decodeBrowserRenderEnvelope(result.result.value.currentStep);
+  const text = envelope.text.trim() || "Browser action completed.";
+  const imageB64 = browserResultImages.get(result);
+  browserResultImages.delete(result);
+  return imageB64 === undefined || imageB64.length === 0
+    ? createStringResult(text)
+    : createImageResult(imageB64, "image/png", text);
+}
+
+function resolveExecutionSignal(
+  context: Context,
+  interactionHandler: AbortSignalInteractionHandler,
+  metadata: ToolMetadata,
+): AbortSignal {
+  return interactionHandler.getAbortSignal?.(context)
+    ?? metadata.signal
+    ?? context.signal;
+}
+
+async function executeWithComputerUseCarrier(
+  context: Context,
+  interactionHandler: ComputerUseCarrierInteractionHandler,
+  metadata: ToolMetadata,
+  args: ComputerUseArgs,
+  run: (context: Context) => Promise<ComputerUseResult>,
+): Promise<ComputerUseResult> {
+  if (interactionHandler.executeToolCall === undefined) return run(context);
+  return interactionHandler.executeToolCall(
+    context,
+    createComputerUseCarrier(args),
+    metadata.toolCallId,
+    run,
+    (result) => createComputerUseCarrier(args, result),
+  );
+}
+
+async function executeWithCommunicateCarrier(
+  context: Context,
+  interactionHandler: CommunicateCarrierInteractionHandler,
+  metadata: ToolMetadata,
+  toolName: string,
+  run: (context: Context) => Promise<CommunicateResult>,
+): Promise<CommunicateResult> {
+  if (interactionHandler.executeToolCall === undefined) return run(context);
+  return interactionHandler.executeToolCall(
+    context,
+    communicateToolCallWrapper({ phase: "executing", tool: toolName }),
+    metadata.toolCallId,
+    run,
+    completedBrowserToolCall,
+  );
+}
+
+const browserBaseParameters = {
+  viewId: z.string().optional().describe(
+    "Target browser tab ID. If omitted, uses your dedicated tab (created on first use).",
+  ),
+};
+
+const browserRefParameters = {
+  ref: z.string().describe("Element ref from browser_snapshot."),
+  element: z.string().optional().describe("Human-readable description of the element."),
+};
+
+function browserObjectParameters(shape: z.ZodRawShape): ZodTypeAny {
+  return z.object({ ...browserBaseParameters, ...shape });
+}
+
+function browserParameters(op: string): ZodTypeAny {
+  switch (op) {
+    case "navigate": return browserObjectParameters({
+      url: z.string().describe("The URL to navigate to"),
+      newTab: z.boolean().optional().describe(
+        "When true, creates a new tab before navigating instead of reusing an existing tab. Defaults to false.",
+      ),
+    });
+    case "snapshot": return browserObjectParameters({
+      interactive: z.boolean().optional().describe(
+        "When true, only include interactive elements in the snapshot. Defaults to false.",
+      ),
+      maxDepth: z.number().optional().describe("Maximum depth for snapshot output. Defaults to 20."),
+      selector: z.string().optional().describe("Optional CSS selector to scope the snapshot to a subtree."),
+    });
+    case "click": return browserObjectParameters({
+      ...browserRefParameters,
+      element: z.string().optional().describe(
+        "Concise description of the element being clicked and why. Required when Auto-review is active.",
+      ),
+      button: z.enum(["left", "right", "middle"]).optional().describe("Mouse button. Defaults to left."),
+      modifiers: z.array(z.enum(["Control", "Shift", "Alt", "Meta", "ControlOrMeta"]))
+        .optional()
+        .describe("Optional modifier keys."),
+      doubleClick: z.boolean().optional().describe("When true, double-click the element."),
+      holdDurationMs: z.number().optional().describe("Optional mouse hold duration before release."),
+      offsetX: z.number().optional().describe("Optional x offset from the element center."),
+      offsetY: z.number().optional().describe("Optional y offset from the element center."),
+    });
+    case "mouse_click_xy": return browserObjectParameters({
+      x: z.number().describe("Viewport x coordinate."),
+      y: z.number().describe("Viewport y coordinate."),
+      element: z.string().optional().describe(
+        "Concise description of the element being clicked and why. Required when Auto-review is active.",
+      ),
+      button: z.enum(["left", "right", "middle"]).optional().describe("Mouse button. Defaults to left."),
+    });
+    case "type": return browserObjectParameters({
+      ...browserRefParameters,
+      text: z.string().describe("Text to type."),
+      clear: z.boolean().optional().describe("When true, clear existing text first."),
+      slowly: z.boolean().optional().describe("When true, type character by character."),
+      submit: z.boolean().optional().describe("When true, press Enter after typing."),
+    });
+    case "fill": return browserObjectParameters({
+      ...browserRefParameters,
+      value: z.string().describe("Value to set."),
+    });
+    case "select_option": return browserObjectParameters({
+      ...browserRefParameters,
+      values: z.array(z.string()).describe("Option values or labels to select."),
+    });
+    case "press_key": return browserObjectParameters({
+      key: z.string().describe(
+        "Key to press, for example Enter, Escape, Tab, ArrowDown, or a single character.",
+      ),
+    });
+    case "scroll": return browserObjectParameters({
+      ref: z.string().optional().describe("Optional element ref from browser_snapshot to scroll into view."),
+      element: z.string().optional().describe("Human-readable description of the element."),
+      direction: z.enum(["up", "down", "left", "right"]).optional().describe(
+        "Scroll direction. Defaults to down.",
+      ),
+      amount: z.number().optional().describe("Scroll amount in pixels. Defaults to 300."),
+      deltaX: z.number().optional().describe("Explicit horizontal scroll delta."),
+      deltaY: z.number().optional().describe("Explicit vertical scroll delta."),
+    });
+    case "drag": return browserObjectParameters({
+      sourceRef: z.string().describe("Source element ref from browser_snapshot."),
+      element: z.string().optional().describe(
+        "Concise description of what is being dragged where, and why. Required when Auto-review is active.",
+      ),
+      targetRef: z.string().optional().describe("Optional target element ref from browser_snapshot."),
+      targetX: z.number().optional().describe("Optional target viewport x coordinate."),
+      targetY: z.number().optional().describe("Optional target viewport y coordinate."),
+    });
+    case "get_bounding_box":
+    case "highlight": return browserObjectParameters({
+      ...browserRefParameters,
+      ...(op === "highlight"
+        ? { durationMs: z.number().optional().describe("Highlight duration in milliseconds. Defaults to 2000.") }
+        : {}),
+    });
+    case "cdp": return browserObjectParameters({
+      method: z.string().describe(
+        "CDP method name, for example Runtime.evaluate, DOM.getDocument, or Performance.getMetrics.",
+      ),
+      params: z.object({}).passthrough().optional().describe(
+        "CDP params object. Omit or pass {} when the command takes no params.",
+      ),
+    });
+    case "tabs": return z.object({
+      action: z.enum(["list", "new", "close", "select"]).describe("Operation to perform"),
+      index: z.number().optional().describe(
+        'Tab index. Required for "select". Optional for "close" (defaults to current tab).',
+      ),
+    });
+    case "screenshot": return browserObjectParameters({
+      fullPage: z.boolean().optional().describe(
+        "When true, captures the full scrollable page instead of the visible viewport.",
+      ),
+    });
+    default: throw new TypeError(`Unknown browser operation: ${op}`);
+  }
+}
+
+const computerParameterDescriptions: Readonly<Record<string, string>> = {
+  action: "What to do on the box desktop. Every call captures a fresh screenshot of the resulting screen once all of its actions have run.",
+  x: "X pixel in the box display space (origin top-left) for click/move/scroll, or the start point for drag (omit to act at the cursor for click/move/scroll).",
+  y: "Y pixel in the box display space (origin top-left) for click/move/scroll, or the start point for drag (omit to act at the cursor for click/move/scroll).",
+  x2: "X pixel for the drag end point. Required with y2 when path is omitted.",
+  y2: "Y pixel for the drag end point. Required with x2 when path is omitted.",
+  path: "Optional ordered drag path. A path with at least two {x, y} points is used verbatim instead of x/y/x2/y2.",
+  text: "Text to type. Required for type.",
+  key: "Key or chord in xdotool form, e.g. Return, ctrl+a, Alt+Left. Required for key. A shortcut meant to open a palette or search may not register — check the returned screenshot that it opened and holds focus before typing a query into it.",
+  button: "Mouse button for click or drag (default left).",
+  count: "Click count for click: 1 single, 2 double, 3 triple.",
+  direction: "Scroll direction. Required for scroll.",
+  amount: "Scroll amount in clicks (default 3).",
+  durationMs: "Milliseconds to wait. Required for wait. Max 30000. A settle delay before the screenshot is automatic, so do not add a wait just to let the screen settle.",
+  description: "Concise model-facing intent for this action. Required for click and drag in Auto-review enforce mode; include for type/key when it clarifies purpose.",
+};
+
+function enrichComputerJsonSchema(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(enrichComputerJsonSchema);
+  if (value === null || typeof value !== "object") return value;
+  const result: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) result[key] = enrichComputerJsonSchema(child);
+  const properties = result.properties;
+  if (properties !== null && typeof properties === "object" && !Array.isArray(properties)) {
+    const describedProperties: Record<string, unknown> = {};
+    for (const [name, property] of Object.entries(properties)) {
+      const description = computerParameterDescriptions[name];
+      describedProperties[name] = description === undefined
+        || property === null
+        || typeof property !== "object"
+        || Array.isArray(property)
+        ? property
+        : { ...property, description };
+    }
+    const path = describedProperties.path;
+    if (path !== null && typeof path === "object" && !Array.isArray(path)) {
+      const items = (path as Record<string, unknown>).items;
+      if (items !== null && typeof items === "object" && !Array.isArray(items)) {
+        const itemProperties = (items as Record<string, unknown>).properties;
+        if (itemProperties !== null && typeof itemProperties === "object" && !Array.isArray(itemProperties)) {
+          const points = { ...itemProperties } as Record<string, unknown>;
+          for (const coordinate of ["x", "y"] as const) {
+            const point = points[coordinate];
+            if (point !== null && typeof point === "object" && !Array.isArray(point)) {
+              points[coordinate] = { ...point, description: `${coordinate.toUpperCase()} pixel for this drag path point.` };
+            }
+          }
+          (items as Record<string, unknown>).properties = points;
+        }
+      }
+    }
+    result.properties = describedProperties;
+  }
+  return result;
+}
+
+function describeComputerParameters(parameters: unknown, operation: "computer" | "screenshot"): unknown {
+  if (parameters === null || typeof parameters !== "object" || Array.isArray(parameters)) return parameters;
+  const wrapper = parameters as Record<string, unknown>;
+  const jsonSchema = wrapper.jsonSchema;
+  if (jsonSchema === null || typeof jsonSchema !== "object" || Array.isArray(jsonSchema)) return parameters;
+  const described = enrichComputerJsonSchema(jsonSchema) as Record<string, unknown>;
+  return {
+    ...wrapper,
+    jsonSchema: operation === "screenshot"
+      ? { ...described, description: "No arguments. Captures the current box desktop screen." }
+      : described,
+  };
+}
+
+function computerDescription(autoReviewEnforced: boolean): string {
+  const examples = autoReviewEnforced
+    ? "scrolling several times to read further down, nudging the pointer before acting"
+    : "typing into a field you just clicked, scrolling several times to read further down, pressing Tab through a form";
+  const batching = `When you already know the next few steps without needing to see the screen between them — ${examples} — put them in then so they run in one call; that is several times faster than one call per action.`;
+  return `Control your isolated box's desktop by screenshot, click, move, drag, type, key, scroll, and wait. ${displaySpaceSentence()} Use drag for scrollbars, sliders, moving windows, drag-selecting content, and revealing or repositioning offscreen UI. Shell runs in the same box: Shell for commands and files, Computer for the screen. Every call returns a screenshot of the resulting screen saved to disk; include that file:// path in your report to the parent when it should be shown to the user. ${batching}`;
+}
+
+function adaptComputerTool(
+  rawTool: RawComputerTool,
+  operation: "computer" | "screenshot",
+  bindUnmappedCharacters = false,
+  autoReviewEnforced = false,
+): TurnTool {
+  const description = operation === "screenshot"
+    ? "Capture the current box desktop screen without interacting with it. This tool is read-only. To click, type, scroll, wait, or otherwise drive the desktop, delegate the task to a computerUse subagent. The screenshot is saved to disk; attach that file:// path with SendMessage to show the user."
+    : computerDescription(autoReviewEnforced);
+  const adapted = createZodAgentTool(rawTool.id, {
+    name: rawTool.name,
+    descriptionGenerator: () => description,
+    parameters: rawTool.parameters,
+    execute: withSafeParsedArgs(
+      rawTool.parameters,
+      async (context, handler, args, rawMetadata) => {
+        const interactionHandler = handler as ComputerUseCarrierInteractionHandler;
+        const metadata = rawMetadata as ToolMetadata;
+        const carrierArgs = createComputerUseArgs(
+          operation,
+          args,
+          metadata,
+          bindUnmappedCharacters,
+        );
+        return executeWithComputerUseCarrier(
+          context,
+          interactionHandler,
+          metadata,
+          carrierArgs,
+          async (executionContext) => {
+            const executionMetadata = {
+              context: executionContext,
+              toolCallId: metadata.toolCallId,
+              signal: resolveExecutionSignal(executionContext, interactionHandler, metadata),
+              ...(metadata.stateHandler === undefined ? {} : { stateHandler: metadata.stateHandler }),
+              ...(metadata.workspacePaths === undefined ? {} : { workspacePaths: metadata.workspacePaths }),
+            };
+            return toComputerUseResult(await rawTool.execute(args, executionMetadata));
+          },
+        );
+      },
+      createComputerUseCarrier(undefined),
+      { emitInitialPartialToolCall: false },
+    ),
+    render: async (_context: Context, result: ComputerUseResult) =>
+      renderComputerUseResult(result, operation),
+    serializeError: (error: unknown) => createComputerUseCarrier(
+      operation === "screenshot"
+        ? createComputerUseArgs(
+            "screenshot",
+            {},
+            { toolCallId: "" },
+            false,
+          )
+        : undefined,
+      createComputerUseErrorResult(error),
+    ),
+  });
+  return asTurnTool({
+    ...rawTool,
+    ...adapted,
+    id: rawTool.id,
+    parameters: describeComputerParameters(adapted.parameters, operation),
+  });
+}
+
+function adaptBrowserTool(
+  rawTool: BrowserToolDefinition<unknown>,
+): TurnTool {
+  const parameters = browserParameters(rawTool.op);
+  const adapted = createZodAgentTool(rawTool.id, {
+    name: rawTool.name,
+    descriptionGenerator: () => rawTool.description,
+    parameters,
+    execute: withSafeParsedArgs(
+      parameters,
+      async (context, handler, args, rawMetadata) => {
+        const interactionHandler = handler as CommunicateCarrierInteractionHandler;
+        const metadata = rawMetadata as ToolMetadata;
+        return executeWithCommunicateCarrier(
+          context,
+          interactionHandler,
+          metadata,
+          rawTool.name,
+          async (executionContext) => {
+            const executionMetadata = {
+              toolCallId: metadata.toolCallId,
+              signal: resolveExecutionSignal(executionContext, interactionHandler, metadata),
+              ...(metadata.stateHandler === undefined ? {} : { stateHandler: metadata.stateHandler }),
+              ...(metadata.workspacePaths === undefined ? {} : { workspacePaths: metadata.workspacePaths }),
+            };
+            const output = await rawTool.execute(
+              executionContext,
+              args as Record<string, unknown>,
+              executionMetadata,
+            );
+            return toBrowserCommunicateResult(output);
+          },
+        );
+      },
+      communicateToolCallWrapper({ tool: rawTool.name }),
+      { emitInitialPartialToolCall: false },
+    ),
+    render: async (_context: Context, result: CommunicateResult) =>
+      renderBrowserResult(result),
+    serializeError: (error: unknown) => completedCommunicateToolCall(
+      buildCommunicateErrorResult(messageFromError(error)),
+    ),
+  });
+  return asTurnTool({ ...rawTool, ...adapted, id: rawTool.id });
+}
+
 function asGeneratedMcpMetaToolOptions(
   tools: readonly McpToolForMeta[],
 ): McpMetaToolOptions {
@@ -908,19 +1662,24 @@ export function createTurnMcpMetaToolFactory(
 export function createTurnComputerToolFactory(
   input: TurnComputerToolFactoryInput,
 ): () => TurnTool {
-  return () => asTurnTool(createComputerTool(input.dependencies));
+  return () => adaptComputerTool(
+    createComputerTool(input.dependencies),
+    "computer",
+    input.dependencies.isUnicodeTypingEnabled?.() === true,
+    input.dependencies.autoReview?.mode === "enforce",
+  );
 }
 
 export function createTurnScreenshotToolFactory(
   input: TurnComputerToolFactoryInput,
 ): () => TurnTool {
-  return () => asTurnTool(createScreenshotTool(input.dependencies));
+  return () => adaptComputerTool(createScreenshotTool(input.dependencies), "screenshot");
 }
 
 export function createTurnBrowserToolFactory(
   input: TurnBrowserToolFactoryInput,
 ): () => readonly TurnTool[] {
-  return () => createSandBrowserTools(input.dependencies).map(asTurnTool);
+  return () => createSandBrowserTools(input.dependencies).map(adaptBrowserTool);
 }
 
 export function createTurnFileTransferToolFactory(

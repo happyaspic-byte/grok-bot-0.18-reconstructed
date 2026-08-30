@@ -20,12 +20,14 @@ import {
   RequestContext,
   RequestContextEnv,
 } from "../packages/proto/generated/agent/v1/request_context_exec_pb.js";
+import { ConversationStateStructure } from "../packages/proto/generated/agent/v1/agent_pb.js";
 import {
   SummarizationHandler,
   type SummarizationPromptSession,
 } from "../packages/agent-summarization/summarization-handler.js";
 import { getAgentBlobStore } from "./runner/sand-agent-runner.js";
 import type { AgentProfileForRunner } from "./runner/sand-agent-runner.js";
+import type { BlobStore } from "../packages/agent-kv/blob-store.js";
 import type {
   AutomationRecord,
   AutomationReview,
@@ -68,7 +70,10 @@ import {
   SAND_EXTERNAL_AWAIT_SHELL_TOOL_NAME,
   SAND_EXTERNAL_READ_TOOL_NAME,
 } from "./sand-activity.js";
-import { connectorCardEmissionToMessage } from "./runner/tools/box-help-tool.js";
+import {
+  connectorCardEmissionToMessage,
+  type BoxHelpOutcome,
+} from "./runner/tools/box-help-tool.js";
 import { createAgentPromptSession } from "./extensions/inference/extension.js";
 import { CONNECTOR_MANIFESTS } from "../shared/channels.js";
 import { parseStoredTrigger } from "./automations/automation-trigger.js";
@@ -92,6 +97,7 @@ import {
 } from "./runner/remote-box-resources.js";
 import { createStreamAttempt } from "./runner/stream-attempt.js";
 import {
+  createTurnDesktopSubagentConfigs,
   createTurnAgentRunStreamInput,
   createTurnAgentStreamStart,
   type TurnLocalResourceProjectionInput,
@@ -158,6 +164,7 @@ import type {
   SubagentManagementController,
 } from "./runner/tools/sand-subagent-management-tools.js";
 import type {
+  ComputerUseUsageSnapshot,
   SubagentSession,
   SubagentRunOptions,
 } from "./runner/subagent-runtime.js";
@@ -168,6 +175,16 @@ import type { CursorRule } from "../packages/proto/generated/agent/v1/cursor_rul
 
 export const DEFAULT_SAND_MODEL = "gpt-5.5-high-fast";
 export const SAND_SUMMARIZATION_MAX_PROMPT_CHARS = 2_800_000;
+// Leave the process-level shutdown watchdog enough time to close transcript
+// stores, extensions, the box daemon, and discovery after a stuck turn.
+export const PRODUCTION_RUNNER_SHUTDOWN_DRAIN_TIMEOUT_MS = 2_000;
+
+export function resolveProductionBrowserUseOffered(input: {
+  readonly experimentEnabled: boolean;
+  readonly localWorkspaceCapability: boolean;
+}): boolean {
+  return input.experimentEnabled || input.localWorkspaceCapability;
+}
 
 type DynamicApi = Record<string, any>;
 
@@ -247,6 +264,7 @@ export function createPerTurnResourceAccessor(
 }
 
 export interface ProductionSessionBoundRunner {
+  readonly currentRunGeneration?: number;
   readonly subagents: {
     readonly sessions: Map<string, SubagentSession>;
     isRunning(agentId: string): boolean;
@@ -260,10 +278,20 @@ export interface ProductionSessionBoundRunner {
   } | undefined;
   run(prompt: string, options?: SubagentRunOptions): Promise<unknown>;
   interrupt(reason: string): unknown;
+  beginShutdown?(reason: string): unknown;
+  interruptAll?(reason: string): unknown;
+  drainActiveRun?(): Promise<void>;
+  drainBackgroundSubagents?(): Promise<void>;
   getResolvedOutline(): Promise<readonly unknown[]>;
   getObservedToolCallCount(): number;
   getActivitySnapshot(): readonly string[];
   getTranscriptPath(): string | null;
+  getComputerUseUsageSnapshot?(): ComputerUseUsageSnapshot | undefined;
+  getComputerUseAuditActionCounts?(): ReadonlyMap<string, number>;
+  dispose?(): void | Promise<void>;
+  getBlobStore?(): BlobStore<unknown>;
+  getAgentConversationStateStructure?(): unknown;
+  setAgentConversationStateStructure?(structure: TurnCheckpoint): void;
   setAgentStore(agentStore: unknown, agentProfileProvider?: unknown): void;
   setMemoryStore(memoryStore: unknown): void;
   setUserMemory(userMemory: unknown): void;
@@ -279,6 +307,112 @@ export interface ProductionSessionBoundRunner {
   setAttachmentIngestor(ingest: unknown): void;
   setImagePersister(persistImage: unknown): void;
   setMediaBytesPersister(persistMediaBytes: unknown): void;
+}
+
+export interface ProductionSubagentRuntimeIdentity<
+  Runner extends ProductionSessionBoundRunner = ProductionSessionBoundRunner,
+> {
+  readonly agentId: string;
+  readonly boxId: string;
+  readonly subagentType: string;
+  readonly isComputerUseSubagent: boolean;
+  readonly isBrowserUseSubagent: boolean;
+  readonly getRunner: () => Runner | undefined;
+}
+
+/**
+ * The single production child construction boundary used by Task.  Keeping
+ * the production turn shell mandatory prevents a child from silently falling
+ * through SandAgentRunner's legacy no-runStep path.
+ */
+export function createProductionSubagentSession<
+  Runner extends ProductionSessionBoundRunner,
+>(input: {
+  readonly baseRunnerOptions: Readonly<Record<string, unknown>>;
+  readonly agentId: string;
+  readonly boxId: string;
+  readonly args: SubagentAdapterArgs;
+  readonly buildRunner: (options: Record<string, unknown>) => Runner;
+  readonly createProductionTurnRunShell: (
+    identity: ProductionSubagentRuntimeIdentity<Runner>,
+  ) => unknown;
+  readonly initializeRunner?: (runner: Runner) => void;
+  readonly bindRunner: (runner: Runner) => void;
+  readonly ownRunner: (runner: Runner) => void;
+}): SubagentSession {
+  let child: Runner | undefined;
+  const normalizedType = input.args.subagentType
+    .replace(/[-_ ]/g, "")
+    .toLowerCase();
+  const identity: ProductionSubagentRuntimeIdentity<Runner> = {
+    agentId: input.agentId,
+    boxId: input.boxId,
+    subagentType: input.args.subagentType,
+    isComputerUseSubagent: normalizedType === "computeruse",
+    isBrowserUseSubagent: normalizedType === "browseruse",
+    getRunner: () => child,
+  };
+  const productionTurnRunShell = input.createProductionTurnRunShell(identity);
+  if (productionTurnRunShell == null) {
+    throw new TypeError("production subagent turn shell is not bound");
+  }
+  child = input.buildRunner({
+    ...input.baseRunnerOptions,
+    conversationId: input.agentId,
+    transcriptId: input.agentId,
+    boxId: input.boxId,
+    getAgentId: () => input.agentId,
+    getBoxId: () => input.boxId,
+    transport: { onUpdate: () => {} },
+    onRunLifecycle: undefined,
+    isSubagent: true,
+    subagentType: input.args.subagentType,
+    initialState: {
+      turns: [],
+      summaryArchives: [],
+      turnTimings: [],
+    },
+    productionTurnRunShell,
+  });
+  try {
+    input.initializeRunner?.(child);
+    input.bindRunner(child);
+    input.ownRunner(child);
+  } catch (error) {
+    void Promise.resolve(child.dispose?.()).catch(() => {});
+    throw error;
+  }
+  return {
+    run: async (prompt, options) => {
+      const result = await child!.run(prompt, options);
+      if (typeof result !== "object" || result == null) {
+        throw new TypeError("production subagent result is not bound");
+      }
+      const text = Reflect.get(result, "text");
+      const aborted = Reflect.get(result, "aborted");
+      if (typeof text !== "string" || typeof aborted !== "boolean") {
+        throw new TypeError("production subagent result is not bound");
+      }
+      return { text, aborted };
+    },
+    interrupt: reason => { child!.interrupt(reason); },
+    getResolvedOutline: () => child!.getResolvedOutline(),
+    getObservedToolCallCount: () => child!.getObservedToolCallCount(),
+    getActivitySnapshot: () => child!.getActivitySnapshot(),
+    getTranscriptPath: () => child!.getTranscriptPath(),
+    ...(typeof child.getComputerUseUsageSnapshot !== "function"
+      ? {}
+      : {
+          getComputerUseUsageSnapshot: () =>
+            child!.getComputerUseUsageSnapshot!(),
+        }),
+    ...(typeof child.getComputerUseAuditActionCounts !== "function"
+      ? {}
+      : {
+          getComputerUseAuditActionCounts: () =>
+            child!.getComputerUseAuditActionCounts!(),
+        }),
+  };
 }
 
 export interface HostRunnerCompositionDependencies<Runner extends ProductionSessionBoundRunner = ProductionSessionBoundRunner> {
@@ -308,6 +442,8 @@ export interface HostRunnerCompositionDependencies<Runner extends ProductionSess
     }
   ): unknown;
   readonly mirrorPoolFactory?: () => TranscriptMirrorOffloadPool;
+  /** Test-overridable deadline for draining active children during shutdown. */
+  readonly productionRunnerShutdownDrainTimeoutMs?: number;
 }
 
 export interface RecoveredHostRunnerComposition<Runner extends ProductionSessionBoundRunner> {
@@ -776,13 +912,18 @@ function isRunnerSubagentOwner(value: unknown): value is RunnerSubagentOwner {
 
 function createRunnerSubagentManagement(
   value: unknown,
+  isShuttingDown: () => boolean = () => false,
 ): SubagentManagementController<unknown> | undefined {
   if (!isRunnerSubagentOwner(value)) return undefined;
   return {
     listRunningSubagents: () => value.listRunningSubagents(),
     getRunningSubagent: id => value.getRunningSubagent(id) ?? undefined,
-    steerSubagent: (id, message) => value.steerSubagent(id, message),
-    abortSubagent: id => value.abortSubagent(id),
+    steerSubagent: (id, message) => isShuttingDown()
+      ? "not-running"
+      : value.steerSubagent(id, message),
+    abortSubagent: id => isShuttingDown()
+      ? "not-running"
+      : value.abortSubagent(id),
   };
 }
 
@@ -836,7 +977,78 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
   const localToolPermission = extensions.api("local-tool-permission");
   const localToolPermissionSurfaces = new Map<string, () => void>();
   const ownedRunners = new Set<Runner>();
+  const ownedSubagentBoxReleases = new Map<string, () => void>();
+  const pendingSubagentBoxReleases = new Set<Promise<void>>();
+  const pendingSubagentDisposals = new Set<Promise<void>>();
+  const runnerDisposals = new WeakMap<Runner, Promise<void>>();
+  const shutdownDrainTimeoutMs =
+    deps.productionRunnerShutdownDrainTimeoutMs
+    ?? PRODUCTION_RUNNER_SHUTDOWN_DRAIN_TIMEOUT_MS;
+  if (!Number.isFinite(shutdownDrainTimeoutMs) || shutdownDrainTimeoutMs <= 0) {
+    throw new TypeError("Production runner shutdown drain timeout must be positive and finite");
+  }
   let mirrorOffloadPool: TranscriptMirrorOffloadPool | null = null;
+  let compositionDisposal: Promise<void> | undefined;
+  let compositionDisposalStarted = false;
+  let compositionShutdownDeadlineMs: number | undefined;
+
+  const disposeRunnerOnce = (runner: Runner): Promise<void> => {
+    const existing = runnerDisposals.get(runner);
+    if (existing !== undefined) return existing;
+    const disposal = Promise.resolve().then(async () => {
+      await runner.dispose?.();
+    });
+    runnerDisposals.set(runner, disposal);
+    return disposal;
+  };
+
+  const trackAnalyticsSafely = (
+    event: string,
+    properties: Readonly<Record<string, unknown>>,
+  ): void => {
+    try {
+      method(
+        extensions.api("telemetry").analytics as DynamicApi | undefined,
+        "trackEvent",
+      )?.(event, properties);
+    } catch {}
+  };
+
+  const waitForBoundedShutdownWork = async (
+    work: readonly PromiseLike<unknown>[],
+    timeoutEvent: string,
+    properties: Readonly<Record<string, unknown>>,
+  ): Promise<void> => {
+    if (work.length === 0) return;
+    // Attach rejection handlers even when the shared deadline is already
+    // exhausted; timed-out work may still settle after composition teardown.
+    const settled = Promise.allSettled(work);
+    const remainingMs = compositionShutdownDeadlineMs === undefined
+      ? shutdownDrainTimeoutMs
+      : Math.max(0, compositionShutdownDeadlineMs - Date.now());
+    if (remainingMs === 0) {
+      trackAnalyticsSafely(timeoutEvent, {
+        ...properties,
+        timeout_ms: shutdownDrainTimeoutMs,
+      });
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = await Promise.race([
+      settled.then(() => false),
+      new Promise<true>((resolve) => {
+        timer = setTimeout(() => resolve(true), remainingMs);
+        timer.unref?.();
+      }),
+    ]);
+    if (timer !== undefined) clearTimeout(timer);
+    if (timedOut) {
+      trackAnalyticsSafely(timeoutEvent, {
+        ...properties,
+        timeout_ms: shutdownDrainTimeoutMs,
+      });
+    }
+  };
 
   const getMirrorOffloadPool = () => {
     mirrorOffloadPool ??=
@@ -902,6 +1114,11 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
     hooks: HostRunnerHooks,
     overrides: HostRunnerOverrides = {}
   ): Runner {
+    if (compositionDisposalStarted) {
+      throw new Error("Host runner composition is shutting down");
+    }
+    const ownedSubagentRunners = new Map<string, Runner>();
+    const releasedProductionSubagentBoxIds = new Set<string>();
     const isSharedRoomTurn = overrides.isSharedRoomTurn === true;
     const localExec = extensions.api("local-exec");
     const attachments = extensions.api("attachments");
@@ -916,6 +1133,82 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
     const cloudAgents = extensions.api("cloud-agents");
     const foreverBox = extensions.api("forever-box");
     const remoteBox = foreverBox.box as DynamicApi;
+    const releaseProductionSubagentBox = (agentId: string): void => {
+      if (releasedProductionSubagentBoxIds.has(agentId)) return;
+      releasedProductionSubagentBoxIds.add(agentId);
+      ownedSubagentBoxReleases.delete(agentId);
+      const releaseAgent = method(foreverBox, "releaseAgent");
+      if (releaseAgent === undefined) return;
+      const remainingMs = compositionShutdownDeadlineMs === undefined
+        ? shutdownDrainTimeoutMs
+        : Math.max(0, compositionShutdownDeadlineMs - Date.now());
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const release = (async (): Promise<void> => {
+        try {
+          await Promise.race([
+            Promise.resolve().then(() => releaseAgent(agentId)),
+            new Promise<never>((_resolve, reject) => {
+              timer = setTimeout(
+                () => reject(new Error("subagent box release timed out")),
+                remainingMs,
+              );
+              timer.unref?.();
+            }),
+          ]);
+        } catch (error) {
+          trackAnalyticsSafely(
+            "sand.subagent_box_release_failed",
+            {
+              agent_id: agentId,
+              error_class: error instanceof Error ? error.name : typeof error,
+            },
+          );
+        } finally {
+          if (timer !== undefined) clearTimeout(timer);
+        }
+      })();
+      pendingSubagentBoxReleases.add(release);
+      void release.finally(() => pendingSubagentBoxReleases.delete(release));
+    };
+    const releaseOwnedProductionSubagent = (agentId: string): void => {
+      const child = ownedSubagentRunners.get(agentId);
+      if (child !== undefined) {
+        ownedSubagentRunners.delete(agentId);
+        ownedRunners.delete(child);
+        const disposal = disposeRunnerOnce(child);
+        pendingSubagentDisposals.add(disposal);
+        void disposal
+          .catch(error => {
+            trackAnalyticsSafely(
+              "sand.subagent_runner_dispose_failed",
+              {
+                agent_id: agentId,
+                error_class: error instanceof Error ? error.name : typeof error,
+              },
+            );
+          })
+          .finally(() => pendingSubagentDisposals.delete(disposal));
+      }
+      releaseProductionSubagentBox(agentId);
+    };
+    const isBrowserUseOffered = (): boolean =>
+      resolveProductionBrowserUseOffered({
+        experimentEnabled:
+          method(experiments, "isBrowserUseSubagentEnabled")?.() === true,
+        localWorkspaceCapability:
+          method(settings, "isLocalWorkspaceBrowserUseEnabled")?.() === true,
+      });
+    // HostBox availability is asynchronous in production. Resolve it at the
+    // owner boundary before prompt/tool composition, then expose the settled
+    // value to the synchronous prompt and tool projections for that turn.
+    let remoteBoxAvailable = false;
+    const refreshRemoteBoxAvailable = async (): Promise<boolean> => {
+      const availability = method(remoteBox, "isAvailable")?.();
+      remoteBoxAvailable = availability === undefined
+        ? true
+        : await Promise.resolve(availability) === true;
+      return remoteBoxAvailable;
+    };
     const transcriptsDir = method(sessionApi, "transcriptsDir")?.() ??
       dirname(dirname(session.dbPath));
 
@@ -994,13 +1287,21 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
     const createTurnToolProjections =
       autoReviewGate == null
         ? undefined
-        : (input: ProductionTurnToolInputs): ProductionTurnHostToolProjections => {
+        : (
+          input: ProductionTurnToolInputs,
+          toolIdentity: {
+            readonly agentId: string;
+            readonly boxId: string;
+          } = { agentId: session.id, boxId: session.id },
+        ): ProductionTurnHostToolProjections => {
+          const toolAgentId = toolIdentity.agentId;
+          const toolBoxId = toolIdentity.boxId;
           const shell = createHostShellExecutor({
             resourceAccessor: input.resourceAccessor,
             assertNoPendingApproval: autoReviewGate.assertNoPendingApproval,
             auditShellCommand: command => {
               method(actionAuditor as DynamicApi, "record")?.({
-                agentId: session.id,
+                agentId: toolAgentId,
                 occurredAtMs: Date.now(),
                 action: {
                   kind: "shellCommand",
@@ -1018,10 +1319,10 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
               resourceAccessor: input.resourceAccessor,
               autoReview: {
                 mode: projectionAutoReviewModes.computer,
-                agentId: session.id,
+                agentId: toolAgentId,
                 boxIdentity: {
-                  boxId: session.id,
-                  windowGeneration: `${autoReviewController?.hostGeneration ?? "host"}:${session.id}`,
+                  boxId: toolBoxId,
+                  windowGeneration: `${autoReviewController?.hostGeneration ?? "host"}:${toolBoxId}:${toolAgentId}`,
                 },
                 ...(autoReviewController === undefined
                   ? {}
@@ -1031,8 +1332,8 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
                 getApprovalExpiryPolicy: () =>
                   sandAutoReviewApprovalExpiryPolicy("turn"),
                 resolveDisplayNumber: async (context: unknown) => {
-                  await method(remoteBox, "ensureReady")?.(context, session.id);
-                  const windowIndex = boxAgentWindowIndex(remoteBox as any, session.id);
+                  await method(remoteBox, "ensureReady")?.(context, toolAgentId);
+                  const windowIndex = boxAgentWindowIndex(remoteBox as any, toolAgentId);
                   return windowIndex ?? (boxSupportsMultiWindow(remoteBox as any) ? undefined : 1);
                 },
                 ...(userAutoRunInstructions === undefined
@@ -1047,7 +1348,7 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
               onComputerAction: action => {
                 deps.emitGatewayEvent({
                   channel: "computer-action",
-                  payload: { agentId: session.id, ...action },
+                  payload: { agentId: toolAgentId, ...action },
                 });
               },
             }),
@@ -1062,15 +1363,16 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
             createBrowserDriverDependencies: () => createHostBrowserDriverDependencies({
               resourceAccessor: input.resourceAccessor,
               box: remoteBox as unknown as HostBrowserBoxOwner<unknown>,
-              getBoxId: () => session.id,
-              getDefaultViewId: () => session.id,
+              getBoxId: () => toolBoxId,
+              getWindowAgentId: () => toolAgentId,
+              getDefaultViewId: () => toolAgentId,
               executeShell: shell,
               autoReview: {
                 mode: projectionAutoReviewModes.computer,
-                agentId: session.id,
+                agentId: toolAgentId,
                 boxIdentity: {
-                  boxId: session.id,
-                  windowGeneration: `${autoReviewController?.hostGeneration ?? "host"}:${session.id}`,
+                  boxId: toolBoxId,
+                  windowGeneration: `${autoReviewController?.hostGeneration ?? "host"}:${toolBoxId}:${toolAgentId}`,
                 },
                 ...(autoReviewController === undefined
                   ? {}
@@ -1080,8 +1382,8 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
                 getApprovalExpiryPolicy: () =>
                   sandAutoReviewApprovalExpiryPolicy("turn"),
                 resolveDisplayNumber: async (context: unknown) => {
-                  await method(remoteBox, "ensureReady")?.(context, session.id);
-                  const windowIndex = boxAgentWindowIndex(remoteBox as any, session.id);
+                  await method(remoteBox, "ensureReady")?.(context, toolAgentId);
+                  const windowIndex = boxAgentWindowIndex(remoteBox as any, toolAgentId);
                   return windowIndex ?? (boxSupportsMultiWindow(remoteBox as any) ? undefined : 1);
                 },
                 ...(userAutoRunInstructions === undefined
@@ -1254,13 +1556,24 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
       : undefined;
     const readVideoAttachmentBytes = method(attachments, "readVideoBytes");
     const mcpCustomInstructions = method(mcp.mcp, "getCustomInstructions");
-    let shellWatchWatermark:
-      | { readonly turnCount: number; readonly boundaryRef: Uint8Array; readonly lastUserMessageId?: string; readonly hasUserTurn: boolean }
-      | undefined;
-    const productionPromptGlue = productionContext === undefined
-      || productionRequestContext === undefined
-      ? undefined
-      : (() => {
+    type ProductionPromptIdentity = {
+      readonly agentId: string;
+      readonly boxId: string;
+      readonly isSubagentRunner: boolean;
+      readonly isComputerUseSubagent: boolean;
+      readonly isBrowserUseSubagent: boolean;
+      readonly getRunner: () => Runner | undefined;
+    };
+    const createProductionPromptGlueFor = (
+      identity: ProductionPromptIdentity,
+    ): ReturnType<typeof createRunnerPromptGlue> | undefined => {
+      if (productionContext === undefined || productionRequestContext === undefined) {
+        return undefined;
+      }
+      let shellWatchWatermark:
+        | { readonly turnCount: number; readonly boundaryRef: Uint8Array; readonly lastUserMessageId?: string; readonly hasUserTurn: boolean }
+        | undefined;
+      return (() => {
         const box = asTransferBox(localExec.box);
         const remoteBoxForPrompt = asCapableTransferBox(remoteBox);
         const userComputers = asPromptUserComputers(localExec.userComputers);
@@ -1277,22 +1590,23 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           remoteBox: remoteBoxForPrompt,
           userComputers,
           remoteBoxHasDesktop: true,
-          isSubagentRunner: false,
-          isComputerUseSubagent: false,
-          isBrowserUseSubagent: false,
+          isSubagentRunner: identity.isSubagentRunner,
+          isComputerUseSubagent: identity.isComputerUseSubagent,
+          isBrowserUseSubagent: identity.isBrowserUseSubagent,
           requestContext: productionRequestContext,
-          ...(typeof hooks.agentProfileProvider === "function"
+          ...(!identity.isSubagentRunner && typeof hooks.agentProfileProvider === "function"
             ? { agentProfileProvider: () => hooks.agentProfileProvider?.() ?? { name: "", description: "" } }
             : {}),
           ...(readVideoAttachment === undefined
             ? {}
             : { readVideoAttachmentBytes: readVideoAttachment }),
+          isBrowserUseSubagentEnabled: isBrowserUseOffered,
           isSpotlightEnabled: () => method(experiments, "isSpotlightEnabled")?.() ?? false,
           uploadAttachmentsIntoBox: async paths =>
-            new Map(await method(attachments, "stageIntoBox")?.(session.id, paths) ?? []),
-          getRemoteBoxAvailable: () => method(remoteBox, "isAvailable")?.() !== false,
-          getConversationId: () => session.id,
-          resolveBoxId: () => session.id,
+            new Map(await method(attachments, "stageIntoBox")?.(identity.boxId, paths) ?? []),
+          getRemoteBoxAvailable: () => remoteBoxAvailable,
+          getConversationId: () => identity.agentId,
+          resolveBoxId: () => identity.boxId,
           ...(mcpCustomInstructions === undefined
             ? {}
             : { mcp: { getCustomInstructions: async (_context: Context) => await mcpCustomInstructions() } }),
@@ -1300,25 +1614,35 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           mcpCustomInstructionsForTurn: () => new Map(),
           isMcpDiscoveryUnavailableForTurn: () => false,
           shellWatchHost: () => {
-            const store = session.agentStore;
+            const runner = identity.getRunner() as {
+              getAgentConversationStateStructure?: () => unknown;
+              getBlobStore?: () => BlobStore<unknown>;
+            } | undefined;
+            const store = !identity.isSubagentRunner ? session.agentStore : undefined;
+            const getConversationState = typeof runner?.getAgentConversationStateStructure === "function"
+              ? () => runner.getAgentConversationStateStructure!()
+              : (store != null && typeof store.getConversationStateStructure === "function"
+                ? () => store.getConversationStateStructure()
+                : undefined);
+            const getBlobStoreForRunner = typeof runner?.getBlobStore === "function"
+              ? () => runner.getBlobStore!()
+              : (store != null && typeof store.getBlobStore === "function"
+                ? () => getAgentBlobStore(store as Parameters<typeof getAgentBlobStore>[0])
+                : undefined);
             if (
-              store == null
-              || typeof store.getConversationStateStructure !== "function"
-              || typeof store.getBlobStore !== "function"
+              getConversationState === undefined
+              || getBlobStoreForRunner === undefined
             ) throw new TypeError("production prompt state store is not bound");
-            const blobStore = getAgentBlobStore(
-              store as Parameters<typeof getAgentBlobStore>[0],
-            );
             const generated = createShellWatchGeneratedStateProjection({
-              getConversationState: () => store.getConversationStateStructure(),
-              getBlobStore: () => blobStore,
+              getConversationState,
+              getBlobStore: getBlobStoreForRunner,
             });
             const shellHost: ShellTerminalWatchHost<Context> = {
               ctx: productionContext,
               ...generated,
-              getConversationId: () => session.id,
-              ensureBoxReady: async (pollContext, agentId) => {
-                const connection = await remoteBox.ensureReady(pollContext, agentId);
+              getConversationId: () => identity.agentId,
+              ensureBoxReady: async (pollContext, windowAgentId) => {
+                const connection = await remoteBox.ensureReady(pollContext, windowAgentId);
                 return {
                   terminalsFolder: method(remoteBox, "getTerminalsFolder")?.() ?? "",
                   remoteAccessor: createShellWatchReadAccessor(connection.remoteAccessor),
@@ -1333,17 +1657,23 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           },
         });
       })();
-    const productionSystemPromptAssembly = productionContext === undefined
-      || productionRequestContext === undefined
-      ? undefined
-      : createSystemPromptAssembly({
+    };
+    const createProductionSystemPromptAssemblyFor = (
+      identity: ProductionPromptIdentity,
+      promptGlue: ReturnType<typeof createRunnerPromptGlue>,
+    ): ReturnType<typeof createSystemPromptAssembly> | undefined =>
+      productionContext === undefined || productionRequestContext === undefined
+        ? undefined
+        : createSystemPromptAssembly({
           basePrompt: typeof overrides.systemPrompt === "string"
             ? overrides.systemPrompt
             : DEFAULT_SAND_SYSTEM_PROMPT,
-          isSubagentRunner: false,
-          isSharedRoomRunner: isSharedRoomTurn,
+          isSubagentRunner: identity.isSubagentRunner,
+          isSharedRoomRunner: !identity.isSubagentRunner && isSharedRoomTurn,
           isSystemPromptOverridden: typeof overrides.systemPrompt === "string",
-          agentProfileProvider: () => hooks.agentProfileProvider?.() ?? null,
+          agentProfileProvider: () => identity.isSubagentRunner
+            ? null
+            : hooks.agentProfileProvider?.() ?? null,
           agentStore: () => {
             const store = session.agentStore;
             return store != null && typeof store.getMetadata === "function"
@@ -1355,7 +1685,8 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           memorySnapshots: () => null,
           userMemory: () => null,
           projectMemory: () => null,
-          isBoxScopedSubagent: () => false,
+          isBoxScopedSubagent: () =>
+            identity.isComputerUseSubagent || identity.isBrowserUseSubagent,
           requestContext: {
             resolve: () => {
               const resolved = productionRequestContext.resolve();
@@ -1381,11 +1712,23 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           mcpManagement: () => mcp.management,
           isMcpMultiAccountEnabled: () => method(experiments, "isMcpMultiAccountEnabled")?.() ?? false,
           isCloudAgentsDisabledByTeam: () => method(experiments, "isCloudAgentsDisabledByTeam")?.() ?? false,
-          mcpCustomInstructionsSection: () => productionPromptGlue?.getMcpCustomInstructionsSection() ?? null,
-          mcpDiscoveryStatusSection: () => productionPromptGlue?.getMcpDiscoveryStatusSection() ?? null,
-          remoteBoxSection: () => productionPromptGlue?.getRemoteBoxSection() ?? "",
-          computerSection: () => productionPromptGlue?.getComputerSection() ?? null,
+          mcpCustomInstructionsSection: () => promptGlue.getMcpCustomInstructionsSection(),
+          mcpDiscoveryStatusSection: () => promptGlue.getMcpDiscoveryStatusSection(),
+          remoteBoxSection: () => promptGlue.getRemoteBoxSection(),
+          computerSection: () => promptGlue.getComputerSection(),
         });
+    const rootPromptIdentity: ProductionPromptIdentity = {
+      agentId: session.id,
+      boxId: session.id,
+      isSubagentRunner: false,
+      isComputerUseSubagent: false,
+      isBrowserUseSubagent: false,
+      getRunner: () => builtRunner,
+    };
+    const productionPromptGlue = createProductionPromptGlueFor(rootPromptIdentity);
+    const productionSystemPromptAssembly = productionPromptGlue === undefined
+      ? undefined
+      : createProductionSystemPromptAssemblyFor(rootPromptIdentity, productionPromptGlue);
 
     const runnerOptions: Record<string, unknown> = {
       inference: extensions.api("inference").port,
@@ -1409,6 +1752,7 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
         requestHelp: (request: unknown) =>
           method(extensions.api("session"), "startHandoff")?.(request)
       },
+      freeComputerUseWindow: releaseOwnedProductionSubagent,
       transport: hooks.transport,
       onRunLifecycle: hooks.onRunLifecycle,
       isSharedRoomTurn,
@@ -1456,8 +1800,7 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
         method(experiments, "isSendMessageDeliveryOwedEnabled")?.() ?? false,
       isDynamicToolsEnabled: () =>
         method(experiments, "isDynamicToolsEnabled")?.() ?? false,
-      isBrowserUseSubagentEnabled: () =>
-        method(experiments, "isBrowserUseSubagentEnabled")?.() ?? false,
+      isBrowserUseSubagentEnabled: isBrowserUseOffered,
       isSpotlightEnabled: () =>
         method(experiments, "isSpotlightEnabled")?.() ?? false,
       isMcpMultiAccountEnabled: () =>
@@ -1519,15 +1862,18 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
       options,
     );
 
-    const baseProductionResourceAccessor = createPerTurnResourceAccessor(
-      remoteBox as unknown as ProductionBoxResourceOwner,
-      session.id,
-    );
-    const productionResourceAccessor = async (
-      context: unknown,
-    ): Promise<ProductionResourceAccessor> => {
+    const createProductionResourceAccessorFor = (
+      agentId: string,
+      boxId: string,
+      getRunner: () => Runner | undefined,
+    ) => {
+      const baseProductionResourceAccessor = createPerTurnResourceAccessor(
+        remoteBox as unknown as ProductionBoxResourceOwner,
+        agentId,
+      );
+      return async (context: unknown): Promise<ProductionResourceAccessor> => {
       const owner = asRemoteBoxResourceOwner(remoteBox);
-      const runner = builtRunner as {
+      const runner = getRunner() as {
         readonly computerUse?: RemoteBoxResourceHost["computerUse"];
         setRemoteBoxTerminalsFolder?(folder: string): void;
         probeNavigationAfterComputerUse?(
@@ -1559,8 +1905,9 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
       const accessor = createRemoteBoxResourceAccessor({
         remoteBox: owner,
         remoteBoxHasDesktop: true,
-        resolveBoxId: () => session.id,
-        getConversationId: () => session.id,
+        resolveBoxId: () => boxId,
+        resolveWindowAgentId: () => agentId,
+        getConversationId: () => agentId,
         setRemoteBoxTerminalsFolder: folder => runner.setRemoteBoxTerminalsFolder?.(folder),
         autoReviewGate: remoteAutoReviewGate,
         auditShellCommand: (_agentId, kind, command, _target, attribution) =>
@@ -1573,7 +1920,13 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           : { autoReviewClassifierExecutor: autoReview.autoReviewClassifierExecutor }),
       });
       return asProductionResourceAccessor(accessor);
+      };
     };
+    const productionResourceAccessor = createProductionResourceAccessorFor(
+      session.id,
+      session.id,
+      () => builtRunner,
+    );
     const localProductionResourceAccessor = createPerTurnResourceAccessor(
       localExec.box as ProductionBoxResourceOwner,
       session.id,
@@ -1953,7 +2306,10 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
             ...(onListenerRoutineSaved === undefined ? {} : { onListenerRoutineSaved }),
           };
 
-      const subagentManagement = createRunnerSubagentManagement(builtRunner);
+      const subagentManagement = createRunnerSubagentManagement(
+        builtRunner,
+        () => compositionDisposalStarted,
+      );
       const projectedActionAuditor = asActionAuditor(actionAuditor);
       const autoReviewProjection: ProductionTurnAutoReviewHostProjection | undefined =
         autoReviewController === undefined || autoReviewGate === undefined
@@ -2021,10 +2377,101 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
     const createTurnToolsetFactoryProvider = (
       dependencies: ProductionTurnHostDependencies,
       turnInputs?: ProductionTurnToolInputs,
+      toolIdentity: {
+        readonly agentId: string;
+        readonly boxId: string;
+        readonly promptGlue?: ReturnType<typeof createRunnerPromptGlue>;
+      } = { agentId: session.id, boxId: session.id, ...(productionPromptGlue === undefined ? {} : { promptGlue: productionPromptGlue }) },
     ): TurnToolsetHostFactoryProvider => {
       const cloudAgent = dependencies.cloudAgent;
       const mcpManagement = dependencies.mcpManagement;
+      const remoteToolProps = (
+        turn: TurnToolsetTurnInput,
+        props: ProductionTurnToolInputs,
+      ): ProductionTurnToolInputs => ({
+        ...props,
+        resourceAccessor:
+          turn.remoteBoxResourceAccessor ?? props.resourceAccessor,
+      });
       const provider: TurnToolsetHostFactoryProvider = {
+      ...(createTurnToolProjections === undefined
+        ? {}
+        : {
+            createComputerToolInputs: (turn, props) => {
+              const projected = remoteToolProps(turn, props);
+              const createDependencies = createTurnToolProjections(
+                projected,
+                toolIdentity,
+              ).createComputerToolDependencies;
+              if (createDependencies === undefined) {
+                throw new TypeError("computer tool dependencies are not bound");
+              }
+              return { dependencies: createDependencies(projected) };
+            },
+            createScreenshotToolInputs: (turn, props) => {
+              const projected = remoteToolProps(turn, props);
+              const createDependencies = createTurnToolProjections(
+                projected,
+                toolIdentity,
+              ).createScreenshotToolDependencies;
+              if (createDependencies === undefined) {
+                throw new TypeError("screenshot tool dependencies are not bound");
+              }
+              return { dependencies: createDependencies(projected) };
+            },
+            createBrowserToolInputs: (turn, props) => {
+              const projected = remoteToolProps(turn, props);
+              const createDependencies = createTurnToolProjections(
+                projected,
+                toolIdentity,
+              ).createBrowserDriverDependencies;
+              if (createDependencies === undefined) {
+                throw new TypeError("browser tool dependencies are not bound");
+              }
+              return { dependencies: createDependencies(projected) };
+            },
+          }),
+      ...(toolIdentity.promptGlue === undefined
+        ? {}
+        : {
+            createFileTransferToolInputs: () => ({
+              controller: toolIdentity.promptGlue!.createFileTransferController(),
+            }),
+          }),
+      createRequestBoxHelpToolInputs: turn => {
+        if (turn.endThisRunAwaitingUser === undefined) {
+          throw new TypeError("box handoff turn control is not bound");
+        }
+        const startHandoff = method(sessionApi, "startHandoff");
+        if (startHandoff === undefined) {
+          throw new TypeError("box handoff service is not bound");
+        }
+        return {
+          dependencies: {
+            getAgentId: () => toolIdentity.agentId,
+            endTurn: () => turn.endThisRunAwaitingUser!("awaiting box handoff"),
+            requestHelp: async request => {
+              const outcome = await startHandoff(request) as BoxHelpOutcome;
+              if (
+                typeof outcome !== "object"
+                || outcome == null
+                || (outcome.kind !== "started" && outcome.kind !== "already-pending")
+                || typeof outcome.requestId !== "string"
+              ) {
+                throw new TypeError("box handoff result is not bound");
+              }
+              return outcome;
+            },
+            onSendMessage: (message, timestampMs) => {
+              hooks.transport.onUpdate({
+                type: "send-message",
+                message,
+                timestampMs,
+              });
+            },
+          },
+        };
+      },
       createSendMessageToolInputs: turn => ({
         dependencies: turn.emitUpdate === undefined
           ? dependencies.sendMessage
@@ -2220,8 +2667,20 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
       };
     };
 
-    const createProductionTurnSettleHost = (): TurnSettleHost => {
-      const runner = builtRunner as {
+    const createProductionTurnSettleHost = (identity: {
+      readonly agentId: string;
+      readonly isSubagentRunner: boolean;
+      readonly getRunner: () => Runner | undefined;
+      readonly promptAssembly?: ReturnType<typeof createSystemPromptAssembly>;
+    } = {
+      agentId: session.id,
+      isSubagentRunner: false,
+      getRunner: () => builtRunner,
+      ...(productionSystemPromptAssembly === undefined
+        ? {}
+        : { promptAssembly: productionSystemPromptAssembly }),
+    }): TurnSettleHost => {
+      const runner = identity.getRunner() as {
         readonly isSubagentRunner?: boolean;
         getBlobStore?: () => unknown;
         getConversationStateStructure?: () => unknown;
@@ -2229,27 +2688,30 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
         currentRunGeneration?: number;
         setAgentConversationStateStructure?: (structure: TurnCheckpoint) => void;
       } | undefined;
-      const store = session.agentStore;
+      const store = identity.isSubagentRunner ? null : session.agentStore;
       if (
-        store == null
-        || typeof store.handleCheckpoint !== "function"
-        || typeof store.getMetadata !== "function"
+        !identity.isSubagentRunner
+        && (store == null
+          || typeof store.handleCheckpoint !== "function"
+          || typeof store.getMetadata !== "function")
       ) throw new TypeError("production Agent checkpoint store is not bound");
       const generation = runner?.currentRunGeneration;
       return {
-        isSubagentRunner: isSharedRoomTurn,
-        ...(transcriptMirrorForTurn === undefined
+        isSubagentRunner: identity.isSubagentRunner || isSharedRoomTurn,
+        ...(identity.isSubagentRunner || transcriptMirrorForTurn === undefined
           ? {}
           : { transcriptMirror: transcriptMirrorForTurn }),
-        getTranscriptId: () => session.id,
-        getBlobStore: () => runner?.getBlobStore?.() ?? getAgentBlobStore(
-          store as Parameters<typeof getAgentBlobStore>[0],
-        ),
-        agentStore: () => ({
-          handleCheckpoint: (context: unknown, checkpoint: unknown) =>
-            store.handleCheckpoint(context, checkpoint),
-          getMetadata: (key: string) => store.getMetadata(key),
-        }),
+        getTranscriptId: () => identity.agentId,
+        getBlobStore: () => runner?.getBlobStore?.() ?? (store == null
+          ? undefined
+          : getAgentBlobStore(store as Parameters<typeof getAgentBlobStore>[0])),
+        agentStore: () => store == null
+          ? null
+          : ({
+              handleCheckpoint: (context: unknown, checkpoint: unknown) =>
+                store.handleCheckpoint(context, checkpoint),
+              getMetadata: (key: string) => store.getMetadata(key),
+            }),
         setLocalState: checkpoint => {
           if (typeof runner?.setAgentConversationStateStructure !== "function") {
             throw new TypeError("production Agent local checkpoint store is not bound");
@@ -2262,12 +2724,12 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           && runner?.currentRunGeneration !== undefined
           && runner.currentRunGeneration !== generation,
         latestPromptMessages: () => runner?.getLatestPromptMessages?.() ?? [],
-        persistAnnouncedAgentProfile: (snapshots, snapshot, identity) => {
+        persistAnnouncedAgentProfile: (snapshots, snapshot, profileIdentity) => {
           const profilePromptSnapshotStore = asPromptSnapshotStore(snapshots);
-          productionSystemPromptAssembly?.persistAnnouncedAgentProfile(
+          identity.promptAssembly?.persistAnnouncedAgentProfile(
             profilePromptSnapshotStore,
             snapshot,
-            identity,
+            profileIdentity,
           );
         },
       };
@@ -2300,23 +2762,54 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
         cloudAgent: "off",
         subagentLaunch: "off",
       };
-      const baseTurn: TurnToolsetTurnInput = {
-        autoReviewModes,
-        subagentConfigs: [],
-      };
+      const baseTurn: TurnToolsetTurnInput = { autoReviewModes };
       const staticModelId = process.env.SAND_AGENT_MODEL ?? DEFAULT_SAND_MODEL;
-      const lazyToolHost = () => createProductionTurnToolsetHost({
-        turn: baseTurn,
-        factoryProvider: createTurnToolsetFactoryProvider(hostDependencies()),
-        isSubagentRunner: false,
-        isSharedRoomRunner: isSharedRoomTurn,
-        isBoxScopedSubagent: false,
-        isComputerUseSubagent: false,
-        isBrowserUseSubagent: false,
+      type ProductionTurnRunnerIdentity = ProductionPromptIdentity & {
+        readonly promptGlue: ReturnType<typeof createRunnerPromptGlue>;
+        readonly promptAssembly?: ReturnType<typeof createSystemPromptAssembly>;
+      };
+      const getProductionConversationState = (
+        identity: ProductionTurnRunnerIdentity,
+      ) => {
+        const store = identity.isSubagentRunner ? null : session.agentStore;
+        if (
+          store != null
+          && typeof store.getConversationStateStructure === "function"
+        ) {
+          return store.getConversationStateStructure();
+        }
+        const runner = identity.getRunner() as {
+          getAgentConversationStateStructure?: () => unknown;
+        } | undefined;
+        if (typeof runner?.getAgentConversationStateStructure === "function") {
+          return runner.getAgentConversationStateStructure();
+        }
+        throw new TypeError("production Agent conversation state is not bound");
+      };
+      const lazyToolHost = (
+        identity: ProductionTurnRunnerIdentity,
+        turn: TurnToolsetTurnInput,
+      ) => createProductionTurnToolsetHost({
+        turn,
+        factoryProvider: createTurnToolsetFactoryProvider(
+          hostDependencies(),
+          undefined,
+          {
+            agentId: identity.agentId,
+            boxId: identity.boxId,
+            promptGlue: identity.promptGlue,
+          },
+        ),
+        isSubagentRunner: identity.isSubagentRunner,
+        isSharedRoomRunner: !identity.isSubagentRunner && isSharedRoomTurn,
+        isBoxScopedSubagent:
+          identity.isComputerUseSubagent || identity.isBrowserUseSubagent,
+        isComputerUseSubagent: identity.isComputerUseSubagent,
+        isBrowserUseSubagent: identity.isBrowserUseSubagent,
         isSystemPromptOverridden: typeof overrides.systemPrompt === "string",
         remoteBoxHasDesktop: true,
-        getConversationId: () => session.id,
-        getRemoteBoxAvailable: () => method(remoteBox, "isAvailable")?.() !== false,
+        getConversationId: () => identity.agentId,
+        getRemoteBoxAvailable: () => remoteBoxAvailable,
         cloudAgentsDisabledByTeam: () => method(experiments, "isCloudAgentsDisabledByTeam")?.() ?? false,
         spotlightEnabled: () => method(experiments, "isSpotlightEnabled")?.() ?? false,
         isDynamicToolsEnabled: () => method(experiments, "isDynamicToolsEnabled")?.() ?? false,
@@ -2326,22 +2819,29 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           ? {}
           : { localToolPermission: projectedLocalToolPermission }),
       });
-      const getProductionConversationState = () => {
-        const runner = builtRunner as {
-          getAgentConversationStateStructure?: () => unknown;
-        } | undefined;
-        if (typeof runner?.getAgentConversationStateStructure === "function") {
-          return runner.getAgentConversationStateStructure();
-        }
-        const store = session.agentStore;
-        if (store != null && typeof store.getConversationStateStructure === "function") {
-          return store.getConversationStateStructure();
-        }
-        throw new TypeError("production Agent conversation state is not bound");
-      };
-      runnerOptions.productionTurnRunShell = createProductionTurnRunShellHostInput({
-        createAgentOwnerInput: ({ requestId, runOptions, context, cancelThisRun, emitUpdate }) => {
-          if (session.agentStore == null || typeof session.agentStore.getBlobStore !== "function") {
+      const createProductionTurnRunShellFor = (
+        identity: ProductionTurnRunnerIdentity,
+      ) => createProductionTurnRunShellHostInput({
+        createAgentOwnerInput: async ({
+          requestId,
+          runOptions,
+          context,
+          cancelThisRun,
+          endThisRunAwaitingUser,
+          onProfileUpdateAppended,
+          emitUpdate,
+        }) => {
+          if (compositionDisposalStarted) {
+            throw new Error("Host runner composition is shutting down");
+          }
+          const runner = identity.getRunner();
+          const rootStore = session.agentStore;
+          if (
+            runner === undefined
+            || typeof runner.getBlobStore !== "function"
+            || (!identity.isSubagentRunner
+              && (rootStore == null || typeof rootStore.getBlobStore !== "function"))
+          ) {
             throw new TypeError("production Agent blob store is not bound");
           }
           const liveAutoReviewModes = turnAutoReviewGate.currentModes();
@@ -2359,7 +2859,7 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
             ? undefined
             : {
                 mode,
-                agentId: session.id,
+                agentId: identity.agentId,
                 surface,
                 requestContext: autoReviewRequestContext,
                 ...(autoReviewController === undefined
@@ -2391,10 +2891,22 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
             "isolated_box",
             "box_shell",
           );
+          const isRemoteBoxAvailable = await refreshRemoteBoxAvailable();
+          if (compositionDisposalStarted) {
+            throw new Error("Host runner composition is shutting down");
+          }
           const turn: TurnToolsetTurnInput = {
             ...baseTurn,
+            ...(identity.isSubagentRunner
+              ? {}
+              : {
+                  subagentConfigs: !isRemoteBoxAvailable
+                    ? []
+                    : createTurnDesktopSubagentConfigs(isBrowserUseOffered()),
+                }),
             emitUpdate,
             cancelThisRun,
+            endThisRunAwaitingUser,
             ...(runOptions.ackToken === undefined
               ? {}
               : { ackToken: runOptions.ackToken }),
@@ -2413,24 +2925,45 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           };
           return {
             context,
-            conversationId: session.id,
+            conversationId: identity.agentId,
             requestId,
             inference: createTypedInferenceOwner(extensions.api("inference").port),
-            onRequestId: requestIdForwarder(hooks, "agent"),
-            isSubagentRunner: false,
+            // A background child owns an independent inference lifecycle.
+            // Never forward its provider request IDs into the root transport,
+            // where they would overwrite the active root turn identity.
+            onRequestId: identity.isSubagentRunner
+              ? () => {}
+              : requestIdForwarder(hooks, "agent"),
+            isSubagentRunner: identity.isSubagentRunner,
+            isComputerUseSubagent: identity.isComputerUseSubagent,
+            isBrowserUseSubagent: identity.isBrowserUseSubagent,
             isSilenceAllowed: runOptions.isSilenceAllowed === true,
+            ...(identity.promptAssembly === undefined
+              ? {}
+              : { systemPromptAssembly: identity.promptAssembly }),
+            onProfileUpdateAppended,
             ...(runOptions.ackToken === undefined
               ? {}
               : { ackToken: runOptions.ackToken }),
             canUseSelfSummary: () => true,
             cancelThisRun: reason => {
-              const runner = builtRunner as { interrupt?: (value: string) => boolean } | undefined;
-              runner?.interrupt?.(reason.reason);
+              const current = identity.getRunner() as {
+                interrupt?: (value: string) => boolean;
+              } | undefined;
+              current?.interrupt?.(reason.reason);
             },
-            createResourceAccessor: localProductionResourceAccessor,
-            createRemoteBoxResourceAccessor: productionResourceAccessor,
+            endThisRunAwaitingUser,
+            createResourceAccessor: createPerTurnResourceAccessor(
+              localExec.box as ProductionBoxResourceOwner,
+              identity.boxId,
+            ),
+            createRemoteBoxResourceAccessor: createProductionResourceAccessorFor(
+              identity.agentId,
+              identity.boxId,
+              identity.getRunner,
+            ),
             createTurnLocalResourceProjectionInput: baseAccessor => {
-              const runner = builtRunner;
+              const runner = identity.getRunner();
               if (runner === undefined) {
                 throw new TypeError("production turn resource runner is not bound");
               }
@@ -2442,42 +2975,65 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
                 agentId: string,
                 args: SubagentAdapterArgs,
               ): SubagentSession => {
-                const child = deps.buildRunner({
-                  ...runnerOptions,
-                  conversationId: agentId,
-                  transcriptId: agentId,
-                  isSubagent: true,
-                  subagentType: args.subagentType,
-                  initialState: {
-                    turns: [],
-                    summaryArchives: [],
-                    turnTimings: [],
+                if (compositionDisposalStarted) {
+                  throw new Error("Host runner composition is shutting down");
+                }
+                return createProductionSubagentSession({
+                  baseRunnerOptions: runnerOptions,
+                  agentId,
+                  boxId: identity.boxId,
+                  args,
+                  buildRunner: deps.buildRunner,
+                  createProductionTurnRunShell: childRuntimeIdentity => {
+                    const childPromptIdentity: ProductionPromptIdentity = {
+                      agentId: childRuntimeIdentity.agentId,
+                      boxId: childRuntimeIdentity.boxId,
+                      isSubagentRunner: true,
+                      isComputerUseSubagent:
+                        childRuntimeIdentity.isComputerUseSubagent,
+                      isBrowserUseSubagent:
+                        childRuntimeIdentity.isBrowserUseSubagent,
+                      getRunner: childRuntimeIdentity.getRunner,
+                    };
+                    const childPromptGlue = createProductionPromptGlueFor(
+                      childPromptIdentity,
+                    );
+                    if (childPromptGlue === undefined) {
+                      throw new TypeError("production subagent prompt owner is not bound");
+                    }
+                    const childPromptAssembly =
+                      createProductionSystemPromptAssemblyFor(
+                        childPromptIdentity,
+                        childPromptGlue,
+                      );
+                    const childIdentity: ProductionTurnRunnerIdentity = {
+                      ...childPromptIdentity,
+                      promptGlue: childPromptGlue,
+                      ...(childPromptAssembly === undefined
+                        ? {}
+                        : { promptAssembly: childPromptAssembly }),
+                    };
+                    return createProductionTurnRunShellFor(childIdentity);
                   },
-                  productionTurnRunShell: undefined,
+                  bindRunner: child =>
+                    bindSessionOwnedRunner(child, { bindAgentStore: false }),
+                  initializeRunner: child => {
+                    if (typeof child.setAgentConversationStateStructure !== "function") {
+                      throw new TypeError("production subagent state owner is not bound");
+                    }
+                    child.setAgentConversationStateStructure(
+                      new ConversationStateStructure(),
+                    );
+                  },
+                  ownRunner: child => {
+                    ownedRunners.add(child);
+                    ownedSubagentRunners.set(agentId, child);
+                    ownedSubagentBoxReleases.set(
+                      agentId,
+                      () => releaseOwnedProductionSubagent(agentId),
+                    );
+                  },
                 });
-                bindSessionOwnedRunner(child);
-                ownedRunners.add(child);
-                return {
-                  run: async (prompt, options) => {
-                    const result = await child.run(prompt, options);
-                    if (typeof result !== "object" || result == null) {
-                      throw new TypeError("production subagent result is not bound");
-                    }
-                    const text = Reflect.get(result, "text");
-                    const aborted = Reflect.get(result, "aborted");
-                    if (typeof text !== "string" || typeof aborted !== "boolean") {
-                      throw new TypeError("production subagent result is not bound");
-                    }
-                    return { text, aborted };
-                  },
-                  interrupt: reason => {
-                    child.interrupt(reason);
-                  },
-                  getResolvedOutline: () => child.getResolvedOutline(),
-                  getObservedToolCallCount: () => child.getObservedToolCallCount(),
-                  getActivitySnapshot: () => child.getActivitySnapshot(),
-                  getTranscriptPath: () => child.getTranscriptPath(),
-                };
               };
               const computerUse = runner.computerUse;
               return {
@@ -2489,8 +3045,14 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
                     computerUse?.allocateWindow(agentId) ?? null,
                   freeComputerUseWindow: agentId => {
                     computerUse?.freeWindow(agentId);
+                    releaseOwnedProductionSubagent(agentId);
                   },
-                  dispatch: input => runner.subagents.dispatchBackgroundSubagent(input),
+                  dispatch: input => {
+                    if (compositionDisposalStarted) {
+                      throw new Error("Host runner composition is shutting down");
+                    }
+                    runner.subagents.dispatchBackgroundSubagent(input);
+                  },
                 },
                 requestContext: turnRequestContext,
                 includeTranscripts: !isSharedRoomTurn,
@@ -2504,28 +3066,43 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
                   assertNoPendingApproval: () => turnAutoReviewGate.assertNoPendingApproval(),
                 },
                 actionAuditor: projectedActionAuditor,
-                agentId: session.id,
+                agentId: identity.agentId,
               };
             },
             blobStore: getAgentBlobStore(
-              session.agentStore as Parameters<typeof getAgentBlobStore>[0],
+              runner as Parameters<typeof getAgentBlobStore>[0],
             ),
-            toolHost: lazyToolHost(),
+            toolHost: lazyToolHost(identity, turn),
             turn,
             staticConfig: {
               modelId: staticModelId,
               agentTokenLimit: 200_000,
-              conversationId: session.id,
-              isBoxScopedSubagent: false,
-              isSubagentRunner: false,
-              isSharedRoomRunner: isSharedRoomTurn,
+              conversationId: identity.agentId,
+              isBoxScopedSubagent:
+                identity.isComputerUseSubagent || identity.isBrowserUseSubagent,
+              isSubagentRunner: identity.isSubagentRunner,
+              isSharedRoomRunner: !identity.isSubagentRunner && isSharedRoomTurn,
               sandSendMessageDeliveryOwed: method(experiments, "isSendMessageDeliveryOwedEnabled")?.() ?? false,
-              systemPromptGenerator: () => productionSystemPromptAssembly?.getSystemPrompt() ?? DEFAULT_SAND_SYSTEM_PROMPT,
+              systemPromptGenerator: () =>
+                identity.promptAssembly?.getSystemPrompt() ?? DEFAULT_SAND_SYSTEM_PROMPT,
+              appendProfileUpdateToHistory: (
+                messages,
+                snapshot,
+                onAppended,
+              ) => identity.promptGlue.appendProfileUpdateToHistory(
+                messages as Parameters<
+                  typeof identity.promptGlue.appendProfileUpdateToHistory
+                >[0],
+                snapshot as Parameters<
+                  typeof identity.promptGlue.appendProfileUpdateToHistory
+                >[1],
+                onAppended,
+              ),
             },
             emitUpdate,
             interactionObservers: {},
             diskPressureReminder: foreverBox.diskPressureReminder,
-            ...(productionSystemPromptAssembly === undefined
+            ...(identity.isSubagentRunner || identity.promptAssembly === undefined
               ? {}
               : (() => {
                   const profilePromptSnapshotStore = asPromptSnapshotStore(session.db);
@@ -2537,9 +3114,9 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           } satisfies ProductionTurnAgentOwnerInput;
         },
         promptOptions: (_prompt, options) => toGeneratedTurnPromptOptions(options),
-        assembleGeneratedTurnAction: productionPromptGlue.assembleGeneratedTurnAction,
+        assembleGeneratedTurnAction: identity.promptGlue.assembleGeneratedTurnAction,
         compactionEpoch: () => 0,
-        getConversationState: getProductionConversationState,
+        getConversationState: () => getProductionConversationState(identity),
         ...(mcp.mcp != null && typeof mcp.mcp.getTools === "function"
           ? {
               mcp: {
@@ -2553,12 +3130,14 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           getExecutor: () => createTextExecutor(owner.runContext.toolSession.getExecutor()),
         }),
         context: () => productionContext,
-        createSettleHost: createProductionTurnSettleHost,
+        createSettleHost: () => createProductionTurnSettleHost(identity),
         profilePromptSnapshots: () => session.db,
-        isSubagentRunner: false,
+        isSubagentRunner: identity.isSubagentRunner,
         subagents: { sessions: new Map() },
-        getConversationId: () => session.id,
-        runGeneration: () => (builtRunner as { currentRunGeneration?: number } | undefined)?.currentRunGeneration ?? 0,
+        getConversationId: () => identity.agentId,
+        runGeneration: () => (identity.getRunner() as {
+          currentRunGeneration?: number;
+        } | undefined)?.currentRunGeneration ?? 0,
         setActiveTurnRequestSource: () => {},
         beginAutoReviewUserMessageEpoch: () => {},
         setActiveRunInterrupted: () => {},
@@ -2571,6 +3150,16 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
           : { lastReactionApplied: () => hooks.transport.lastReactionApplied?.() === true }),
         cancelThisRun: () => {},
       });
+      const rootTurnIdentity: ProductionTurnRunnerIdentity = {
+        ...rootPromptIdentity,
+        promptGlue: productionPromptGlue,
+        ...(productionSystemPromptAssembly === undefined
+          ? {}
+          : { promptAssembly: productionSystemPromptAssembly }),
+      };
+      runnerOptions.productionTurnRunShell = createProductionTurnRunShellFor(
+        rootTurnIdentity,
+      );
     }
 
     if (deps.createRunStep != null && runnerOptions.productionTurnRunShell === undefined) {
@@ -2583,8 +3172,13 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
       });
     }
 
-    function bindSessionOwnedRunner(runner: Runner): void {
-      runner.setAgentStore(session.agentStore, hooks.agentProfileProvider);
+    function bindSessionOwnedRunner(
+      runner: Runner,
+      options: { readonly bindAgentStore?: boolean } = {},
+    ): void {
+      if (options.bindAgentStore !== false) {
+        runner.setAgentStore(session.agentStore, hooks.agentProfileProvider);
+      }
       runner.setMemoryStore(session.memory);
       runner.setUserMemory(runnerOptions.userMemory);
       runner.setProjectMemory(runnerOptions.projectMemory);
@@ -2625,22 +3219,92 @@ export function createHostRunnerComposition<Runner extends ProductionSessionBoun
       localToolPermissionSurfaces.delete(agentId);
       method(localToolPermission, "forgetAgent")?.(agentId);
     },
-    dispose: async () => {
-      for (const runner of ownedRunners) {
-        const candidate = runner as {
-          interrupt?(reason?: string): unknown;
-          dispose?(): void | Promise<void>;
-        };
-        candidate.interrupt?.("host shutdown");
-        await candidate.dispose?.();
+    dispose: () => {
+      if (compositionDisposal !== undefined) return compositionDisposal;
+      compositionDisposalStarted = true;
+      compositionShutdownDeadlineMs = Date.now() + shutdownDrainTimeoutMs;
+      let resolveDisposal!: () => void;
+      let rejectDisposal!: (error: unknown) => void;
+      // Publish the stable promise before synchronous runner cancellation can
+      // re-enter composition disposal through lifecycle callbacks.
+      compositionDisposal = new Promise<void>((resolve, reject) => {
+        resolveDisposal = resolve;
+        rejectDisposal = reject;
+      });
+      const interruptedRunners = [...ownedRunners];
+      for (const runner of interruptedRunners) {
+        try {
+          if (runner.beginShutdown !== undefined) {
+            runner.beginShutdown("host shutdown");
+          } else if (runner.interruptAll !== undefined) {
+            runner.interruptAll("host shutdown");
+          } else {
+            runner.interrupt("host shutdown");
+          }
+        } catch {}
       }
-      ownedRunners.clear();
-      for (const unsubscribe of localToolPermissionSurfaces.values()) {
-        unsubscribe();
-      }
-      localToolPermissionSurfaces.clear();
-      await mirrorOffloadPool?.closeAll();
-      mirrorOffloadPool = null;
+
+      void (async () => {
+        const drains: Promise<unknown>[] = [];
+        for (const runner of interruptedRunners) {
+          for (const drain of [
+            runner.drainActiveRun,
+            runner.drainBackgroundSubagents,
+          ]) {
+            if (drain === undefined) continue;
+            try {
+              drains.push(Promise.resolve(drain.call(runner)));
+            } catch (error) {
+              drains.push(Promise.reject(error));
+            }
+          }
+        }
+        await waitForBoundedShutdownWork(
+          drains,
+          "sand.runner_shutdown_drain_timed_out",
+          { runner_count: interruptedRunners.length },
+        );
+
+        const runnersToDispose = new Set([...interruptedRunners, ...ownedRunners]);
+        ownedRunners.clear();
+        const disposals = new Set<Promise<void>>([
+          ...[...runnersToDispose].map(runner => disposeRunnerOnce(runner)),
+          ...pendingSubagentDisposals,
+        ]);
+        await waitForBoundedShutdownWork(
+          [...disposals],
+          "sand.runner_shutdown_dispose_timed_out",
+          { runner_count: runnersToDispose.size },
+        );
+        for (const release of [...ownedSubagentBoxReleases.values()]) release();
+        // A timed-out dispose promise cannot be cancelled. Drop the strong
+        // bookkeeping references after forcing the remaining child cleanup;
+        // the attached handlers still absorb any eventual rejection.
+        pendingSubagentDisposals.clear();
+        if (pendingSubagentBoxReleases.size > 0) {
+          await Promise.allSettled([...pendingSubagentBoxReleases]);
+        }
+        for (const unsubscribe of localToolPermissionSurfaces.values()) {
+          unsubscribe();
+        }
+        localToolPermissionSurfaces.clear();
+        const mirrorPool = mirrorOffloadPool;
+        mirrorOffloadPool = null;
+        if (mirrorPool !== null) {
+          let close: Promise<unknown>;
+          try {
+            close = Promise.resolve(mirrorPool.closeAll());
+          } catch (error) {
+            close = Promise.reject(error);
+          }
+          await waitForBoundedShutdownWork(
+            [close],
+            "sand.runner_shutdown_mirror_close_timed_out",
+            {},
+          );
+        }
+      })().then(resolveDisposal, rejectDisposal);
+      return compositionDisposal;
     }
   };
 }

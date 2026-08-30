@@ -11,7 +11,8 @@ export const COORDINATOR_PROTOCOL_VERSION = 1;
 export const COORDINATOR_TRANSPORT_STATE_FAMILY = "coordinator-transport-state";
 
 type EventListener = (payload: unknown) => void;
-type TransportListener = (state: "connected" | "down") => void;
+export type CoordinatorTransportState = "connected" | "down";
+type TransportListener = (state: CoordinatorTransportState) => void;
 
 interface PendingCall {
   method: string;
@@ -56,6 +57,8 @@ export interface ProductionCoordinatorClient {
   isEgressTunnelAvailable(): Promise<boolean>;
   subscribe(family: string, listener: EventListener): () => void;
   subscribeTransport(listener: TransportListener): () => void;
+  getTransportState(): CoordinatorTransportState;
+  waitForTransportConnected(timeoutMs?: number): Promise<void>;
   dispose(): void;
 }
 
@@ -67,6 +70,7 @@ export function createCoordinatorClient(portBridge: CoordinatorPortBridge): Prod
   let nextRequestId = 0;
   let disposed = false;
   let serving = false;
+  let transportState: CoordinatorTransportState = "down";
   let resolveReady = () => {};
   let rejectReady = (_reason: unknown) => {};
   const makeReady = () => new Promise<void>((resolve, reject) => {
@@ -76,6 +80,12 @@ export function createCoordinatorClient(portBridge: CoordinatorPortBridge): Prod
   const ready = makeReady();
   let currentReady = ready;
   ready.catch(() => {});
+
+  const publishTransport = (state: CoordinatorTransportState): void => {
+    if (transportState === state) return;
+    transportState = state;
+    for (const listener of transportListeners) listener(state);
+  };
 
   const rejectCalls = (reason: string) => {
     rejectReady(new Error(reason));
@@ -88,7 +98,7 @@ export function createCoordinatorClient(portBridge: CoordinatorPortBridge): Prod
     port = null;
     serving = false;
     rejectCalls(reason);
-    for (const listener of transportListeners) listener("down");
+    publishTransport("down");
     currentReady = makeReady();
     currentReady.catch(() => {});
     claim?.request();
@@ -104,7 +114,6 @@ export function createCoordinatorClient(portBridge: CoordinatorPortBridge): Prod
       if (value.protocolVersion !== COORDINATOR_PROTOCOL_VERSION) return disconnect(expectedPort, "coordinator protocol version mismatch");
       serving = true;
       resolveReady();
-      for (const listener of transportListeners) listener("connected");
       return;
     }
     if (value.kind === "lifecycle" && value.phase === "shutdown") return disconnect(expectedPort, "coordinator requested shutdown");
@@ -126,7 +135,7 @@ export function createCoordinatorClient(portBridge: CoordinatorPortBridge): Prod
     }
     if (value.kind === "event" && typeof value.family === "string") {
       if (value.family === COORDINATOR_TRANSPORT_STATE_FAMILY && isRecord(value.payload) && (value.payload.state === "connected" || value.payload.state === "down")) {
-        for (const listener of transportListeners) listener(value.payload.state);
+        publishTransport(value.payload.state);
       }
       for (const listener of eventListeners.get(value.family) ?? []) listener(value.payload);
     }
@@ -141,6 +150,7 @@ export function createCoordinatorClient(portBridge: CoordinatorPortBridge): Prod
       port = nextPort;
       previousPort?.close();
       serving = false;
+      publishTransport("down");
       if (replacesLivePort) {
         currentReady = makeReady();
         currentReady.catch(() => {});
@@ -177,7 +187,31 @@ export function createCoordinatorClient(portBridge: CoordinatorPortBridge): Prod
     },
     subscribeTransport(listener) {
       transportListeners.add(listener);
+      listener(transportState);
       return () => transportListeners.delete(listener);
+    },
+    getTransportState: () => transportState,
+    waitForTransportConnected(timeoutMs = 20_000) {
+      if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return Promise.reject(new Error("Coordinator connection timeout must be positive."));
+      if (disposed) return Promise.reject(new Error("Coordinator client is disposed."));
+      if (transportState === "connected") return Promise.resolve();
+      return new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const finish = (error?: Error) => {
+          if (settled) return;
+          settled = true;
+          globalThis.clearTimeout(timeout);
+          transportListeners.delete(onTransport);
+          if (error == null) resolve();
+          else reject(error);
+        };
+        const onTransport: TransportListener = (state) => {
+          if (state === "connected") finish();
+        };
+        const timeout = globalThis.setTimeout(() => finish(new Error("Timed out waiting for the Local 9Router coordinator to connect.")), timeoutMs);
+        transportListeners.add(onTransport);
+        if (transportState === "connected") finish();
+      });
     },
     dispose() {
       if (disposed) return;

@@ -13,7 +13,7 @@ export interface BoxRecoveryConnector {
 
 export interface BoxRecovery {
   readBoxMigrationStatus(): MigrationEvent | null;
-  restartCoordinator(): void;
+  restartCoordinator(): void | Promise<unknown>;
   recreateComputer(args: { readonly preserveData: boolean; readonly force?: boolean }): Promise<RecreateResult>;
   forceRecreateComputer(): Promise<RecreateResult>;
   updateForeverBox(args: { readonly id: string; readonly force: boolean }): Promise<unknown>;
@@ -30,7 +30,7 @@ export interface ProductionBoxRecoveryOptions {
   readonly watch?: (signal: AbortSignal) => AsyncIterable<MigrationStatus>;
   broadcast(event: MigrationEvent): void;
   onWatchTelemetry?: (event: MigrationWatchTelemetry) => void;
-  restartCoordinator(): void;
+  restartCoordinator(): void | Promise<unknown>;
   updateForeverBox(args: { readonly id: string; readonly force: boolean }): Promise<unknown>;
 }
 

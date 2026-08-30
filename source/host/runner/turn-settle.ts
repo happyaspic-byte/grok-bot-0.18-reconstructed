@@ -233,6 +233,7 @@ export function createTurnSettle(
     checkpoint: TurnCheckpoint,
     finalizeCheckpoint: boolean,
   ): Promise<void> {
+    if (host.isRunSuperseded()) return;
     const transcriptMirror = host.transcriptMirror;
     const preparedTranscriptMirror = transcriptPersistenceEnabled
       ? transcriptMirror
@@ -247,6 +248,15 @@ export function createTurnSettle(
         finalizeCheckpoint,
         finalizeCheckpoint || host.isSubagentRunner,
       );
+      if (host.isRunSuperseded()) {
+        await Promise.allSettled([
+          preparedTranscriptMirror.abortCheckpoint(
+            context,
+            host.getTranscriptId(),
+          ),
+        ]);
+        return;
+      }
     }
 
     const store = host.agentStore();
@@ -268,6 +278,10 @@ export function createTurnSettle(
       throw error;
     }
 
+    // Once the durable checkpoint write succeeds, complete the transcript
+    // commit even if the run was superseded while the store was awaiting.
+    // Aborting here would delete the prepared journal record for a durable
+    // root that recovery still needs to replay.
     if (preparedTranscriptMirror != null) {
       try {
         const rootBlobId = store?.getMetadata("latestRootBlobId");
@@ -294,7 +308,9 @@ export function createTurnSettle(
     checkpoint: TurnCheckpoint,
   ): Promise<void> {
     await persistCheckpoint(context, checkpoint, false);
-    if (host.ownsRunner()) persistPendingProfileAnnouncement();
+    if (!host.isRunSuperseded() && host.ownsRunner()) {
+      persistPendingProfileAnnouncement();
+    }
   }
 
   async function settleCompletedTurn(
@@ -378,7 +394,7 @@ export function createTurnSettle(
   ): Promise<void> {
     prepareCheckpointForPersistence(finalState);
     await persistCheckpoint(context, finalState, true);
-    persistPendingProfileAnnouncement();
+    if (!host.isRunSuperseded()) persistPendingProfileAnnouncement();
   }
 
   function buildResult(flags: TurnResultFlags): TurnSettleResult {
