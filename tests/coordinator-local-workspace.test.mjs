@@ -2044,6 +2044,9 @@ test("explicit pause termination errors quarantine an adopted daemon before retr
     await supervisor.setPaused(true);
     assert.equal(supervisor.state().phase, "failed");
     assert.match(supervisor.state().reason, /simulated termination timeout/);
+    await supervisor.setPaused(false);
+    assert.equal(supervisor.state().phase, "failed");
+    assert.match(supervisor.state().reason, /verified process remained live/);
     await liveness.tick();
     await liveness.tick();
     assert.equal(supervisor.state().phase, "failed");
