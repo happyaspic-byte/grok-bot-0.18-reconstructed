@@ -423,6 +423,7 @@ export function createCoordinatorControlExecutors(
   };
   const daemonExitSettlements = new Map<string, Promise<{ readonly identity: LocalExecProcessIdentity; readonly exitCode: number | null; readonly signal: NodeJS.Signals | null }>>();
   const ownedDaemonIdentities = new Map<number, LocalExecProcessIdentity>();
+  const unidentifiedSpawnQuarantine = new Set<number>();
   const identityKey = (identity: LocalExecProcessIdentity) => `${identity.pid}:${identity.startEpochMs}:${identity.command}:${identity.entryRealpath}:${identity.generationToken}`;
   const expectedMatches = (expected: ExpectedLocalExecProcessIdentity, identity: LocalExecProcessIdentity): boolean => expected.pid === identity.pid
     && expected.entryRealpath === identity.entryRealpath
@@ -453,9 +454,17 @@ export function createCoordinatorControlExecutors(
   const stopUnidentifiedSpawn = async (child: Awaited<ReturnType<typeof native.spawnLocalExecDaemon>>["child"]): Promise<void> => {
     if (child.exitCode !== null || child.signalCode !== null) return;
     if (child.pid === undefined) throw new Error("local-exec unidentified child had no pid for owned-handle termination");
-    await native.terminateProcess(child.pid);
-    if (native.isProcessAlive(child.pid)) {
-      throw new Error(`local-exec child ${child.pid} remained alive after owned-handle termination`);
+    const pid = child.pid;
+    unidentifiedSpawnQuarantine.add(pid);
+    try {
+      await native.terminateProcess(pid, { allowUnidentifiedOwnedEscalation: true });
+      if (native.isProcessAlive(pid)) {
+        throw new Error(`local-exec child ${pid} remained alive after owned-handle termination`);
+      }
+      unidentifiedSpawnQuarantine.delete(pid);
+    } catch (error) {
+      if (!native.isProcessAlive(pid)) unidentifiedSpawnQuarantine.delete(pid);
+      throw error;
     }
   };
 
@@ -492,6 +501,12 @@ export function createCoordinatorControlExecutors(
       readonly logPath: string;
       readonly env: NodeJS.ProcessEnv;
     }) {
+      for (const pid of [...unidentifiedSpawnQuarantine]) {
+        if (native.isProcessAlive(pid)) {
+          throw new Error(`local-exec child ${pid} is quarantined after an unconfirmed startup cleanup`);
+        }
+        unidentifiedSpawnQuarantine.delete(pid);
+      }
       const spawned = await native.spawnLocalExecDaemon(args);
       const { child, entryRealpath, generationToken } = spawned;
       if (child.pid === undefined) throw new Error("local-exec daemon spawn returned no pid");
@@ -526,7 +541,7 @@ export function createCoordinatorControlExecutors(
     async terminateProcess({ identity }: { readonly identity: LocalExecProcessIdentity }) {
       const observed = readOwnedIdentity(identity);
       if (observed == null || !sameLocalExecProcessIdentity(observed, identity)) return { terminated: false };
-      await native.terminateProcess(identity.pid);
+      await native.terminateProcess(identity.pid, { expectedIdentity: identity });
       return { terminated: true };
     },
     isProcessAlive: ({ pid }: { readonly pid: number }) => native.isProcessAlive(pid),

@@ -19,6 +19,11 @@ export function daemonMainPath(moduleUrl = import.meta.url): string { return joi
 export function resolveLocalExecDaemonEntryRealpath(mainPath = daemonMainPath(), realpath: typeof realpathSync = realpathSync): string { return realpath(mainPath); }
 function attemptSync<T>(run: () => T): { ok: true; value: T } | { ok: false } { try { return { ok: true, value: run() }; } catch { return { ok: false }; } }
 export interface LocalExecProcessIdentity { readonly pid: number; readonly startEpochMs: number; readonly command: string; }
+function sameNativeProcessIdentity(left: LocalExecProcessIdentity, right: LocalExecProcessIdentity): boolean {
+  return left.pid === right.pid
+    && left.startEpochMs === right.startEpochMs
+    && left.command === right.command;
+}
 export interface SpawnedLocalExecDaemon { readonly child: ChildProcess; readonly entryRealpath: string; readonly generationToken: string; }
 export function parsePosixProcessIdentity(pid: number, output: string): LocalExecProcessIdentity | null { const match = /^(\S{3}\s+\S{3}\s+[ 0-9]\d\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$/.exec(output.trim()); const started = match?.[1]; if (started == null) return null; const startEpochMs = Date.parse(started); const command = match?.[2]?.trim() ?? ""; return Number.isFinite(startEpochMs) && command.length > 0 ? { pid, startEpochMs, command } : null; }
 
@@ -94,6 +99,7 @@ export { commandCarriesLocalExecGeneration, LOCAL_EXEC_GENERATION_TOKEN_ARG, LOC
 function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }
 export class LocalExecTerminationTimeoutError extends Error { constructor(readonly pid: number) { super(`local-exec process ${pid} remained alive after termination timeout`); this.name = "LocalExecTerminationTimeoutError"; } }
 export class LocalExecTerminationSignalError extends Error { constructor(readonly pid: number, readonly code: string | undefined, cause: unknown) { super(`local-exec process ${pid} could not be signalled${code == null ? "" : ` (${code})`}`, { cause }); this.name = "LocalExecTerminationSignalError"; } }
+export class LocalExecTerminationIdentityError extends Error { constructor(readonly pid: number, message: string) { super(`local-exec process ${pid} ${message}`); this.name = "LocalExecTerminationIdentityError"; } }
 export async function waitForProcessExit(pid: number, deps: { readonly isAlive?: (pid: number) => boolean; readonly delay?: (ms: number) => Promise<void> } = {}): Promise<void> { const alive = deps.isAlive ?? isProcessAlive; const wait = deps.delay ?? delay; for (let attempt = 0; attempt < 40; attempt += 1) { if (!alive(pid)) return; await wait(100); } if (alive(pid)) throw new LocalExecTerminationTimeoutError(pid); }
 
 export async function waitForWindowsProcessExit(
@@ -102,16 +108,23 @@ export async function waitForWindowsProcessExit(
     readonly isAlive?: (pid: number) => boolean;
     readonly readIdentity?: (pid: number) => LocalExecProcessIdentity | null;
     readonly delay?: (ms: number) => Promise<void>;
+    readonly expectedIdentity?: LocalExecProcessIdentity;
   } = {},
 ): Promise<void> {
   const alive = deps.isAlive ?? isProcessAlive;
   const identity = deps.readIdentity ?? ((candidate) => readProcessIdentity(candidate, "win32"));
   const wait = deps.delay ?? delay;
+  const expected = deps.expectedIdentity;
+  const hasExited = (): boolean => {
+    const observed = identity(pid);
+    if (expected != null && observed != null && !sameNativeProcessIdentity(observed, expected)) return true;
+    return !alive(pid) && observed == null;
+  };
   for (let attempt = 0; attempt < 40; attempt += 1) {
-    if (!alive(pid) && identity(pid) == null) return;
+    if (hasExited()) return;
     await wait(100);
   }
-  if (alive(pid) || identity(pid) != null) throw new LocalExecTerminationTimeoutError(pid);
+  if (!hasExited()) throw new LocalExecTerminationTimeoutError(pid);
 }
 
 export async function terminateProcess(
@@ -123,9 +136,42 @@ export async function terminateProcess(
     readonly platform?: NodeJS.Platform;
     readonly execFileSync?: typeof execFileSync;
     readonly environment?: NodeJS.ProcessEnv;
+    readonly expectedIdentity?: LocalExecProcessIdentity;
+    readonly readIdentity?: (pid: number) => LocalExecProcessIdentity | null;
+    readonly isAlive?: (pid: number) => boolean;
+    readonly allowUnidentifiedOwnedEscalation?: boolean;
   } = {},
 ): Promise<void> {
   const platform = deps.platform ?? process.platform;
+  const signal = deps.kill ?? process.kill.bind(process);
+  const alive = deps.isAlive ?? isProcessAlive;
+  const readIdentity = deps.readIdentity ?? ((candidate: number) => readProcessIdentity(
+    candidate,
+    platform,
+    {
+      ...(deps.execFileSync === undefined ? {} : { execFileSync: deps.execFileSync }),
+      ...(deps.environment === undefined ? {} : { environment: deps.environment }),
+    },
+  ));
+  const expected = deps.expectedIdentity;
+  const reportFailure = deps.reportFailure ?? ((failure: unknown) => reportLocalExecTerminationFailed(pid, failure));
+  const expectedExitConfirmed = (): boolean => {
+    const observed = readIdentity(pid);
+    if (expected != null && observed != null && !sameNativeProcessIdentity(observed, expected)) return true;
+    return observed == null && !alive(pid);
+  };
+
+  if (platform === "win32" && expected != null) {
+    const observed = readIdentity(pid);
+    if (observed == null) {
+      if (!alive(pid)) return;
+      throw new LocalExecTerminationIdentityError(pid, "remained alive but its identity could not be verified before taskkill");
+    }
+    if (!sameNativeProcessIdentity(observed, expected)) {
+      throw new LocalExecTerminationIdentityError(pid, "changed identity before taskkill");
+    }
+  }
+
   try {
     if (platform === "win32" && deps.kill == null) {
       (deps.execFileSync ?? execFileSync)(
@@ -134,17 +180,51 @@ export async function terminateProcess(
         { encoding: "utf8", timeout: 10_000, windowsHide: true },
       );
     } else {
-      (deps.kill ?? process.kill.bind(process))(pid, "SIGTERM");
+      signal(pid, "SIGTERM");
     }
   } catch (error) {
     const code = findSystemErrno(error);
-    if (code === "ESRCH") return;
-    (deps.reportFailure ?? ((failure) => reportLocalExecTerminationFailed(pid, failure)))(error);
+    if (code === "ESRCH" || expectedExitConfirmed()) return;
+    reportFailure(error);
     throw new LocalExecTerminationSignalError(pid, code, error);
   }
+
   const waitForExit = deps.waitForExit
-    ?? (platform === "win32" ? waitForWindowsProcessExit : waitForProcessExit);
+    ?? (platform === "win32"
+      ? (candidate: number) => waitForWindowsProcessExit(candidate, {
+          ...(expected === undefined ? {} : { expectedIdentity: expected }),
+          readIdentity,
+          isAlive: alive,
+        })
+      : waitForProcessExit);
+  try {
+    await waitForExit(pid);
+    return;
+  } catch (error) {
+    if (
+      platform === "win32"
+      || !(error instanceof LocalExecTerminationTimeoutError)
+      || (expected == null && deps.allowUnidentifiedOwnedEscalation !== true)
+    ) throw error;
+  }
+
+  if (expected != null) {
+    const observed = readIdentity(pid);
+    if (observed == null) {
+      if (!alive(pid)) return;
+      throw new LocalExecTerminationIdentityError(pid, "remained alive but its identity could not be verified before SIGKILL escalation");
+    }
+    if (!sameNativeProcessIdentity(observed, expected)) return;
+  }
+  try {
+    signal(pid, "SIGKILL");
+  } catch (error) {
+    const code = findSystemErrno(error);
+    if (code === "ESRCH" || expectedExitConfirmed()) return;
+    reportFailure(error);
+    throw new LocalExecTerminationSignalError(pid, code, error);
+  }
   await waitForExit(pid);
 }
 export async function spawnLocalExecDaemon(args: { readonly logPath: string; readonly env: NodeJS.ProcessEnv; readonly mainPath?: string; readonly spawnImpl?: typeof spawn; readonly generationToken?: string; readonly realpath?: typeof realpathSync; readonly open?: typeof openSync; readonly close?: typeof closeSync }): Promise<SpawnedLocalExecDaemon> { await mkdir(dirname(args.logPath), { recursive: true }); const entryRealpath = resolveLocalExecDaemonEntryRealpath(args.mainPath ?? daemonMainPath(), args.realpath ?? realpathSync); const generationToken = args.generationToken ?? randomUUID(); if (generationToken.length === 0) throw new Error("local-exec generation token must not be empty"); const logFd = (args.open ?? openSync)(args.logPath, "a"); try { const child = (args.spawnImpl ?? spawn)(process.execPath, [entryRealpath, `${LOCAL_EXEC_GENERATION_TOKEN_ARG}${generationToken}`], { detached: true, stdio: ["ignore", logFd, logFd], env: { ...process.env, ...args.env, [LOCAL_EXEC_GENERATION_TOKEN_ENV]: generationToken } }); const spawnedAt = performance.now(); let spawnSucceeded = false; child.once("error", (error) => reportLocalExecSpawnFailed(error)); child.once("spawn", () => { spawnSucceeded = true; reportLocalExecSpawned(child.pid); }); child.once("exit", (exitCode, signal) => { if (spawnSucceeded) reportLocalExecExited({ ...(child.pid === undefined ? {} : { pid: child.pid }), exitCode, signal, uptimeMs: performance.now() - spawnedAt }); }); child.unref(); return { child, entryRealpath, generationToken }; } finally { (args.close ?? closeSync)(logFd); } }
-export async function killLocalExecDaemon(discoveryPath: string, deps: { readonly expectedEntryRealpath?: string; readonly readIdentity?: typeof readProcessIdentity; readonly terminate?: (pid: number) => Promise<void>; readonly now?: () => number } = {}): Promise<void> { const existing = await readLocalExecDaemonDiscovery(discoveryPath); if (existing == null || existing.entryRealpath == null || existing.generationToken == null) return; const expectedEntryRealpath = deps.expectedEntryRealpath ?? realpathSync(daemonMainPath()); if (existing.entryRealpath !== expectedEntryRealpath) return; const observed = (deps.readIdentity ?? readProcessIdentity)(existing.pid); if (observed == null || !localExecDiscoveryTimeMatchesProcess(existing.startedAt, observed.startEpochMs, (deps.now ?? Date.now)()) || !commandCarriesLocalExecGeneration(observed.command, expectedEntryRealpath, existing.generationToken)) return; await (deps.terminate ?? terminateProcess)(existing.pid); }
+export async function killLocalExecDaemon(discoveryPath: string, deps: { readonly expectedEntryRealpath?: string; readonly readIdentity?: typeof readProcessIdentity; readonly terminate?: (pid: number) => Promise<void>; readonly now?: () => number } = {}): Promise<void> { const existing = await readLocalExecDaemonDiscovery(discoveryPath); if (existing == null || existing.entryRealpath == null || existing.generationToken == null) return; const expectedEntryRealpath = deps.expectedEntryRealpath ?? realpathSync(daemonMainPath()); if (existing.entryRealpath !== expectedEntryRealpath) return; const observed = (deps.readIdentity ?? readProcessIdentity)(existing.pid); if (observed == null || !localExecDiscoveryTimeMatchesProcess(existing.startedAt, observed.startEpochMs, (deps.now ?? Date.now)()) || !commandCarriesLocalExecGeneration(observed.command, expectedEntryRealpath, existing.generationToken)) return; if (deps.terminate != null) await deps.terminate(existing.pid); else await terminateProcess(existing.pid, { expectedIdentity: observed }); }

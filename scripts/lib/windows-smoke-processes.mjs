@@ -71,10 +71,47 @@ function generationFingerprint(value) {
 }
 
 export function redactLocalExecGeneration(value) {
-  return String(value).replace(
-    /--sand-local-exec-generation=(?:"[^"\r\n]*"|'[^'\r\n]*'|[A-Za-z0-9._:-]+)/gi,
-    "--sand-local-exec-generation=[REDACTED]",
-  );
+  const source = String(value);
+  const marker = "--sand-local-exec-generation=";
+  const lower = source.toLowerCase();
+  let cursor = 0;
+  let output = "";
+  for (;;) {
+    const start = lower.indexOf(marker, cursor);
+    if (start < 0) return output + source.slice(cursor);
+    output += source.slice(cursor, start) + marker + "[REDACTED]";
+    let end = start + marker.length;
+    if (source.startsWith("[REDACTED]", end)) {
+      end += "[REDACTED]".length;
+    } else if (source[end] === "\\" && (source[end + 1] === '"' || source[end + 1] === "'")) {
+      const quote = source[end + 1];
+      end += 2;
+      while (end < source.length) {
+        if (source[end] === "\\" && source[end + 1] === quote) {
+          end += 2;
+          break;
+        }
+        end += 1;
+      }
+    } else if (source[end] === '"' || source[end] === "'") {
+      const quote = source[end];
+      end += 1;
+      while (end < source.length) {
+        if (source[end] === "\\") {
+          end += Math.min(2, source.length - end);
+          continue;
+        }
+        if (source[end] === quote) {
+          end += 1;
+          break;
+        }
+        end += 1;
+      }
+    } else {
+      while (end < source.length && !/[\s"'\r\n]/.test(source[end])) end += 1;
+    }
+    cursor = end;
+  }
 }
 
 function sanitizeCommandLine(value) {

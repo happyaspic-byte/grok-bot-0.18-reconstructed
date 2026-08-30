@@ -118,6 +118,27 @@ test("local-exec generation redaction is JSON-safe and idempotent", () => {
     next: "Grok Bot process",
   });
   assert.equal(redacted.includes(generationToken), false);
+
+  const escapedQuotedToken = "abc+def/with=punctuation";
+  const escapedQuoted = JSON.stringify({
+    commandLine: `app.exe --sand-local-exec-generation="${escapedQuotedToken}" --next`,
+  });
+  const escapedQuotedRedacted = redactLocalExecGeneration(escapedQuoted);
+  assert.deepEqual(JSON.parse(escapedQuotedRedacted), {
+    commandLine: "app.exe --sand-local-exec-generation=[REDACTED] --next",
+  });
+  assert.equal(escapedQuotedRedacted.includes(escapedQuotedToken), false);
+  assert.equal(redactLocalExecGeneration(escapedQuotedRedacted), escapedQuotedRedacted);
+
+  const unquotedToken = "abc+def/with=punctuation";
+  const unquoted = JSON.stringify({
+    commandLine: `app.exe --sand-local-exec-generation=${unquotedToken}`,
+  });
+  const unquotedRedacted = redactLocalExecGeneration(unquoted);
+  assert.deepEqual(JSON.parse(unquotedRedacted), {
+    commandLine: "app.exe --sand-local-exec-generation=[REDACTED]",
+  });
+  assert.equal(unquotedRedacted.includes(unquotedToken), false);
 });
 
 test("out-of-order descendants and any unknown survivor fail the quit classification", () => {

@@ -1549,6 +1549,22 @@ function inertLocalExecPollingPolicy() {
   return { start() { return { dispose() {} }; } };
 }
 
+function controlledLocalExecPollingPolicy() {
+  let tick;
+  return {
+    policy: {
+      start(work) {
+        tick = work;
+        return { dispose() { tick = undefined; } };
+      },
+    },
+    async tick() {
+      assert.equal(typeof tick, "function");
+      await tick();
+    },
+  };
+}
+
 function localExecIdentity(pid, startEpochMs, entryRealpath, generationToken) {
   return {
     pid,
@@ -1606,6 +1622,292 @@ test("local-exec replacement fails closed when a verified predecessor refuses te
     assert.equal(supervisor.state().phase, "failed");
     assert.match(supervisor.state().reason, /remained alive after identity-verified termination was refused/);
     assert.deepEqual(JSON.parse(await readFile(discoveryPath, "utf8")), descriptor);
+    await supervisor.dispose();
+  } finally {
+    await loaded.dispose();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("local-exec discovery identity failures quarantine a live PID across reconciliation ticks", async () => {
+  const loaded = await loadModule("source/node-agent-coordinator/local-exec/supervisor.ts");
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-supervisor-"));
+  const discoveryPath = path.join(temporary, "local-exec-daemon.json");
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const descriptor = {
+    pid: 4_151,
+    startedAt: 2_000,
+    entryRealpath,
+    generationToken: "unreadable-generation",
+    inflightCount: 0,
+  };
+  const liveness = controlledLocalExecPollingPolicy();
+  let spawnCalls = 0;
+  try {
+    await writeFile(discoveryPath, JSON.stringify(descriptor), "utf8");
+    const supervisor = loaded.module.createLocalExecDaemonSupervisor({
+      dataDir: temporary,
+      isPackaged: true,
+      refreshPolicy: inertLocalExecPollingPolicy(),
+      livenessPolicy: liveness.policy,
+      now: () => 3_000,
+      control: {
+        async resolveGatewayConnection() { return { endpoint: "loopback" }; },
+        async mintLocalExecDaemonCredential() { return null; },
+        async spawnLocalExecDaemon() {
+          spawnCalls += 1;
+          assert.fail("an identity-unreadable live PID must block replacement spawn");
+        },
+        async getProcessIdentity() { return null; },
+        async isProcessAlive({ pid }) { return pid === descriptor.pid; },
+        async terminateProcess() { assert.fail("an unverified PID must never be terminated"); },
+        async waitLocalExecDaemonExit() { return await new Promise(() => {}); },
+      },
+    });
+
+    await supervisor.start();
+    assert.equal(supervisor.state().phase, "failed");
+    assert.match(supervisor.state().reason, /remained alive while its discovery identity could not be verified/);
+    await liveness.tick();
+    await liveness.tick();
+    assert.equal(supervisor.state().phase, "failed");
+    assert.equal(spawnCalls, 0);
+    assert.deepEqual(JSON.parse(await readFile(discoveryPath, "utf8")), descriptor);
+    await supervisor.dispose();
+  } finally {
+    await loaded.dispose();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("local-exec termination errors quarantine the verified predecessor before retries", async () => {
+  const loaded = await loadModule("source/node-agent-coordinator/local-exec/supervisor.ts");
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-supervisor-"));
+  const discoveryPath = path.join(temporary, "local-exec-daemon.json");
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const predecessor = localExecIdentity(4_161, 1_000, entryRealpath, "stuck-generation");
+  const descriptor = {
+    pid: predecessor.pid,
+    startedAt: 2_000,
+    entryRealpath,
+    generationToken: predecessor.generationToken,
+    inflightCount: 0,
+  };
+  const liveness = controlledLocalExecPollingPolicy();
+  let spawnCalls = 0;
+  let terminationCalls = 0;
+  try {
+    await writeFile(discoveryPath, JSON.stringify(descriptor), "utf8");
+    const supervisor = loaded.module.createLocalExecDaemonSupervisor({
+      dataDir: temporary,
+      isPackaged: true,
+      refreshPolicy: inertLocalExecPollingPolicy(),
+      livenessPolicy: liveness.policy,
+      now: () => 3_000,
+      control: {
+        async resolveGatewayConnection() { return { endpoint: "loopback" }; },
+        async mintLocalExecDaemonCredential() { return null; },
+        async spawnLocalExecDaemon() {
+          spawnCalls += 1;
+          assert.fail("a termination error must block every replacement retry");
+        },
+        async getProcessIdentity({ pid }) { return pid === predecessor.pid ? predecessor : null; },
+        async isProcessAlive({ pid }) { return pid === predecessor.pid; },
+        async terminateProcess({ identity }) {
+          assert.deepEqual(identity, predecessor);
+          terminationCalls += 1;
+          throw new Error("simulated termination timeout");
+        },
+        async waitLocalExecDaemonExit() { return await new Promise(() => {}); },
+      },
+    });
+
+    await supervisor.start();
+    assert.equal(supervisor.state().phase, "failed");
+    assert.match(supervisor.state().reason, /simulated termination timeout/);
+    await liveness.tick();
+    await liveness.tick();
+    assert.equal(supervisor.state().phase, "failed");
+    assert.equal(terminationCalls, 1);
+    assert.equal(spawnCalls, 0);
+    assert.deepEqual(JSON.parse(await readFile(discoveryPath, "utf8")), descriptor);
+    await supervisor.dispose();
+  } finally {
+    await loaded.dispose();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("local-exec active healing never replaces a live process after a transient identity read failure", async () => {
+  const loaded = await loadModule("source/node-agent-coordinator/local-exec/supervisor.ts");
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-supervisor-"));
+  const discoveryPath = path.join(temporary, "local-exec-daemon.json");
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const active = localExecIdentity(4_171, 1_000, entryRealpath, "active-generation");
+  const descriptor = {
+    pid: active.pid,
+    startedAt: 2_000,
+    entryRealpath,
+    generationToken: active.generationToken,
+    inflightCount: 1,
+  };
+  const liveness = controlledLocalExecPollingPolicy();
+  let identityReadable = true;
+  let spawnCalls = 0;
+  try {
+    await writeFile(discoveryPath, JSON.stringify(descriptor), "utf8");
+    const supervisor = loaded.module.createLocalExecDaemonSupervisor({
+      dataDir: temporary,
+      isPackaged: true,
+      refreshPolicy: inertLocalExecPollingPolicy(),
+      livenessPolicy: liveness.policy,
+      now: () => 3_000,
+      control: {
+        async resolveGatewayConnection() { return { endpoint: "loopback" }; },
+        async mintLocalExecDaemonCredential() { return null; },
+        async spawnLocalExecDaemon() {
+          spawnCalls += 1;
+          assert.fail("a transient identity failure must not duplicate the active daemon");
+        },
+        async getProcessIdentity({ pid }) { return identityReadable && pid === active.pid ? active : null; },
+        async isProcessAlive({ pid }) { return pid === active.pid; },
+        async terminateProcess() { assert.fail("an identity-unreadable active PID must not be terminated"); },
+        async waitLocalExecDaemonExit() { return await new Promise(() => {}); },
+      },
+    });
+
+    await supervisor.start();
+    assert.equal(supervisor.state().phase, "active");
+    identityReadable = false;
+    await liveness.tick();
+    await liveness.tick();
+    assert.equal(supervisor.state().phase, "failed");
+    assert.match(supervisor.state().reason, /active process remained alive while its identity could not be verified/);
+    await liveness.tick();
+    assert.equal(spawnCalls, 0);
+    assert.deepEqual(JSON.parse(await readFile(discoveryPath, "utf8")), descriptor);
+    identityReadable = true;
+    await liveness.tick();
+    assert.equal(supervisor.state().phase, "active");
+    assert.equal(supervisor.state().daemon.pid, active.pid);
+    assert.equal(spawnCalls, 0);
+    await supervisor.dispose();
+  } finally {
+    await loaded.dispose();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("local-exec pause and resume preserve an unreadable live discovery without spawning", async () => {
+  const loaded = await loadModule("source/node-agent-coordinator/local-exec/supervisor.ts");
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-supervisor-"));
+  const discoveryPath = path.join(temporary, "local-exec-daemon.json");
+  const descriptor = {
+    pid: 4_181,
+    startedAt: 2_000,
+    entryRealpath: "C:\\app\\local-exec-daemon\\main.cjs",
+    generationToken: "pause-generation",
+    inflightCount: 0,
+  };
+  let spawnCalls = 0;
+  try {
+    await writeFile(discoveryPath, JSON.stringify(descriptor), "utf8");
+    const supervisor = loaded.module.createLocalExecDaemonSupervisor({
+      dataDir: temporary,
+      isPackaged: true,
+      refreshPolicy: inertLocalExecPollingPolicy(),
+      livenessPolicy: inertLocalExecPollingPolicy(),
+      now: () => 3_000,
+      control: {
+        async resolveGatewayConnection() { return { endpoint: "loopback" }; },
+        async mintLocalExecDaemonCredential() { return null; },
+        async spawnLocalExecDaemon() {
+          spawnCalls += 1;
+          assert.fail("pause/resume must not duplicate an unreadable live daemon");
+        },
+        async getProcessIdentity() { throw new Error("simulated CIM outage"); },
+        async isProcessAlive({ pid }) { return pid === descriptor.pid; },
+        async terminateProcess() { assert.fail("an unreadable PID must not be terminated"); },
+        async waitLocalExecDaemonExit() { return await new Promise(() => {}); },
+      },
+    });
+
+    await supervisor.setPaused(true);
+    assert.equal(supervisor.state().phase, "failed");
+    assert.match(supervisor.state().reason, /pause retirement could not verify its identity/);
+    await supervisor.start();
+    await supervisor.setPaused(false);
+    assert.equal(supervisor.state().phase, "failed");
+    assert.equal(spawnCalls, 0);
+    assert.deepEqual(JSON.parse(await readFile(discoveryPath, "utf8")), descriptor);
+    await supervisor.dispose();
+  } finally {
+    await loaded.dispose();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("local-exec healing quarantines both generations when successor identity lookup fails", async () => {
+  const loaded = await loadModule("source/node-agent-coordinator/local-exec/supervisor.ts");
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-supervisor-"));
+  const discoveryPath = path.join(temporary, "local-exec-daemon.json");
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const active = localExecIdentity(4_191, 1_000, entryRealpath, "active-generation");
+  const successor = localExecIdentity(4_192, 3_000, entryRealpath, "successor-generation");
+  const activeDescriptor = {
+    pid: active.pid,
+    startedAt: 2_000,
+    entryRealpath,
+    generationToken: active.generationToken,
+    inflightCount: 1,
+  };
+  const successorDescriptor = {
+    pid: successor.pid,
+    startedAt: 3_500,
+    entryRealpath,
+    generationToken: successor.generationToken,
+    inflightCount: 0,
+  };
+  const liveness = controlledLocalExecPollingPolicy();
+  let successorVisible = false;
+  let spawnCalls = 0;
+  try {
+    await writeFile(discoveryPath, JSON.stringify(activeDescriptor), "utf8");
+    const supervisor = loaded.module.createLocalExecDaemonSupervisor({
+      dataDir: temporary,
+      isPackaged: true,
+      refreshPolicy: inertLocalExecPollingPolicy(),
+      livenessPolicy: liveness.policy,
+      now: () => 4_000,
+      control: {
+        async resolveGatewayConnection() { return { endpoint: "loopback" }; },
+        async mintLocalExecDaemonCredential() { return null; },
+        async spawnLocalExecDaemon() {
+          spawnCalls += 1;
+          assert.fail("ambiguous live generations must block every replacement spawn");
+        },
+        async getProcessIdentity({ pid }) {
+          if (pid === active.pid) return active;
+          if (pid === successor.pid && successorVisible) throw new Error("simulated successor CIM failure");
+          return null;
+        },
+        async isProcessAlive({ pid }) { return pid === active.pid || pid === successor.pid; },
+        async terminateProcess() { assert.fail("ambiguous live generations must not be terminated"); },
+        async waitLocalExecDaemonExit() { return await new Promise(() => {}); },
+      },
+    });
+
+    await supervisor.start();
+    assert.equal(supervisor.state().phase, "active");
+    successorVisible = true;
+    await writeFile(discoveryPath, JSON.stringify(successorDescriptor), "utf8");
+    await liveness.tick();
+    await liveness.tick();
+    assert.equal(supervisor.state().phase, "failed");
+    assert.match(supervisor.state().reason, /replacement discovery could not be verified/);
+    await liveness.tick();
+    assert.equal(spawnCalls, 0);
+    assert.deepEqual(JSON.parse(await readFile(discoveryPath, "utf8")), successorDescriptor);
     await supervisor.dispose();
   } finally {
     await loaded.dispose();
@@ -1780,6 +2082,111 @@ test("Windows local-exec exit verification requires both PID signalling and CIM 
   }
 });
 
+test("Windows termination treats an already-exited taskkill race as success", async () => {
+  const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
+  try {
+    const expected = { pid: 5_208, startEpochMs: 10, command: "expected daemon" };
+    let identityReads = 0;
+    let taskkillCalls = 0;
+    await loaded.module.terminateProcess(expected.pid, {
+      platform: "win32",
+      expectedIdentity: expected,
+      readIdentity() {
+        identityReads += 1;
+        return identityReads === 1 ? expected : null;
+      },
+      isAlive: () => false,
+      execFileSync() {
+        taskkillCalls += 1;
+        throw new Error("taskkill: process not found");
+      },
+      reportFailure(error) { assert.fail(`confirmed exit must not report a failure: ${String(error)}`); },
+    });
+    assert.equal(identityReads, 2);
+    assert.equal(taskkillCalls, 1);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("Windows termination refuses taskkill after PID identity reuse", async () => {
+  const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
+  try {
+    const expected = { pid: 5_208, startEpochMs: 10, command: "expected daemon" };
+    const replacement = { pid: expected.pid, startEpochMs: 11, command: "unrelated process" };
+    let taskkillCalls = 0;
+    await assert.rejects(
+      loaded.module.terminateProcess(expected.pid, {
+        platform: "win32",
+        expectedIdentity: expected,
+        readIdentity: () => replacement,
+        isAlive: () => true,
+        execFileSync() {
+          taskkillCalls += 1;
+          return "";
+        },
+      }),
+      error => error instanceof loaded.module.LocalExecTerminationIdentityError
+        && /changed identity before taskkill/.test(error.message),
+    );
+    assert.equal(taskkillCalls, 0);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("POSIX owned unidentified termination escalates a timed-out SIGTERM to SIGKILL", async () => {
+  const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
+  try {
+    const signals = [];
+    let waitCalls = 0;
+    await loaded.module.terminateProcess(4_201, {
+      platform: "linux",
+      allowUnidentifiedOwnedEscalation: true,
+      kill(pid, signal) {
+        assert.equal(pid, 4_201);
+        signals.push(signal);
+        return true;
+      },
+      async waitForExit(pid) {
+        assert.equal(pid, 4_201);
+        waitCalls += 1;
+        if (waitCalls === 1) throw new loaded.module.LocalExecTerminationTimeoutError(pid);
+      },
+    });
+    assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+    assert.equal(waitCalls, 2);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("POSIX identified termination will not SIGKILL a reused PID", async () => {
+  const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
+  try {
+    const expected = { pid: 4_201, startEpochMs: 10, command: "expected daemon" };
+    const replacement = { pid: expected.pid, startEpochMs: 11, command: "unrelated process" };
+    const signals = [];
+    await loaded.module.terminateProcess(expected.pid, {
+      platform: "linux",
+      expectedIdentity: expected,
+      readIdentity: () => replacement,
+      isAlive: () => true,
+      kill(pid, signal) {
+        assert.equal(pid, expected.pid);
+        signals.push(signal);
+        return true;
+      },
+      async waitForExit(pid) {
+        throw new loaded.module.LocalExecTerminationTimeoutError(pid);
+      },
+    });
+    assert.deepEqual(signals, ["SIGTERM"]);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
 test("unidentified local-exec spawns use the native bounded termination path", async () => {
   const source = await readFile(
     path.join(repoRoot, "source/electron-main/coordinator/coordinator-executors.ts"),
@@ -1789,8 +2196,10 @@ test("unidentified local-exec spawns use the native bounded termination path", a
   const next = source.indexOf("\n  };", helper);
   assert.ok(helper >= 0 && next > helper);
   const body = source.slice(helper, next);
-  assert.match(body, /await native\.terminateProcess\(child\.pid\)/);
-  assert.match(body, /native\.isProcessAlive\(child\.pid\)/);
+  assert.match(body, /unidentifiedSpawnQuarantine\.add\(pid\)/);
+  assert.match(body, /await native\.terminateProcess\(pid, \{ allowUnidentifiedOwnedEscalation: true \}\)/);
+  assert.match(body, /native\.isProcessAlive\(pid\)/);
+  assert.match(body, /unidentifiedSpawnQuarantine\.delete\(pid\)/);
   assert.doesNotMatch(body, /child\.kill\(/);
 });
 
