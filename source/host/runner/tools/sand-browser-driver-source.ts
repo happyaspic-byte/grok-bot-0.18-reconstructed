@@ -1,4 +1,4 @@
-export const SAND_BROWSER_DRIVER_VERSION = 4;
+export const SAND_BROWSER_DRIVER_VERSION = 5;
 export const SAND_BROWSER_DRIVER_BOX_DIR = "/tmp/.sand-browser";
 export const SAND_BROWSER_DRIVER_BOX_PATH = SAND_BROWSER_DRIVER_BOX_DIR + "/driver-v" + String(SAND_BROWSER_DRIVER_VERSION) + ".mjs";
 export const SAND_BROWSER_RESULT_MARKER = "__SAND_BROWSER_RESULT__";
@@ -131,9 +131,15 @@ async function withViewClaimLock(display, fn) {
 async function cdpAlive(port) {
   try {
     const res = await fetch("http://127.0.0.1:" + String(port) + "/json/version", {
+      headers: { Connection: "close" },
       signal: AbortSignal.timeout(1500),
     });
-    return res.ok;
+    const ok = res.ok;
+    // Do not leave Undici's response stream pending while the short-lived
+    // driver tears down. On Windows, forcing process exit during that native
+    // async cleanup can trip libuv's double-close assertion.
+    await res.body?.cancel().catch(() => {});
+    return ok;
   } catch {
     return false;
   }
@@ -255,11 +261,17 @@ async function reviveDiscardedTabs(port) {
   let socket;
   try {
     const base = "http://127.0.0.1:" + String(port);
-    const listRes = await fetch(base + "/json/list", { signal: AbortSignal.timeout(1500) });
+    const listRes = await fetch(base + "/json/list", {
+      headers: { Connection: "close" },
+      signal: AbortSignal.timeout(1500),
+    });
     if (!listRes.ok) return;
     const targets = (await listRes.json()).filter((t) => t.type === "page");
     if (targets.length === 0) return;
-    const versionRes = await fetch(base + "/json/version", { signal: AbortSignal.timeout(1500) });
+    const versionRes = await fetch(base + "/json/version", {
+      headers: { Connection: "close" },
+      signal: AbortSignal.timeout(1500),
+    });
     if (!versionRes.ok) return;
     const wsUrl = (await versionRes.json()).webSocketDebuggerUrl;
     if (typeof wsUrl !== "string" || wsUrl.length === 0) return;
@@ -1040,6 +1052,8 @@ const watchdog = setTimeout(() => {
   clearTimeout(watchdog);
   emitResult(result, activeResponseKey);
   activeResponseKey?.fill(0);
-  process.exit(0);
+  // Let stdout, stdin and native fetch resources drain naturally. A forced
+  // process.exit here can race Undici/libuv handle teardown on Windows.
+  process.exitCode = 0;
 })();
 `;

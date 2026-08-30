@@ -277,7 +277,8 @@ function createHarness(loaded, options = {}) {
           return {
             async execute(_context, args) {
               executions.push({ resource: "writeBackgroundShellInput" });
-              const encrypted = makeEncryptedBrowserResult(loaded, args.chars, {
+              assert.equal(args.chars.endsWith("\x04"), true, "Browser stdin must close after its one request");
+              const encrypted = makeEncryptedBrowserResult(loaded, args.chars.slice(0, -1), {
                 ok: true,
                 summary: "browser child tool executed",
                 screenshot: true,

@@ -351,7 +351,7 @@ test("generated Browser driver resolves NODE_PATH-only Playwright and authentica
         clearTimeout(timeout);
         reject(error);
       });
-      child.once("exit", (code, signal) => {
+      child.once("close", (code, signal) => {
         clearTimeout(timeout);
         resolve({ code, signal });
       });
@@ -498,7 +498,7 @@ module.exports = {
         clearTimeout(timeout);
         reject(error);
       });
-      child.once("exit", (code, signal) => {
+      child.once("close", (code, signal) => {
         clearTimeout(timeout);
         resolve({ code, signal });
       });
@@ -686,11 +686,11 @@ test("Browser adapter executes the raw driver with streamed args and preserves P
     assert.equal(shellCalls[0].context, interaction.started[0].context);
     assert.equal(shellCalls[0].input.toolCallId, "sand-browser-screenshot-browser-call");
     assert.equal(shellCalls[0].input.name, "node");
-    assert.equal(shellCalls[0].input.command, "node /tmp/.sand-browser/driver-v4.mjs --request-stdin");
+    assert.equal(shellCalls[0].input.command, "node /tmp/.sand-browser/driver-v5.mjs --request-stdin");
     const syntax = spawnSync("sh", ["-n", "-c", shellCalls[0].input.command], { encoding: "utf8" });
     assert.equal(syntax.status, 0, syntax.stderr);
     assert.equal(uploads.length, 1);
-    assert.equal(uploads[0].filePath, "/tmp/.sand-browser/driver-v4.mjs");
+    assert.equal(uploads[0].filePath, "/tmp/.sand-browser/driver-v5.mjs");
     assert.equal(uploads.some((entry) => entry.filePath.includes("request-")), false);
     const request = decodeBrowserStdin(shellCalls[0].stdin).request;
     assert.equal(request.op, "screenshot");
@@ -770,7 +770,7 @@ test("Browser secrets travel only through non-echoed stdin, never files, termina
     }
 
     assert.equal(uploads.filter((entry) => entry.filePath.includes("request-")).length, 0);
-    assert.equal(uploads.filter((entry) => entry.filePath.endsWith("driver-v4.mjs")).length, 1);
+    assert.equal(uploads.filter((entry) => entry.filePath.endsWith("driver-v5.mjs")).length, 1);
     assert.equal(shellCalls.length, secretCases.length);
     assert.deepEqual(removals, secretCases.map(([name]) =>
       `/tmp/.sand-browser/shot-${name}-secret-call.png`));
@@ -811,7 +811,7 @@ test("Browser secrets travel only through non-echoed stdin, never files, termina
     for (const call of shellCalls) {
       const command = call.input.command;
       assert.equal(spawnSync("sh", ["-n", "-c", command]).status, 0);
-      assert.equal(command, "node /tmp/.sand-browser/driver-v4.mjs --request-stdin");
+      assert.equal(command, "node /tmp/.sand-browser/driver-v5.mjs --request-stdin");
       for (const secret of secrets) {
         assert.equal(call.input.command.includes(secret), false);
         assert.equal(call.input.command.includes(Buffer.from(secret).toString("base64")), false);
@@ -823,7 +823,9 @@ test("Browser secrets travel only through non-echoed stdin, never files, termina
     assert.match(loaded.module.SAND_BROWSER_DRIVER_SOURCE, /STDIN_READY_MARKER/);
     assert.match(loaded.module.SAND_BROWSER_DRIVER_SOURCE, /process\.stdin\.on\("data"/);
     assert.match(loaded.module.SAND_BROWSER_DRIVER_SOURCE, /createCipheriv\("aes-256-gcm"/);
-    const driverPath = path.join(loaded.directory, "driver-v4.mjs");
+    assert.match(loaded.module.SAND_BROWSER_DRIVER_SOURCE, /await res\.body\?\.cancel\(\)/);
+    assert.match(loaded.module.SAND_BROWSER_DRIVER_SOURCE, /process\.exitCode = 0/);
+    const driverPath = path.join(loaded.directory, "driver-v5.mjs");
     await writeFile(driverPath, loaded.module.SAND_BROWSER_DRIVER_SOURCE);
     const driverSyntax = spawnSync(process.execPath, ["--check", driverPath], { encoding: "utf8" });
     assert.equal(driverSyntax.status, 0, driverSyntax.stderr);

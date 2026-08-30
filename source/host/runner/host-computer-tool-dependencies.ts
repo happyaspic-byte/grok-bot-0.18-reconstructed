@@ -449,7 +449,11 @@ export function createHostBrowserDriverDependencies<Context = unknown>(
         await waitFor(operationContext, 10_000, output => output.includes(SAND_BROWSER_STDIN_READY_MARKER));
         const written = await writeInput.execute(operationContext, new WriteShellStdinArgs({
           shellId,
-          chars: stdin,
+          // BackgroundShellManager interprets EOT as an instruction to end
+          // the pipe without forwarding the control byte. The Browser driver
+          // reads one line, but a paused open stdin would otherwise keep its
+          // natural Windows shutdown alive until the footer watchdog kills it.
+          chars: `${stdin}\x04`,
         }));
         if (written.result.case !== "success") return { case: written.result.case ?? "" };
         const stdout = await waitFor(
