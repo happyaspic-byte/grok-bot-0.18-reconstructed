@@ -682,6 +682,7 @@ export function RouterSettingsPanel({ provider, pending = false, onChange, boxRu
       {boxRuntime ? <SettingsGroup title="Computer">
         <div className="sand-provider-usage-card" style={{ gap: 10 }}>
           <SandSwitch
+            ariaLabel="Use local Docker VM"
             checked={boxRuntime.state?.mode === "local-docker"}
             disabled={boxRuntime.pending || boxRuntime.state == null}
             label={<span className="sand-settings-copy">

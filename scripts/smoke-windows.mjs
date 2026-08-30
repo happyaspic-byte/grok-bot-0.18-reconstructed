@@ -760,14 +760,14 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     phase = "strict-docker-control-plane";
     await waitForRendererState(
       launched.cdp,
-      `(() => { const toggle = document.querySelector('button[role="switch"][aria-label="Use local Docker VM"]'); const ready = toggle instanceof HTMLButtonElement && !toggle.disabled && toggle.getAttribute('aria-checked') === 'false'; if (ready) toggle.click(); return { clicked: ready, checked: toggle?.getAttribute('aria-checked') ?? null, disabled: toggle?.disabled ?? null }; })()`,
+      `(() => { const dialog = document.querySelector('[role="dialog"][aria-label="Grok Bot settings"]'); const switches = [...(dialog?.querySelectorAll('button[role="switch"]') ?? [])]; const matching = switches.filter(node => node instanceof HTMLButtonElement && node.getAttribute('aria-label') === 'Use local Docker VM' && node.isConnected && node.getClientRects().length > 0); const toggle = matching.length === 1 ? matching[0] : null; const ready = toggle instanceof HTMLButtonElement && !toggle.disabled && toggle.getAttribute('aria-checked') === 'false'; if (ready) toggle.click(); return { clicked: ready, matchCount: matching.length, checked: toggle?.getAttribute('aria-checked') ?? null, disabled: toggle?.disabled ?? null, switches: switches.map(node => ({ label: node.getAttribute('aria-label'), checked: node.getAttribute('aria-checked'), disabled: node.disabled, visible: node.isConnected && node.getClientRects().length > 0 })) }; })()`,
       value => value?.clicked === true,
       "Local Docker switch was not available from the fresh 9Router profile",
     );
     await waitForRendererState(
       launched.cdp,
-      `(async () => { const runtime = await window.desktop.agent.getBoxRuntime(); const toggle = document.querySelector('button[role="switch"][aria-label="Use local Docker VM"]'); return { mode: runtime?.mode ?? null, ready: runtime?.status?.ready === true, detail: runtime?.status?.detail ?? null, checked: toggle?.getAttribute('aria-checked') ?? null, text: document.body?.innerText ?? '' }; })()`,
-      value => value?.mode === "local-docker" && value.ready === true && value.checked === "true" && /Local Docker VM is ready/i.test(value.text ?? value.detail ?? ""),
+      `(async () => { const runtime = await window.desktop.agent.getBoxRuntime(); const dialog = document.querySelector('[role="dialog"][aria-label="Grok Bot settings"]'); const switches = [...(dialog?.querySelectorAll('button[role="switch"]') ?? [])]; const matching = switches.filter(node => node instanceof HTMLButtonElement && node.getAttribute('aria-label') === 'Use local Docker VM' && node.isConnected && node.getClientRects().length > 0); const toggle = matching.length === 1 ? matching[0] : null; return { mode: runtime?.mode ?? null, ready: runtime?.status?.ready === true, detail: runtime?.status?.detail ?? null, matchCount: matching.length, checked: toggle?.getAttribute('aria-checked') ?? null, text: document.body?.innerText ?? '' }; })()`,
+      value => value?.mode === "local-docker" && value.ready === true && value.matchCount === 1 && value.checked === "true" && /Local Docker VM is ready/i.test(value.text ?? value.detail ?? ""),
       "Strict Docker control plane did not reach ready state",
       60_000,
     );

@@ -151,6 +151,7 @@ export function SandCheckbox({ checked: controlledChecked, defaultChecked = fals
 }
 
 export interface SandSwitchProps {
+  readonly ariaLabel?: string;
   readonly checked?: boolean;
   readonly defaultChecked?: boolean;
   readonly onCheckedChange?: (checked: boolean) => void;
@@ -161,13 +162,13 @@ export interface SandSwitchProps {
   readonly id?: string;
 }
 
-export function SandSwitch({ checked: controlledChecked, defaultChecked = false, onCheckedChange, disabled = false, label, size = "md", variant = "green", id }: SandSwitchProps): ReactNode {
+export function SandSwitch({ ariaLabel, checked: controlledChecked, defaultChecked = false, onCheckedChange, disabled = false, label, size = "md", variant = "green", id }: SandSwitchProps): ReactNode {
   const [uncontrolledChecked, setUncontrolledChecked] = useState(defaultChecked);
   const isControlled = controlledChecked !== undefined;
   const isChecked = isControlled ? controlledChecked : uncontrolledChecked;
   const toggle = () => { const next = !isChecked; if (!isControlled) setUncontrolledChecked(next); onCheckedChange?.(next); };
   return <label htmlFor={id} data-disabled={disabled || undefined}>
-    <button aria-checked={isChecked} disabled={disabled} id={id} onClick={toggle} role="switch" type="button">
+    <button aria-checked={isChecked} aria-label={ariaLabel} disabled={disabled} id={id} onClick={toggle} role="switch" type="button">
       <span aria-hidden="true" data-checked={isChecked || undefined} data-component="switch" data-disabled={disabled || undefined} data-size={size} data-variant={variant} style={{ background: isChecked ? "var(--cursor-bg-accent)" : "var(--cursor-bg-tertiary)" }}><span style={{ transform: isChecked ? "translateX(16px)" : "translateX(0)" }} /></span>
     </button>
     {label == null ? null : <span>{label}</span>}

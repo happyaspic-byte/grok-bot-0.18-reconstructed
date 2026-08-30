@@ -47,6 +47,10 @@ test("Windows packaged smoke exercises the complete signed-out 9Router setup in 
   assert.match(source, /eventStreamHeld === true/);
   assert.match(source, /Settings closed before the restarted coordinator transport became ready/);
   assert.match(source, /runtimeReady === true/);
+  assert.match(source, /document\.querySelector\('\[role="dialog"\]\[aria-label="Grok Bot settings"\]'\)/);
+  assert.match(source, /matching\.length === 1/);
+  assert.match(source, /matchCount: matching\.length/);
+  assert.match(source, /label: node\.getAttribute\('aria-label'\)[\s\S]*visible: node\.isConnected/);
   assert.match(source, /credential\?\.isPersistent === true/);
   assert.match(source, /probeModels\?\.includes\(SMOKE_MODEL\)/);
   assert.match(source, /window\.desktop\?\.windowControls\?\.close/);

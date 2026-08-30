@@ -117,6 +117,7 @@ test("9Router settings expose secure Tailscale setup without weakening the defau
   const preload = await readFile(path.join(repoRoot, "source/electron-preload/preload.ts"), "utf8");
   const desktopBridge = await readFile(path.join(repoRoot, "frontend/src/recovered/contracts/desktop-bridge.ts"), "utf8");
   const panel = await readFile(path.join(repoRoot, "frontend/src/recovered/features/settings/overlay/panels.tsx"), "utf8");
+  const formPrimitives = await readFile(path.join(repoRoot, "frontend/src/recovered/ui/sand-form-primitives.tsx"), "utf8");
   const desktopSurface = await readFile(path.join(repoRoot, "frontend/src/recovered/features/settings/overlay/desktop-surface.tsx"), "utf8");
   const coordinator = await readFile(path.join(repoRoot, "source/node-agent-coordinator/inference-router.ts"), "utf8");
   assert.match(preload, /cliProxy:\s*\{[\s\S]*status:[\s\S]*save:[\s\S]*remove:/);
@@ -147,6 +148,9 @@ test("9Router settings expose secure Tailscale setup without weakening the defau
   assert.match(panel, /Coordinator connected/);
   assert.doesNotMatch(panel, /cliProxy\.on(?:Delete|Test)\(\)\.catch\(\(\) => undefined\)/);
   assert.match(panel, /Use local Docker VM/);
+  assert.match(panel, /<SandSwitch[\s\S]{0,120}ariaLabel="Use local Docker VM"/);
+  assert.match(formPrimitives, /readonly ariaLabel\?: string/);
+  assert.match(formPrimitives, /<button aria-checked=\{isChecked\} aria-label=\{ariaLabel\}/);
   assert.match(panel, /Repair Local Docker VM/);
   assert.match(panel, /boxRuntime\.onChange\("local-docker"\)/);
   assert.match(panel, /computer tools locally on this Windows PC/);
