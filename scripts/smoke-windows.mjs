@@ -452,6 +452,7 @@ async function startHarnessServers(secretCanary) {
     response.end(JSON.stringify({ error: { message: "unexpected smoke route" } }));
   });
   const routerPort = await listenLoopback(router, 0);
+  const routerBaseUrl = `http://127.0.0.1:${routerPort}/v1`;
 
   const gatewayRequests = [];
   const gatewayState = {
@@ -462,6 +463,17 @@ async function startHarnessServers(secretCanary) {
     holdNextEventStream: false,
     eventStreamHeld: false,
     releaseHeldEventStream: null,
+    cliProxyLeaseActive: false,
+    cliProxyLeaseInstalls: 0,
+    cliProxyModelProbes: 0,
+  };
+  let cliProxyLease;
+  let cliProxyLeaseExpiryTimer;
+  const clearHarnessCliProxyLease = () => {
+    if (cliProxyLeaseExpiryTimer != null) clearTimeout(cliProxyLeaseExpiryTimer);
+    cliProxyLeaseExpiryTimer = undefined;
+    cliProxyLease = undefined;
+    gatewayState.cliProxyLeaseActive = false;
   };
   const handleGatewayRequest = async (request, response) => {
     if (request.method === "GET" && request.url === "/health") {
@@ -521,8 +533,13 @@ async function startHarnessServers(secretCanary) {
       const args = await readJsonRequest(request);
       if (command === "setHostSettings") {
         if (typeof args !== "object" || args == null || Array.isArray(args)) throw new Error("setHostSettings needs an object");
-        gatewayState.hostSettings = { ...gatewayState.hostSettings, ...args };
         audit.clearedCliProxyLease = args.clearCliProxyCredentialLease === true;
+        if (audit.clearedCliProxyLease || (args.inferenceProvider !== undefined && args.inferenceProvider !== "cli-proxy")) {
+          clearHarnessCliProxyLease();
+        }
+        const hostSettingsUpdate = { ...args };
+        delete hostSettingsUpdate.clearCliProxyCredentialLease;
+        gatewayState.hostSettings = { ...gatewayState.hostSettings, ...hostSettingsUpdate };
         writeJson(response, 200, gatewayState.hostSettings);
         return;
       }
@@ -546,6 +563,85 @@ async function startHarnessServers(secretCanary) {
         writeJson(response, 200, { ok: true });
         return;
       }
+      if (command === "leaseCliProxyCredential") {
+        if (
+          typeof args !== "object"
+          || args == null
+          || Array.isArray(args)
+          || Object.keys(args).length !== 1
+          || !("config" in args)
+        ) {
+          throw new Error("leaseCliProxyCredential needs exactly one config object");
+        }
+        const config = args.config;
+        const configKeys = typeof config === "object" && config != null && !Array.isArray(config)
+          ? Object.keys(config).sort()
+          : [];
+        const expectedKeys = ["allowRemoteHttps", "allowTailscaleHttp", "apiKey", "baseUrl", "model", "protocol"];
+        if (
+          configKeys.length !== expectedKeys.length
+          || configKeys.some((key, index) => key !== expectedKeys[index])
+          || config.baseUrl !== routerBaseUrl
+          || config.model !== SMOKE_MODEL
+          || config.protocol !== "chat-completions"
+          || config.allowRemoteHttps !== false
+          || config.allowTailscaleHttp !== false
+          || config.apiKey !== secretCanary
+        ) {
+          throw new Error("leaseCliProxyCredential received an invalid 9Router turn config");
+        }
+        clearHarnessCliProxyLease();
+        gatewayState.cliProxyLeaseInstalls += 1;
+        const expiresAtMs = Date.now() + 30 * 60_000;
+        const generation = gatewayState.cliProxyLeaseInstalls;
+        cliProxyLease = {
+          config: Object.freeze({ ...config }),
+          expiresAtMs,
+          generation,
+        };
+        cliProxyLeaseExpiryTimer = setTimeout(() => {
+          if (cliProxyLease?.generation === generation) clearHarnessCliProxyLease();
+        }, 30 * 60_000);
+        cliProxyLeaseExpiryTimer.unref?.();
+        gatewayState.cliProxyLeaseActive = true;
+        audit.cliProxyLeaseValidated = true;
+        audit.cliProxyLeaseInstall = gatewayState.cliProxyLeaseInstalls;
+        writeJson(response, 200, { expiresAtMs });
+        return;
+      }
+      if (command === "probeCliProxyModels") {
+        if (typeof args !== "object" || args == null || Array.isArray(args) || Object.keys(args).length !== 0) {
+          throw new Error("probeCliProxyModels must not receive config or credentials");
+        }
+        const lease = cliProxyLease;
+        if (lease == null || lease.expiresAtMs <= Date.now()) {
+          clearHarnessCliProxyLease();
+          throw new Error("probeCliProxyModels requires an active credential lease");
+        }
+        const probeStartedAtMs = Date.now();
+        const probeResponse = await fetch(`${lease.config.baseUrl}/models`, {
+          method: "GET",
+          headers: {
+            accept: "application/json",
+            authorization: `Bearer ${lease.config.apiKey}`,
+            connection: "close",
+            "user-agent": "grok-bot-9router/1",
+          },
+          redirect: "error",
+          signal: AbortSignal.timeout(5_000),
+        });
+        if (!probeResponse.ok) throw new Error("leased 9Router model probe was not authorized");
+        const probeDocument = await probeResponse.json();
+        const probeModels = Array.isArray(probeDocument?.data)
+          ? probeDocument.data.map(item => item?.id).filter(id => typeof id === "string" && id.length > 0)
+          : [];
+        gatewayState.cliProxyModelProbes += 1;
+        audit.credentialFreeCliProxyProbe = true;
+        audit.cliProxyLeaseInstall = lease.generation;
+        audit.authenticatedRouterProbe = probeModels.includes(SMOKE_MODEL);
+        writeJson(response, 200, { outcome: probeModels.length > 0 ? "ok" : "empty", latencyMs: Math.max(0, Date.now() - probeStartedAtMs) });
+        return;
+      }
       audit.unsupported = true;
       writeJson(response, 404, { error: `unsupported Windows smoke gateway command: ${command}` });
       return;
@@ -560,6 +656,7 @@ async function startHarnessServers(secretCanary) {
       else writeJson(response, 500, { error: error instanceof Error ? error.message : String(error) });
     });
   });
+  gateway.once("close", clearHarnessCliProxyLease);
   try { await listenLoopback(gateway, 1340); }
   catch (error) {
     try { await closeServer(router, "router harness after gateway bind failure"); }
@@ -574,7 +671,7 @@ async function startHarnessServers(secretCanary) {
     gatewayRequests,
     gatewayState,
     routerRequests,
-    routerBaseUrl: `http://127.0.0.1:${routerPort}/v1`,
+    routerBaseUrl,
   };
 }
 
@@ -951,9 +1048,18 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     if (protectedGatewayRequests.length === 0 || protectedGatewayRequests.some(request => request.authorized !== true || request.unsupported === true)) {
       throw new Error(`Mock gateway observed an unauthorized or unsupported coordinator request: ${JSON.stringify(servers.gatewayRequests)}`);
     }
+    if (JSON.stringify(servers.gatewayRequests).includes(secretCanary)) throw new Error("9Router API key reached the gateway audit log");
     if (servers.gatewayRequests.filter(request => request.url === "/events").length < 2) throw new Error("Coordinator did not reconnect its authenticated gateway event stream");
-    for (const route of ["/api/getHostSettings", "/api/setHostSettings", "/api/setBoxSecrets", "/api/setWindowFocused", "/api/listAgents"]) {
+    for (const route of ["/api/getHostSettings", "/api/setHostSettings", "/api/setBoxSecrets", "/api/setWindowFocused", "/api/listAgents", "/api/leaseCliProxyCredential", "/api/probeCliProxyModels"]) {
       if (!servers.gatewayRequests.some(request => request.url === route)) throw new Error(`Coordinator resync did not reach ${route}`);
+    }
+    const leaseRequests = servers.gatewayRequests.filter(request => request.url === "/api/leaseCliProxyCredential");
+    const containerProbeRequests = servers.gatewayRequests.filter(request => request.url === "/api/probeCliProxyModels");
+    if (leaseRequests.length < 2 || leaseRequests.some(request => request.cliProxyLeaseValidated !== true)) {
+      throw new Error("Fresh and recovered Local Docker sessions did not each receive a strictly validated memory-only 9Router credential lease");
+    }
+    if (containerProbeRequests.length < 2 || containerProbeRequests.some(request => request.credentialFreeCliProxyProbe !== true || request.authenticatedRouterProbe !== true || !(request.cliProxyLeaseInstall > 0))) {
+      throw new Error("Fresh and recovered Local Docker sessions did not probe 9Router through the credential-free leased gateway contract");
     }
     if (servers.gatewayState.healthChecks < 1 || servers.gatewayState.hostSettings.inferenceProvider !== "cli-proxy") {
       throw new Error("Local Docker health or coordinator host-settings resync did not become authoritative");
@@ -961,6 +1067,7 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     if (!servers.gatewayRequests.some(request => request.url === "/api/setHostSettings" && request.clearedCliProxyLease === true)) {
       throw new Error("Final 9Router save did not revoke the prior host credential lease over the authenticated coordinator channel");
     }
+    if (servers.gatewayState.cliProxyLeaseActive !== false) throw new Error("Final graceful quit left the mock host credential lease active");
     if (!servers.gatewayRequests.some(request => request.url === "/api/listAgents")) throw new Error("Login-free workspace never reached the coordinator roster path");
     const transcript = await readFile(dockerTranscriptPath, "utf8");
     const dockerCommands = parseFakeDockerTranscript(transcript);
