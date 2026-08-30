@@ -144,6 +144,48 @@ test("replacement readiness cannot reuse a connected previous coordinator port",
   }
 });
 
+test("replacement wait resolves when the newer port connected before registration", async () => {
+  const loaded = await loadClient();
+  try {
+    const ports = bridge();
+    const client = loaded.module.createCoordinatorClient(ports.source);
+    assert.ok(client);
+
+    const first = transferredPort();
+    ports.deliver(first);
+    first.emitMessage({ kind: "lifecycle", phase: "ready", protocolVersion: 1 });
+    first.emitMessage({ kind: "event", family: "coordinator-transport-state", payload: { state: "connected" } });
+    const baselineGeneration = client.getPortGeneration();
+
+    const second = transferredPort();
+    ports.deliver(second);
+    second.emitMessage({ kind: "lifecycle", phase: "ready", protocolVersion: 1 });
+    second.emitMessage({ kind: "event", family: "coordinator-transport-state", payload: { state: "connected" } });
+
+    await client.waitForTransportConnectedAfterPortGeneration(baselineGeneration, 1_000);
+    assert.equal(client.getPortGeneration(), baselineGeneration + 1);
+    assert.equal(client.getTransportState(), "connected");
+    client.dispose();
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("disposing rejects a pending replacement-port wait immediately", async () => {
+  const loaded = await loadClient();
+  try {
+    const ports = bridge();
+    const client = loaded.module.createCoordinatorClient(ports.source);
+    assert.ok(client);
+
+    const pending = client.waitForTransportConnectedAfterPortGeneration(client.getPortGeneration(), 60_000);
+    client.dispose();
+    await assert.rejects(pending, /Coordinator client is disposed/);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
 test("a replacement coordinator generation can serve calls after the first disconnects", async () => {
   const loaded = await loadClient();
   try {
