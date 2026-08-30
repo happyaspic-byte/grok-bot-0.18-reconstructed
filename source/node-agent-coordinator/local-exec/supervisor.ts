@@ -58,7 +58,7 @@ interface LocalExecControl {
   isProcessAlive(args: { readonly pid: number }): Promise<boolean>;
   getProcessIdentity(args: ExpectedLocalExecProcessIdentity): Promise<LocalExecProcessIdentity | null>;
   inspectLocalExecProcessIdentity?(args: ExpectedLocalExecProcessIdentity): Promise<
-    | { readonly status: "matching"; readonly identity: LocalExecProcessIdentity }
+    | { readonly status: "matching"; readonly identity: LocalExecProcessIdentity; readonly hasRetainedHandle?: boolean }
     | { readonly status: "different" | "absent" | "unreadable" }
   >;
   waitLocalExecDaemonExit(identity: LocalExecProcessIdentity): Promise<{ readonly identity: LocalExecProcessIdentity; readonly exitCode: number | null; readonly signal: string | null }>;
@@ -159,19 +159,25 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
   const inspectQuarantinedProcess = async (
     expected: ExpectedLocalExecProcessIdentity,
   ): Promise<
-    | { readonly status: "matching"; readonly identity: LocalExecProcessIdentity }
+    | { readonly status: "matching"; readonly identity: LocalExecProcessIdentity; readonly hasRetainedHandle: boolean }
     | { readonly status: "different" | "absent" | "unreadable" }
   > => {
     if (options.control.inspectLocalExecProcessIdentity != null) {
       try {
         const inspected = await options.control.inspectLocalExecProcessIdentity(expected);
-        if (inspected.status === "matching" && isProcessIdentity(inspected.identity)) return inspected;
+        if (inspected.status === "matching" && isProcessIdentity(inspected.identity)) {
+          return {
+            status: "matching",
+            identity: inspected.identity,
+            hasRetainedHandle: inspected.hasRetainedHandle === true,
+          };
+        }
         if (inspected.status === "different" || inspected.status === "absent" || inspected.status === "unreadable") return inspected;
       } catch {}
       return { status: "unreadable" };
     }
     const observed = await currentIdentity(expected);
-    if (observed != null) return { status: "matching", identity: observed };
+    if (observed != null) return { status: "matching", identity: observed, hasRetainedHandle: true };
     try { return await options.control.isProcessAlive({ pid: expected.pid }) ? { status: "unreadable" } : { status: "absent" }; }
     catch { return { status: "unreadable" }; }
   };
@@ -244,6 +250,14 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
     } catch {}
   };
 
+  const confirmReadyIdentity = async (identity: LocalExecProcessIdentity): Promise<void> => {
+    if (options.control.confirmLocalExecDaemonReady == null) return;
+    const confirmation = await options.control.confirmLocalExecDaemonReady({ identity });
+    if (confirmation?.confirmed !== true) {
+      throw new Error(`local-exec daemon ${identity.pid} readiness confirmation was refused`);
+    }
+  };
+
   const spawnDaemon = async () => {
     if (paused || refusedForClientPause) return;
     const spawned = await options.control.spawnLocalExecDaemon({
@@ -268,12 +282,7 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
         const observed = await currentIdentity(spawned);
         if (observed == null || !sameLocalExecProcessIdentity(observed, spawned)) throw new Error(`local-exec daemon ${spawned.pid} exited or changed identity before readiness`);
         if (discovery != null && descriptorMatchesProcess(discovery, spawned, now())) {
-          if (options.control.confirmLocalExecDaemonReady != null) {
-            const confirmation = await options.control.confirmLocalExecDaemonReady({ identity: spawned });
-            if (confirmation?.confirmed !== true) {
-              throw new Error(`local-exec daemon ${spawned.pid} readiness confirmation was refused`);
-            }
-          }
+          await confirmReadyIdentity(spawned);
           clearQuarantine();
           state = activeGeneration("spawned", discovery, spawned);
           missingDiscoveryTicks = 0;
@@ -323,6 +332,10 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
   const establishDaemon = async () => {
     if (paused || refusedForClientPause) return;
     try {
+      const startupQuarantine = await reconcileStartupQuarantine();
+      if (startupQuarantine.blocked) {
+        throw new Error(startupQuarantine.reason ?? "local-exec startup quarantine is blocked");
+      }
       if (await quarantineBlocksSpawn()) {
         state = { phase: "failed", reason: "local-exec process identity is quarantined until its exit is confirmed" };
         return;
@@ -334,13 +347,18 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
           ? { ...existing, discoveryStartedAt: existing.startedAt }
           : undefined;
         let identity = expected == null ? null : await currentIdentity(expected);
-        if (identity == null && expected != null) {
+        let hasRetainedHandle = true;
+        if (expected != null) {
           const inspected = await inspectQuarantinedProcess(expected);
-          if (inspected.status === "matching") identity = inspected.identity;
-          else if (inspected.status === "different" || inspected.status === "absent") {
+          if (inspected.status === "matching") {
+            identity = inspected.identity;
+            hasRetainedHandle = inspected.hasRetainedHandle;
+          } else if (inspected.status === "different" || inspected.status === "absent") {
             await removeLocalExecDaemonDiscoveryIfMatches(paths.discoveryPath, existing);
             await spawnDaemon();
             return;
+          } else if (identity != null) {
+            hasRetainedHandle = false;
           }
         }
         if (identity == null || !descriptorMatchesProcess(existing, identity, now())) {
@@ -352,7 +370,8 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
           await spawnDaemon();
           return;
         }
-        if ((existing.inflightCount ?? 0) > 0) {
+        if ((existing.inflightCount ?? 0) > 0 || !hasRetainedHandle) {
+          await confirmReadyIdentity(identity);
           clearQuarantine();
           state = { phase: "adopting", pid: existing.pid };
           state = activeGeneration("adopted", existing, identity);
@@ -429,6 +448,7 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
       } else {
         const successorIdentity = descriptorHasIdentity(discovery) ? await currentIdentity({ ...discovery, discoveryStartedAt: discovery.startedAt }) : null;
         if (successorIdentity != null && descriptorMatchesProcess(discovery, successorIdentity, now())) {
+          await confirmReadyIdentity(successorIdentity);
           await terminateIfStillOwned(activeIdentity);
           clearQuarantine();
           state = activeGeneration("adopted", discovery, successorIdentity);

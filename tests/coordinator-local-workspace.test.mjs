@@ -1623,17 +1623,17 @@ test("pre-spawn durable quarantine reconciliation does not consume the superviso
 
     await supervisor.start();
     assert.equal(supervisor.state().phase, "failed");
-    assert.equal(spawnCalls, 1);
+    assert.equal(spawnCalls, 0);
     for (let attempt = 0; attempt < loaded.module.LOCAL_EXEC_DAEMON_RESPAWN_LIMIT + 3; attempt += 1) {
       await liveness.tick();
     }
     assert.equal(supervisor.state().phase, "failed");
     assert.match(supervisor.state().reason, /durable startup quarantine/);
-    assert.equal(spawnCalls, 1, "pre-spawn reconciliation blocks must not invoke spawn again");
+    assert.equal(spawnCalls, 0, "pre-spawn reconciliation blocks must not invoke spawn");
     assert.ok(reconciliationCalls > loaded.module.LOCAL_EXEC_DAEMON_RESPAWN_LIMIT);
     blocked = false;
     await liveness.tick();
-    assert.equal(spawnCalls, 2);
+    assert.equal(spawnCalls, 1);
     assert.equal(supervisor.state().phase, "active");
     assert.equal(supervisor.state().daemon.pid, identity.pid);
     await supervisor.dispose();
@@ -1739,6 +1739,82 @@ test("local-exec replacement fails closed when a verified predecessor refuses te
   }
 });
 
+test("local-exec safely adopts an exact idle predecessor when no retained handle survives restart", async () => {
+  const loaded = await loadModule("source/node-agent-coordinator/local-exec/supervisor.ts");
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-supervisor-"));
+  const discoveryPath = path.join(temporary, "local-exec-daemon.json");
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const predecessor = localExecIdentity(4_111, 1_000, entryRealpath, "persisted-generation");
+  const descriptor = {
+    pid: predecessor.pid,
+    startedAt: 2_000,
+    entryRealpath,
+    generationToken: predecessor.generationToken,
+    inflightCount: 0,
+  };
+  let spawnCalls = 0;
+  let terminationCalls = 0;
+  let confirmationCalls = 0;
+  try {
+    await writeFile(discoveryPath, JSON.stringify(descriptor), "utf8");
+    const supervisor = loaded.module.createLocalExecDaemonSupervisor({
+      dataDir: temporary,
+      isPackaged: true,
+      refreshPolicy: inertLocalExecPollingPolicy(),
+      livenessPolicy: inertLocalExecPollingPolicy(),
+      now: () => 3_000,
+      control: {
+        async resolveGatewayConnection() { return { endpoint: "loopback" }; },
+        async mintLocalExecDaemonCredential() { return null; },
+        async reconcileLocalExecStartupQuarantine() { return { blocked: false, reason: null }; },
+        async confirmLocalExecDaemonReady({ identity }) {
+          confirmationCalls += 1;
+          assert.deepEqual(identity, predecessor);
+          return { confirmed: true };
+        },
+        async spawnLocalExecDaemon() {
+          spawnCalls += 1;
+          assert.fail("a verified handleless predecessor must be adopted without replacement");
+        },
+        async getProcessIdentity({ pid }) { return pid === predecessor.pid ? predecessor : null; },
+        async inspectLocalExecProcessIdentity({ pid }) {
+          return pid === predecessor.pid
+            ? { status: "matching", identity: predecessor, hasRetainedHandle: false }
+            : { status: "absent" };
+        },
+        async isProcessAlive({ pid }) { return pid === predecessor.pid; },
+        async terminateProcess() {
+          terminationCalls += 1;
+          assert.fail("a handleless predecessor must never be signalled");
+        },
+        async waitLocalExecDaemonExit() { return await new Promise(() => {}); },
+      },
+    });
+
+    await supervisor.start();
+    assert.equal(spawnCalls, 0);
+    assert.equal(terminationCalls, 0);
+    assert.equal(confirmationCalls, 1);
+    assert.deepEqual(supervisor.state(), {
+      phase: "active",
+      daemon: {
+        origin: "adopted",
+        pid: predecessor.pid,
+        startedAt: descriptor.startedAt,
+        processStartEpochMs: predecessor.startEpochMs,
+        command: predecessor.command,
+        entryRealpath,
+        generationToken: predecessor.generationToken,
+      },
+    });
+    assert.deepEqual(JSON.parse(await readFile(discoveryPath, "utf8")), descriptor);
+    await supervisor.dispose();
+  } finally {
+    await loaded.dispose();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test("local-exec quarantine releases an unrelated reused PID and recovers without signalling it", async () => {
   const loaded = await loadModule("source/node-agent-coordinator/local-exec/supervisor.ts");
   const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-supervisor-"));
@@ -1793,9 +1869,9 @@ test("local-exec quarantine releases an unrelated reused PID and recovers withou
           if (pid === predecessor.pid) {
             return predecessorReused
               ? { status: "different" }
-              : { status: "matching", identity: predecessor };
+              : { status: "matching", identity: predecessor, hasRetainedHandle: true };
           }
-          if (pid === successor.pid && successorAlive) return { status: "matching", identity: successor };
+          if (pid === successor.pid && successorAlive) return { status: "matching", identity: successor, hasRetainedHandle: true };
           return { status: "absent" };
         },
         async isProcessAlive({ pid }) {
@@ -2268,6 +2344,101 @@ test("Windows local-exec termination refuses a PID-only path without a retained 
   }
 });
 
+test("Windows handleless expected-identity termination requires stable-handle opt-in", async () => {
+  const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
+  try {
+    const expected = { pid: 5_208, startEpochMs: 10, command: "expected daemon" };
+    let powershellCalls = 0;
+    await assert.rejects(
+      loaded.module.terminateProcess(expected.pid, {
+        platform: "win32",
+        expectedIdentity: expected,
+        readIdentity: () => expected,
+        isAlive: () => true,
+        execFileSync() {
+          powershellCalls += 1;
+          return "";
+        },
+      }),
+      error => error instanceof loaded.module.LocalExecTerminationIdentityError
+        && /no retained child-process handle/.test(error.message),
+    );
+    assert.equal(powershellCalls, 0);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("Windows updater termination acquires and validates a stable process handle in one PowerShell lane", async () => {
+  const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
+  try {
+    const expected = {
+      pid: 5_210,
+      startEpochMs: 1_788_123_741_538,
+      command: '"C:\\app\\Grok Bot.exe" "C:\\app\\main.cjs" --sand-local-exec-generation=update-generation',
+    };
+    let invocation;
+    let waited = false;
+    await loaded.module.terminateProcess(expected.pid, {
+      platform: "win32",
+      expectedIdentity: expected,
+      allowVerifiedWindowsHandleAcquisition: true,
+      environment: { SystemRoot: "D:\\Windows" },
+      execFileSync(file, args, options) {
+        invocation = { file, args, options };
+        return "";
+      },
+      readIdentity: () => expected,
+      isAlive: () => true,
+      async waitForExit(pid) {
+        assert.equal(pid, expected.pid);
+        waited = true;
+      },
+    });
+    assert.equal(invocation.file, "D:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    assert.deepEqual(invocation.args.slice(0, 4), ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
+    const script = invocation.args[4];
+    assert.match(script, /Get-CimInstance Win32_Process/);
+    assert.match(script, /GetProcessById\(5210\)/);
+    assert.match(script, /\$null = \$target\.Handle/);
+    assert.match(script, /\$target\.StartTime/);
+    assert.match(script, /\$target\.Kill\(\)/);
+    assert.match(script, /WaitForExit\(5000\)/);
+    assert.doesNotMatch(script, /taskkill|Stop-Process|process\.kill/i);
+    assert.equal(invocation.options.windowsHide, true);
+    assert.equal(waited, true);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("retained-handle termination without an expected identity requires explicit opt-in", async () => {
+  const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
+  try {
+    const signals = [];
+    const ownedChild = {
+      pid: 5_208,
+      exitCode: null,
+      signalCode: null,
+      kill(signal) { signals.push(signal); return true; },
+      once() {},
+      off() {},
+    };
+    await assert.rejects(
+      loaded.module.terminateProcess(5_208, {
+        platform: "win32",
+        ownedChild,
+        isAlive: () => true,
+      }),
+      error => error instanceof loaded.module.LocalExecTerminationIdentityError
+        && /explicit unidentified-owned opt-in/.test(error.message),
+    );
+    assert.deepEqual(signals, []);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
 test("Windows expected-identity termination uses only the retained process handle", async () => {
   const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
   try {
@@ -2478,6 +2649,46 @@ test("POSIX identified termination will not signal a retained handle after ident
   }
 });
 
+test("staged-update daemon shutdown forwards an exact identity into stable Windows handle acquisition", async () => {
+  const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-update-stop-"));
+  const discoveryPath = path.join(temporary, "local-exec-daemon.json");
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const generationToken = "staged-update-generation";
+  const observed = {
+    pid: 5_311,
+    startEpochMs: 9_900,
+    command: `node "${entryRealpath}" --sand-local-exec-generation=${generationToken}`,
+  };
+  let termination;
+  try {
+    await writeFile(discoveryPath, JSON.stringify({
+      pid: observed.pid,
+      startedAt: 9_950,
+      entryRealpath,
+      generationToken,
+      inflightCount: 0,
+    }), "utf8");
+    await loaded.module.killLocalExecDaemon(discoveryPath, {
+      expectedPid: observed.pid,
+      expectedEntryRealpath: entryRealpath,
+      readIdentity: () => observed,
+      now: () => 10_000,
+      async terminate(pid, options) {
+        termination = { pid, options };
+      },
+    });
+    assert.equal(termination.pid, observed.pid);
+    assert.deepEqual(termination.options, {
+      expectedIdentity: observed,
+      allowVerifiedWindowsHandleAcquisition: true,
+    });
+  } finally {
+    await loaded.dispose();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test("local-exec startup ownership is persisted before polling and cleared only after readiness", async () => {
   const source = await readFile(
     path.join(repoRoot, "source/electron-main/coordinator/coordinator-executors.ts"),
@@ -2498,29 +2709,50 @@ test("local-exec startup ownership is persisted before polling and cleared only 
     /LOCAL_EXEC_STARTUP_QUARANTINE_REASON/,
   );
 
-  const helperStart = source.indexOf("const stopUnidentifiedSpawn = async");
+  const reconcileStart = source.indexOf("const reconcileStartupQuarantine = async");
+  const helperStart = source.indexOf("const stopUnidentifiedSpawn = async", reconcileStart);
+  assert.ok(reconcileStart >= 0 && helperStart > reconcileStart);
+  const reconcileBody = source.slice(reconcileStart, helperStart);
+  assert.match(reconcileBody, /readStartupQuarantines\(\)/);
+  assert.match(reconcileBody, /classification === "reused"/);
+  assert.match(reconcileBody, /classification === "ambiguous"/);
+  assert.match(reconcileBody, /readDaemonDiscovery\(\)/);
+  assert.match(reconcileBody, /discovery\.pid === entry\.pid/);
+  assert.match(reconcileBody, /discovery\.entryRealpath === entry\.entryRealpath/);
+  assert.match(reconcileBody, /discovery\.generationToken === entry\.generationToken/);
+  assert.match(reconcileBody, /localExecDiscoveryTimeMatchesProcess/);
+  assert.match(reconcileBody, /ownedDaemonIdentities\.set\(entry\.pid/);
+  assert.match(reconcileBody, /releaseStartupQuarantine\(entry\)/);
+
   const helperEnd = source.indexOf("const inspectExpectedProcessIdentity", helperStart);
-  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  assert.ok(helperEnd > helperStart);
   const helperBody = source.slice(helperStart, helperEnd);
-  assert.match(helperBody, /persisted \?\? await writeStartupQuarantine\(candidate\)/);
-  assert.match(helperBody, /PID-only termination is forbidden/);
-  assert.match(helperBody, /process start is ambiguous/);
+  assert.match(helperBody, /let quarantine = persisted/);
+  assert.match(helperBody, /writeStartupQuarantine\(candidate\)/);
+  assert.match(helperBody, /allowUnidentifiedOwnedEscalation: true/);
+  assert.match(helperBody, /isUnidentifiedProcessStillOwned: isStillOwned/);
   assert.match(helperBody, /expectedIdentity: observed/);
   assert.match(helperBody, /ownedChild: child/);
-  assert.match(helperBody, /classifyStartupQuarantineProcess\(quarantine, observed\)/);
+  assert.match(helperBody, /durable quarantine remains/);
+  assert.match(helperBody, /classifyStartupQuarantineProcess\(durableQuarantine, observed\)/);
   assert.match(helperBody, /native\.isProcessAlive\(pid\)/);
-  assert.match(helperBody, /releaseStartupQuarantine\(quarantine\)/);
+  assert.match(helperBody, /releaseStartupQuarantine\(durableQuarantine\)/);
   assert.doesNotMatch(helperBody, /child\.kill\(/);
-  assert.doesNotMatch(helperBody, /allowUnidentifiedOwnedEscalation/);
 
   const confirmStart = source.indexOf("async confirmLocalExecDaemonReady");
   const confirmEnd = source.indexOf("async terminateProcess", confirmStart);
+  assert.ok(confirmStart >= 0 && confirmEnd > confirmStart);
   const confirmBody = source.slice(confirmStart, confirmEnd);
-  assert.match(confirmBody, /readLocalExecDaemonDiscovery/);
+  assert.match(confirmBody, /readLocalExecDaemonDiscovery|readDaemonDiscovery/);
   assert.match(confirmBody, /localExecDiscoveryTimeMatchesProcess/);
+  assert.match(confirmBody, /readStartupQuarantines\(\)/);
+  assert.match(confirmBody, /quarantine\.pid === identity\.pid/);
+  assert.match(confirmBody, /quarantine\.entryRealpath === identity\.entryRealpath/);
+  assert.match(confirmBody, /quarantine\.generationToken === identity\.generationToken/);
+  assert.match(confirmBody, /classifyStartupQuarantineProcess\(quarantine, identity\) === "match"/);
   assert.match(confirmBody, /releaseStartupQuarantine\(quarantine\)/);
   assert.match(source, /ownedDaemonChildren\.set\(identity\.pid, child\)/);
-  assert.match(source, /inspectLocalExecProcessIdentity: \(expected/);
+  assert.match(source, /hasRetainedHandle: ownedDaemonChildren\.has\(identity\.pid\)/);
   assert.match(source, /reconcileLocalExecStartupQuarantine/);
 
   const nativeSource = await readFile(
@@ -2532,11 +2764,36 @@ test("local-exec startup ownership is persisted before polling and cleared only 
   const terminateBody = nativeSource.slice(terminateStart, terminateEnd);
   assert.match(terminateBody, /ownedChild\.kill\(signalName\)/);
   assert.match(terminateBody, /PID-only termination is forbidden/);
+  assert.match(terminateBody, /requires explicit unidentified-owned opt-in/);
+  assert.match(terminateBody, /allowVerifiedWindowsHandleAcquisition === true/);
   assert.doesNotMatch(terminateBody, /resolveWindowsTaskkillPath/);
   assert.doesNotMatch(terminateBody, /process\.kill/);
+  assert.match(nativeSource, /terminateVerifiedWindowsProcessByHandle/);
+  assert.match(nativeSource, /\$null = \$target\.Handle/);
+  assert.match(nativeSource, /\$target\.StartTime/);
+  assert.match(nativeSource, /\$target\.Kill\(\)/);
+  const killStart = nativeSource.indexOf("export async function killLocalExecDaemon");
+  const killBody = nativeSource.slice(killStart);
+  assert.match(killBody, /expectedPid/);
+  assert.match(killBody, /allowVerifiedWindowsHandleAcquisition: true as const/);
+
+  const bindingSource = await readFile(
+    path.join(repoRoot, "source/electron-main/production-binding-providers.ts"),
+    "utf8",
+  );
+  assert.match(bindingSource, /killLocalExecDaemon\(getLocalExecDaemonDiscoveryPath\(\)\)/);
+  assert.match(bindingSource, /expectedPid: pid/);
+  assert.match(bindingSource, /expectedEntryRealpath: discovery\.entryRealpath/);
+  assert.doesNotMatch(bindingSource, /terminate: ports\.terminate \?\? terminateProcess/);
+
+  const legacySource = await readFile(
+    path.join(repoRoot, "source/electron-main/startup/legacy-daemon-retirement.ts"),
+    "utf8",
+  );
+  assert.match(legacySource, /options\.terminate\(pid, discovery\.value\)/);
 });
 
-test("coordinator supervisor wires structured startup and process-identity reconciliation", async () => {
+test("coordinator supervisor wires structured startup, readiness, and handleless adoption", async () => {
   const mainSource = await readFile(path.join(repoRoot, "source/node-agent-coordinator/main.ts"), "utf8");
   const supervisorSource = await readFile(path.join(repoRoot, "source/node-agent-coordinator/local-exec/supervisor.ts"), "utf8");
   assert.match(mainSource, /reconcileLocalExecStartupQuarantine: \(args\) => command\(commands, "reconcileLocalExecStartupQuarantine", args\)/);
@@ -2544,7 +2801,18 @@ test("coordinator supervisor wires structured startup and process-identity recon
   assert.match(mainSource, /inspectLocalExecProcessIdentity: \(args\) => command\(commands, "inspectLocalExecProcessIdentity", args\)/);
   assert.match(supervisorSource, /startupQuarantine\.blocked/);
   assert.match(supervisorSource, /inspected\.status === "different" \|\| inspected\.status === "absent"/);
-  assert.match(supervisorSource, /confirmLocalExecDaemonReady\(\{ identity: spawned \}\)/);
+  assert.match(supervisorSource, /confirmReadyIdentity\(spawned\)/);
+  assert.match(supervisorSource, /confirmReadyIdentity\(identity\)/);
+  assert.match(supervisorSource, /\(existing\.inflightCount \?\? 0\) > 0 \|\| !hasRetainedHandle/);
+  assert.match(supervisorSource, /activeGeneration\("adopted", existing, identity\)/);
+  const establishStart = supervisorSource.indexOf("const establishDaemon = async");
+  const healStart = supervisorSource.indexOf("const healDaemonInternal", establishStart);
+  assert.ok(establishStart >= 0 && healStart > establishStart);
+  const establishBody = supervisorSource.slice(establishStart, healStart);
+  assert.ok(
+    establishBody.indexOf("reconcileStartupQuarantine()")
+      < establishBody.indexOf("readLocalExecDaemonDiscovery(paths.discoveryPath)"),
+  );
   assert.doesNotMatch(supervisorSource, /state\.reason\.includes\(LOCAL_EXEC_STARTUP_QUARANTINE_REASON\)/);
 });
 

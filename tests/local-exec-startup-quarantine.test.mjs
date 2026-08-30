@@ -262,7 +262,7 @@ test("restart reconciliation releases a reused PID without signalling it and the
   }
 });
 
-test("restart reconciliation signals only an exact generation and clears it after confirmed exit", async () => {
+test("restart reconciliation keeps an exact live generation fenced when no retained handle or ready discovery exists", async () => {
   const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
   const quarantined = {
     version: 1,
@@ -273,38 +273,148 @@ test("restart reconciliation signals only an exact generation and clears it afte
     generationToken: "owned-generation",
   };
   const exactIdentity = matchingIdentity(quarantined.pid, quarantined.entryRealpath, quarantined.generationToken);
-  const freshGeneration = "next-generation";
-  const freshIdentity = matchingIdentity(4_502, quarantined.entryRealpath, freshGeneration);
   const ledger = { records: [quarantined] };
-  let quarantinedAlive = true;
   let terminationCalls = 0;
+  let spawnCalls = 0;
   try {
     const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
       ledger,
       native: {
         async spawnLocalExecDaemon() {
-          return { child: fakeChild(freshIdentity.pid), entryRealpath: quarantined.entryRealpath, generationToken: freshGeneration };
+          spawnCalls += 1;
+          assert.fail("an exact handleless generation must remain fenced");
         },
-        async terminateProcess(pid, options) {
-          assert.equal(pid, quarantined.pid);
-          assert.deepEqual(options, { expectedIdentity: exactIdentity });
+        async terminateProcess() {
           terminationCalls += 1;
-          quarantinedAlive = false;
+          throw new Error("no retained child-process handle");
         },
-        isProcessAlive(pid) { return pid === quarantined.pid ? quarantinedAlive : true; },
-        readProcessIdentity(pid) {
-          if (pid === quarantined.pid) return quarantinedAlive ? exactIdentity : null;
-          if (pid === freshIdentity.pid) return freshIdentity;
-          return null;
-        },
+        isProcessAlive() { return true; },
+        readProcessIdentity(pid) { return pid === quarantined.pid ? exactIdentity : null; },
         resolveLocalExecDaemonEntryRealpath() { return quarantined.entryRealpath; },
       },
     }));
-    const spawned = await executors.spawnLocalExecDaemon({ logPath: "test.log", env: {} });
-    assert.equal(spawned.pid, freshIdentity.pid);
+    const status = await executors.reconcileLocalExecStartupQuarantine();
+    assert.equal(status.blocked, true);
+    assert.match(status.reason, /startup cleanup is quarantined/);
     assert.equal(terminationCalls, 1);
-    assert.equal(ledger.records.length, 1);
-    assert.equal(ledger.records[0].generationToken, freshGeneration);
+    assert.equal(spawnCalls, 0);
+    assert.deepEqual(ledger.records, [quarantined]);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("restart reconciliation accepts a matching ready discovery and adopts it without PID signalling", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const quarantined = {
+    version: 1,
+    spawnRequestedAt: 9_900,
+    pid: 4_551,
+    recordedAt: 10_000,
+    entryRealpath: "C:\\app\\local-exec-daemon\\main.cjs",
+    generationToken: "ready-recovered-generation",
+  };
+  const exactIdentity = matchingIdentity(quarantined.pid, quarantined.entryRealpath, quarantined.generationToken);
+  const ledger = { records: [quarantined] };
+  let terminationCalls = 0;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      overrides: {
+        async readLocalExecDaemonDiscovery() {
+          return {
+            pid: quarantined.pid,
+            startedAt: 9_950,
+            entryRealpath: quarantined.entryRealpath,
+            generationToken: quarantined.generationToken,
+            inflightCount: 0,
+          };
+        },
+      },
+      native: {
+        async spawnLocalExecDaemon() { assert.fail("reconciliation only"); },
+        async terminateProcess() { terminationCalls += 1; },
+        isProcessAlive() { return true; },
+        readProcessIdentity(pid) { return pid === quarantined.pid ? exactIdentity : null; },
+        resolveLocalExecDaemonEntryRealpath() { return quarantined.entryRealpath; },
+      },
+    }));
+    assert.deepEqual(await executors.reconcileLocalExecStartupQuarantine(), { blocked: false, reason: null });
+    assert.equal(terminationCalls, 0);
+    assert.deepEqual(ledger.records, []);
+    assert.deepEqual(
+      await executors.inspectLocalExecProcessIdentity({
+        pid: quarantined.pid,
+        entryRealpath: quarantined.entryRealpath,
+        generationToken: quarantined.generationToken,
+        startEpochMs: exactIdentity.startEpochMs,
+        command: exactIdentity.command,
+      }),
+      {
+        status: "matching",
+        identity: { ...exactIdentity, entryRealpath: quarantined.entryRealpath, generationToken: quarantined.generationToken },
+        hasRetainedHandle: false,
+      },
+    );
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("restart readiness confirmation clears an exact disk fence without an inherited child handle", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const quarantined = {
+    version: 1,
+    spawnRequestedAt: 9_900,
+    pid: 4_571,
+    recordedAt: 10_000,
+    entryRealpath: "C:\\app\\local-exec-daemon\\main.cjs",
+    generationToken: "confirm-recovered-generation",
+  };
+  const observed = matchingIdentity(
+    quarantined.pid,
+    quarantined.entryRealpath,
+    quarantined.generationToken,
+  );
+  const identity = {
+    ...observed,
+    entryRealpath: quarantined.entryRealpath,
+    generationToken: quarantined.generationToken,
+  };
+  const ledger = { records: [quarantined] };
+  let terminationCalls = 0;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      overrides: {
+        async readLocalExecDaemonDiscovery() {
+          return {
+            pid: quarantined.pid,
+            startedAt: 9_950,
+            entryRealpath: quarantined.entryRealpath,
+            generationToken: quarantined.generationToken,
+            inflightCount: 0,
+          };
+        },
+      },
+      native: {
+        async spawnLocalExecDaemon() { assert.fail("readiness confirmation only"); },
+        async terminateProcess() { terminationCalls += 1; },
+        isProcessAlive() { return true; },
+        readProcessIdentity(pid) { return pid === quarantined.pid ? observed : null; },
+        resolveLocalExecDaemonEntryRealpath() { return quarantined.entryRealpath; },
+      },
+    }));
+    assert.deepEqual(
+      await executors.confirmLocalExecDaemonReady({ identity }),
+      { confirmed: true },
+    );
+    assert.equal(terminationCalls, 0);
+    assert.deepEqual(ledger.records, []);
+    assert.deepEqual(
+      await executors.inspectLocalExecProcessIdentity(identity),
+      { status: "matching", identity, hasRetainedHandle: false },
+    );
   } finally {
     await loaded.dispose();
   }
@@ -419,6 +529,47 @@ test("startup quarantine is durable before the first identity-poll delay and blo
     assert.equal(ledger.records.length, 1);
   } finally {
     releaseDelay?.();
+    await loaded.dispose();
+  }
+});
+
+test("startup fence write failure cleans the unrecorded child only through its retained handle", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const ledger = { records: [] };
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const child = fakeChild(4_751);
+  let terminationCalls = 0;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      overrides: {
+        async writeLocalExecStartupQuarantine() {
+          throw new Error("simulated startup fence disk failure");
+        },
+      },
+      native: {
+        async spawnLocalExecDaemon() {
+          return { child, entryRealpath, generationToken: "write-failure-generation" };
+        },
+        async terminateProcess(pid, options) {
+          terminationCalls += 1;
+          assert.equal(pid, child.pid);
+          assert.equal(options.ownedChild, child);
+          assert.equal(options.allowUnidentifiedOwnedEscalation, true);
+          assert.equal(options.isUnidentifiedProcessStillOwned(), true);
+        },
+        isProcessAlive() { return true; },
+        readProcessIdentity() { return null; },
+        resolveLocalExecDaemonEntryRealpath() { return entryRealpath; },
+      },
+    }));
+    await assert.rejects(
+      executors.spawnLocalExecDaemon({ logPath: "test.log", env: {} }),
+      /simulated startup fence disk failure/,
+    );
+    assert.equal(terminationCalls, 1);
+    assert.deepEqual(ledger.records, []);
+  } finally {
     await loaded.dispose();
   }
 });

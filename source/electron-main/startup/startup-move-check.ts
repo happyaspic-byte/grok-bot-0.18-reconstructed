@@ -20,7 +20,10 @@ export interface StartupMoveCheckDependencies {
   };
   readDiscovery(): Promise<{ readonly pid: number; readonly entryRealpath?: string; readonly generationToken?: string; readonly inflightCount?: number } | null>;
   isDaemonProcess(pid: number, discovery: { readonly entryRealpath?: string; readonly generationToken?: string }): boolean;
-  terminate(pid: number): Promise<void>;
+  terminate(
+    pid: number,
+    discovery: { readonly entryRealpath?: string; readonly generationToken?: string },
+  ): Promise<void>;
   isProcessAlive(pid: number): boolean;
   reportFailure?(surface: string, operation: string, error: unknown): void;
   reportFailureClass?(surface: string, operation: string, reason: string): void;

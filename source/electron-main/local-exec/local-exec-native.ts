@@ -127,6 +127,45 @@ export async function waitForWindowsProcessExit(
   if (!hasExited()) throw new LocalExecTerminationTimeoutError(pid);
 }
 
+export function terminateVerifiedWindowsProcessByHandle(
+  pid: number,
+  expected: LocalExecProcessIdentity,
+  dependencies: {
+    readonly execFileSync?: typeof execFileSync;
+    readonly environment?: NodeJS.ProcessEnv;
+  } = {},
+): void {
+  if (expected.pid !== pid) {
+    throw new LocalExecTerminationIdentityError(pid, "does not match the expected Windows process identity");
+  }
+  const execute = dependencies.execFileSync ?? execFileSync;
+  const expectedCommandBase64 = Buffer.from(expected.command, "utf8").toString("base64");
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
+    `$expectedStart = [Int64]${Math.trunc(expected.startEpochMs)}`,
+    `$expectedCommand = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${expectedCommandBase64}'))`,
+    `$cim = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'`,
+    "if ($null -eq $cim) { exit 0 }",
+    "$cimStart = [DateTimeOffset]::new($cim.CreationDate.ToUniversalTime()).ToUnixTimeMilliseconds()",
+    "if ($cimStart -ne $expectedStart -or [string]$cim.CommandLine -cne $expectedCommand) { throw 'local-exec identity changed before Windows handle acquisition' }",
+    "$target = $null",
+    "try {",
+    `  try { $target = [Diagnostics.Process]::GetProcessById(${pid}) } catch [ArgumentException] { exit 0 }`,
+    "  $null = $target.Handle",
+    "  $handleStart = [DateTimeOffset]::new($target.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()",
+    "  if ($handleStart -ne $expectedStart) { throw 'local-exec identity changed during Windows handle acquisition' }",
+    "  $target.Kill()",
+    "  if (-not $target.WaitForExit(5000)) { throw 'local-exec process remained alive after Windows handle termination' }",
+    "} finally { if ($null -ne $target) { $target.Dispose() } }",
+  ].join("; ");
+  execute(
+    resolveWindowsPowerShellPath(dependencies.environment),
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+    { encoding: "utf8", timeout: 10_000, windowsHide: true },
+  );
+}
+
 export async function terminateProcess(
   pid: number,
   deps: {
@@ -139,6 +178,7 @@ export async function terminateProcess(
     readonly readIdentity?: (pid: number) => LocalExecProcessIdentity | null;
     readonly isAlive?: (pid: number) => boolean;
     readonly ownedChild?: Pick<ChildProcess, "pid" | "exitCode" | "signalCode" | "kill" | "once" | "off">;
+    readonly allowVerifiedWindowsHandleAcquisition?: boolean;
     readonly allowUnidentifiedOwnedEscalation?: boolean;
     readonly isUnidentifiedProcessStillOwned?: () => boolean;
   } = {},
@@ -157,15 +197,44 @@ export async function terminateProcess(
   const ownedChild = deps.ownedChild;
   const reportFailure = deps.reportFailure ?? ((failure: unknown) => reportLocalExecTerminationFailed(pid, failure));
   const unidentifiedOwnership = deps.isUnidentifiedProcessStillOwned;
+  if (
+    ownedChild == null
+    && expected != null
+    && platform === "win32"
+    && deps.allowVerifiedWindowsHandleAcquisition === true
+  ) {
+    try {
+      terminateVerifiedWindowsProcessByHandle(pid, expected, {
+        ...(deps.execFileSync === undefined ? {} : { execFileSync: deps.execFileSync }),
+        ...(deps.environment === undefined ? {} : { environment: deps.environment }),
+      });
+    } catch (error) {
+      let observed: LocalExecProcessIdentity | null = null;
+      try { observed = readIdentity(pid); } catch {}
+      if (observed != null && !sameNativeProcessIdentity(observed, expected)) return;
+      try {
+        if (observed == null && !alive(pid)) return;
+      } catch {}
+      reportFailure(error);
+      throw new LocalExecTerminationSignalError(pid, findSystemErrno(error), error);
+    }
+    const waitForExit = deps.waitForExit ?? (async () => waitForWindowsProcessExit(pid, {
+      isAlive: alive,
+      readIdentity,
+      expectedIdentity: expected,
+    }));
+    await waitForExit(pid);
+    return;
+  }
   if (ownedChild == null) {
     throw new LocalExecTerminationIdentityError(pid, "has no retained child-process handle, so PID-only termination is forbidden");
   }
   if (ownedChild.pid !== pid) {
     throw new LocalExecTerminationIdentityError(pid, "does not match the retained child-process handle");
   }
-  if (expected == null && deps.allowUnidentifiedOwnedEscalation === true) {
-    if (unidentifiedOwnership == null) {
-      throw new LocalExecTerminationIdentityError(pid, "requires an owned-child liveness proof before unidentified escalation");
+  if (expected == null) {
+    if (deps.allowUnidentifiedOwnedEscalation !== true || unidentifiedOwnership == null) {
+      throw new LocalExecTerminationIdentityError(pid, "requires explicit unidentified-owned opt-in and a child-handle liveness proof");
     }
     if (!unidentifiedOwnership()) return;
   }
@@ -249,4 +318,35 @@ export async function terminateProcess(
   await waitForExit(pid);
 }
 export async function spawnLocalExecDaemon(args: { readonly logPath: string; readonly env: NodeJS.ProcessEnv; readonly mainPath?: string; readonly spawnImpl?: typeof spawn; readonly generationToken?: string; readonly realpath?: typeof realpathSync; readonly open?: typeof openSync; readonly close?: typeof closeSync }): Promise<SpawnedLocalExecDaemon> { await mkdir(dirname(args.logPath), { recursive: true }); const entryRealpath = resolveLocalExecDaemonEntryRealpath(args.mainPath ?? daemonMainPath(), args.realpath ?? realpathSync); const generationToken = args.generationToken ?? randomUUID(); if (generationToken.length === 0) throw new Error("local-exec generation token must not be empty"); const logFd = (args.open ?? openSync)(args.logPath, "a"); try { const child = (args.spawnImpl ?? spawn)(process.execPath, [entryRealpath, `${LOCAL_EXEC_GENERATION_TOKEN_ARG}${generationToken}`], { detached: true, stdio: ["ignore", logFd, logFd], env: { ...process.env, ...args.env, [LOCAL_EXEC_GENERATION_TOKEN_ENV]: generationToken } }); const spawnedAt = performance.now(); let spawnSucceeded = false; child.once("error", (error) => reportLocalExecSpawnFailed(error)); child.once("spawn", () => { spawnSucceeded = true; reportLocalExecSpawned(child.pid); }); child.once("exit", (exitCode, signal) => { if (spawnSucceeded) reportLocalExecExited({ ...(child.pid === undefined ? {} : { pid: child.pid }), exitCode, signal, uptimeMs: performance.now() - spawnedAt }); }); child.unref(); return { child, entryRealpath, generationToken }; } finally { (args.close ?? closeSync)(logFd); } }
-export async function killLocalExecDaemon(discoveryPath: string, deps: { readonly expectedEntryRealpath?: string; readonly readIdentity?: typeof readProcessIdentity; readonly terminate?: (pid: number) => Promise<void>; readonly now?: () => number } = {}): Promise<void> { const existing = await readLocalExecDaemonDiscovery(discoveryPath); if (existing == null || existing.entryRealpath == null || existing.generationToken == null) return; const expectedEntryRealpath = deps.expectedEntryRealpath ?? realpathSync(daemonMainPath()); if (existing.entryRealpath !== expectedEntryRealpath) return; const observed = (deps.readIdentity ?? readProcessIdentity)(existing.pid); if (observed == null || !localExecDiscoveryTimeMatchesProcess(existing.startedAt, observed.startEpochMs, (deps.now ?? Date.now)()) || !commandCarriesLocalExecGeneration(observed.command, expectedEntryRealpath, existing.generationToken)) return; if (deps.terminate != null) await deps.terminate(existing.pid); else await terminateProcess(existing.pid, { expectedIdentity: observed }); }
+export async function killLocalExecDaemon(
+  discoveryPath: string,
+  deps: {
+    readonly expectedPid?: number;
+    readonly expectedEntryRealpath?: string;
+    readonly readIdentity?: typeof readProcessIdentity;
+    readonly terminate?: (
+      pid: number,
+      options: {
+        readonly expectedIdentity: LocalExecProcessIdentity;
+        readonly allowVerifiedWindowsHandleAcquisition: true;
+      },
+    ) => Promise<void>;
+    readonly now?: () => number;
+  } = {},
+): Promise<void> {
+  const existing = await readLocalExecDaemonDiscovery(discoveryPath);
+  if (existing == null || existing.entryRealpath == null || existing.generationToken == null) return;
+  if (deps.expectedPid != null && existing.pid !== deps.expectedPid) return;
+  const expectedEntryRealpath = deps.expectedEntryRealpath ?? realpathSync(daemonMainPath());
+  if (existing.entryRealpath !== expectedEntryRealpath) return;
+  const observed = (deps.readIdentity ?? readProcessIdentity)(existing.pid);
+  if (observed == null
+    || !localExecDiscoveryTimeMatchesProcess(existing.startedAt, observed.startEpochMs, (deps.now ?? Date.now)())
+    || !commandCarriesLocalExecGeneration(observed.command, expectedEntryRealpath, existing.generationToken)) return;
+  const terminationOptions = {
+    expectedIdentity: observed,
+    allowVerifiedWindowsHandleAcquisition: true as const,
+  };
+  if (deps.terminate != null) await deps.terminate(existing.pid, terminationOptions);
+  else await terminateProcess(existing.pid, terminationOptions);
+}

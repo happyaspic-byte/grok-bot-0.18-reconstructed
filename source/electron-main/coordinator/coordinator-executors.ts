@@ -446,6 +446,8 @@ export function createCoordinatorControlExecutors(
     ?? ((info: LocalExecStartupQuarantine) => writeLocalExecStartupQuarantine(info, startupQuarantineDirectory));
   const clearStartupQuarantineIfMatches = dependencies.clearLocalExecStartupQuarantineIfMatches
     ?? ((expected: LocalExecStartupQuarantine) => clearLocalExecStartupQuarantineIfMatches(expected, startupQuarantineDirectory));
+  const readDaemonDiscovery = dependencies.readLocalExecDaemonDiscovery
+    ?? (() => readLocalExecDaemonDiscovery(getLocalExecDaemonDiscoveryPath()));
   const identityKey = (identity: LocalExecProcessIdentity) => `${identity.pid}:${identity.startEpochMs}:${identity.command}:${identity.entryRealpath}:${identity.generationToken}`;
   const expectedMatches = (expected: ExpectedLocalExecProcessIdentity, identity: LocalExecProcessIdentity): boolean => expected.pid === identity.pid
     && expected.entryRealpath === identity.entryRealpath
@@ -475,7 +477,7 @@ export function createCoordinatorControlExecutors(
   };
   type StartupQuarantineProcessClassification = "match" | "reused" | "ambiguous";
   type ExpectedProcessInspection =
-    | { readonly status: "matching"; readonly identity: LocalExecProcessIdentity }
+    | { readonly status: "matching"; readonly identity: LocalExecProcessIdentity; readonly hasRetainedHandle: boolean }
     | { readonly status: "different" | "absent" | "unreadable" };
   const classifyStartupQuarantineProcess = (
     entry: LocalExecStartupQuarantine,
@@ -514,6 +516,20 @@ export function createCoordinatorControlExecutors(
         blocked.push(entry);
         continue;
       }
+      const discovery = await readDaemonDiscovery();
+      if (discovery != null
+        && discovery.pid === entry.pid
+        && discovery.entryRealpath === entry.entryRealpath
+        && discovery.generationToken === entry.generationToken
+        && localExecDiscoveryTimeMatchesProcess(discovery.startedAt, observed.startEpochMs, now())) {
+        ownedDaemonIdentities.set(entry.pid, {
+          ...observed,
+          entryRealpath: entry.entryRealpath,
+          generationToken: entry.generationToken,
+        });
+        await releaseStartupQuarantine(entry);
+        continue;
+      }
       try {
         const ownedChild = ownedDaemonChildren.get(entry.pid);
         await native.terminateProcess(entry.pid, {
@@ -548,34 +564,55 @@ export function createCoordinatorControlExecutors(
     persisted?: LocalExecStartupQuarantine,
   ): Promise<void> => {
     const { child } = spawned;
-    const quarantine = persisted ?? await writeStartupQuarantine(candidate);
-    unidentifiedSpawnQuarantine.set(quarantine.pid, quarantine);
-    if (child.exitCode !== null || child.signalCode !== null) {
-      await releaseStartupQuarantine(quarantine);
-      return;
-    }
-    if (child.pid === undefined || child.pid !== quarantine.pid) {
+    if (child.pid === undefined || child.pid !== candidate.pid) {
       throw new Error(`${LOCAL_EXEC_STARTUP_QUARANTINE_REASON}: local-exec unidentified child lost its owned PID`);
     }
     const pid = child.pid;
     const isStillOwned = () => child.pid === pid && child.exitCode === null && child.signalCode === null;
-    const release = async () => releaseStartupQuarantine(quarantine);
-    const inspectAfterFailure = async (): Promise<boolean> => {
-      let observed: NativeLocalExecProcessIdentity | null = null;
-      try { observed = native.readProcessIdentity(pid); } catch {}
-      if (observed != null) {
-        if (classifyStartupQuarantineProcess(quarantine, observed) === "reused") {
-          await release();
-          return true;
-        }
-        return false;
-      }
+    let quarantine = persisted;
+    if (quarantine === undefined) {
       try {
-        if (!native.isProcessAlive(pid)) {
-          await release();
-          return true;
+        quarantine = await writeStartupQuarantine(candidate);
+      } catch (persistenceError) {
+        try {
+          await native.terminateProcess(pid, {
+            ownedChild: child,
+            allowUnidentifiedOwnedEscalation: true,
+            isUnidentifiedProcessStillOwned: isStillOwned,
+          });
+          unidentifiedSpawnQuarantine.delete(pid);
+          return;
+        } catch (terminationError) {
+          throw new AggregateError(
+            [persistenceError, terminationError],
+            "local-exec startup fence could not be persisted and retained-handle cleanup failed",
+          );
         }
-      } catch {}
+      }
+    }
+    const durableQuarantine: LocalExecStartupQuarantine = quarantine;
+    unidentifiedSpawnQuarantine.set(pid, durableQuarantine);
+    const release = async () => releaseStartupQuarantine(durableQuarantine);
+    if (!isStillOwned()) {
+      await release();
+      return;
+    }
+    const inspectAfterFailure = async (): Promise<boolean> => {
+      let after: NativeLocalExecProcessIdentity | null = null;
+      try { after = native.readProcessIdentity(pid); } catch {}
+      if (after != null
+        && classifyStartupQuarantineProcess(durableQuarantine, after) === "reused") {
+        await release();
+        return true;
+      }
+      if (after == null) {
+        try {
+          if (!native.isProcessAlive(pid)) {
+            await release();
+            return true;
+          }
+        } catch {}
+      }
       return false;
     };
     try {
@@ -585,22 +622,18 @@ export function createCoordinatorControlExecutors(
         return;
       }
       if (observed == null) {
-        throw new Error(`${LOCAL_EXEC_STARTUP_QUARANTINE_REASON}: child ${pid} identity is not readable, so PID-only termination is forbidden`);
+        throw new Error(`${LOCAL_EXEC_STARTUP_QUARANTINE_REASON}: child ${pid} identity is not readable; durable quarantine remains`);
       }
-      const classification = classifyStartupQuarantineProcess(quarantine, observed);
+      const classification = classifyStartupQuarantineProcess(durableQuarantine, observed);
       if (classification === "reused") {
         await release();
         return;
       }
       if (classification === "ambiguous") {
-        throw new Error(`${LOCAL_EXEC_STARTUP_QUARANTINE_REASON}: child ${pid} process start is ambiguous, so termination is forbidden`);
+        throw new Error(`${LOCAL_EXEC_STARTUP_QUARANTINE_REASON}: child ${pid} process start is ambiguous; durable quarantine remains`);
       }
       await native.terminateProcess(pid, { expectedIdentity: observed, ownedChild: child });
-      if (!isStillOwned() || !native.isProcessAlive(pid) || await inspectAfterFailure()) {
-        await release();
-        return;
-      }
-      throw new Error(`local-exec child ${pid} remained alive after identity-verified termination`);
+      await release();
     } catch (error) {
       try {
         if (await inspectAfterFailure()) return;
@@ -631,7 +664,11 @@ export function createCoordinatorControlExecutors(
     if (!commandCarriesLocalExecGeneration(observed.command, canonicalEntryRealpath, expected.generationToken)
       || !expectedMatches(expected, identity)) return { status: "different" };
     ownedDaemonIdentities.set(identity.pid, identity);
-    return { status: "matching", identity };
+    return {
+      status: "matching",
+      identity,
+      hasRetainedHandle: ownedDaemonChildren.has(identity.pid),
+    };
   };
 
   return {
@@ -735,7 +772,7 @@ export function createCoordinatorControlExecutors(
         try { await stopUnidentifiedSpawn(spawned, candidate, startupQuarantine); }
         catch (failure) { cleanupError = failure; }
         if (cleanupError === undefined) {
-          const discovery = await (dependencies.readLocalExecDaemonDiscovery ?? (() => readLocalExecDaemonDiscovery(getLocalExecDaemonDiscoveryPath())))();
+          const discovery = await readDaemonDiscovery();
           if (discovery != null
             && discovery.pid === child.pid
             && discovery.entryRealpath === entryRealpath
@@ -753,16 +790,34 @@ export function createCoordinatorControlExecutors(
     async confirmLocalExecDaemonReady({ identity }: { readonly identity: LocalExecProcessIdentity }) {
       const observed = readOwnedIdentity(identity);
       if (observed == null || !sameLocalExecProcessIdentity(observed, identity)) return { confirmed: false };
-      const discovery = await (dependencies.readLocalExecDaemonDiscovery ?? (() => readLocalExecDaemonDiscovery(getLocalExecDaemonDiscoveryPath())))();
+      const discovery = await readDaemonDiscovery();
       if (discovery == null
         || discovery.pid !== identity.pid
         || discovery.entryRealpath !== identity.entryRealpath
         || discovery.generationToken !== identity.generationToken
         || !localExecDiscoveryTimeMatchesProcess(discovery.startedAt, identity.startEpochMs, now())) return { confirmed: false };
-      const quarantine = unidentifiedSpawnQuarantine.get(identity.pid);
-      if (quarantine != null
-        && classifyStartupQuarantineProcess(quarantine, identity) === "match") {
-        await releaseStartupQuarantine(quarantine);
+      const matchingQuarantines = new Map<string, LocalExecStartupQuarantine>();
+      const inMemoryQuarantine = unidentifiedSpawnQuarantine.get(identity.pid);
+      if (inMemoryQuarantine != null) {
+        matchingQuarantines.set(
+          `${inMemoryQuarantine.pid}:${inMemoryQuarantine.spawnRequestedAt}:${inMemoryQuarantine.recordedAt}:${inMemoryQuarantine.generationToken}`,
+          inMemoryQuarantine,
+        );
+      }
+      for (const quarantine of await readStartupQuarantines()) {
+        if (quarantine.pid === identity.pid
+          && quarantine.entryRealpath === identity.entryRealpath
+          && quarantine.generationToken === identity.generationToken) {
+          matchingQuarantines.set(
+            `${quarantine.pid}:${quarantine.spawnRequestedAt}:${quarantine.recordedAt}:${quarantine.generationToken}`,
+            quarantine,
+          );
+        }
+      }
+      for (const quarantine of matchingQuarantines.values()) {
+        if (classifyStartupQuarantineProcess(quarantine, identity) === "match") {
+          await releaseStartupQuarantine(quarantine);
+        }
       }
       return { confirmed: true };
     },

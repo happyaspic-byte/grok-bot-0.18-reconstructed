@@ -22,7 +22,6 @@ import {
   isLocalExecDaemonProcess,
   isProcessAlive,
   killLocalExecDaemon,
-  terminateProcess,
 } from "./local-exec/local-exec-native.js";
 import { createAgentsControlFeed } from "./notifications/agents-control-feed.js";
 import { SandDockBadgeManager } from "./notifications/dock-badge-manager.js";
@@ -136,7 +135,10 @@ export interface ElectronStartupProviderPorts {
   readonly homeDir?: string;
   readonly readDiscovery?: () => Promise<{ readonly pid: number; readonly entryRealpath?: string; readonly generationToken?: string; readonly inflightCount?: number } | null>;
   readonly isDaemonProcess?: (pid: number, discovery: { readonly entryRealpath?: string; readonly generationToken?: string }) => boolean;
-  readonly terminate?: (pid: number) => Promise<void>;
+  readonly terminate?: (
+    pid: number,
+    discovery: { readonly entryRealpath?: string; readonly generationToken?: string },
+  ) => Promise<void>;
   readonly isProcessAlive?: (pid: number) => boolean;
   readonly scheduleStuck?: (listener: () => void) => void;
   readonly monotonicNow?: () => number;
@@ -522,7 +524,15 @@ export function createProductionStartupBinding(
       dialog: ports.dialog,
       readDiscovery: ports.readDiscovery ?? (() => readLocalExecDaemonDiscovery()),
       isDaemonProcess: ports.isDaemonProcess ?? ((pid, discovery) => isLocalExecDaemonProcess(pid, discovery.entryRealpath, discovery.generationToken)),
-      terminate: ports.terminate ?? terminateProcess,
+      terminate: ports.terminate ?? ((pid, discovery) => killLocalExecDaemon(
+        getLocalExecDaemonDiscoveryPath(),
+        {
+          expectedPid: pid,
+          ...(discovery.entryRealpath === undefined
+            ? {}
+            : { expectedEntryRealpath: discovery.entryRealpath }),
+        },
+      )),
       isProcessAlive: ports.isProcessAlive ?? isProcessAlive,
       reportFailure: reportDesktopEdgeFailure,
       reportFailureClass: reportDesktopEdgeFailureClass,
