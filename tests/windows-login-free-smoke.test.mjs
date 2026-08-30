@@ -149,6 +149,9 @@ test("Windows smoke preserves the basic and --app entrypoints while defaulting C
   assert.match(source, /await waitForProcessClose\(launched\.child\)/);
   assert.match(source, /setTimeout\([\s\S]{0,180}Timed out waiting for packaged process close[\s\S]{0,180}closed\.then\(\(\) => \{ clearTimeout\(timeout\); resolve\(\); \}\)/);
   assert.match(source, /Timed out waiting for packaged process close/);
+  assert.match(source, /Get-CimInstance Win32_Process/);
+  assert.match(source, /const relatedPids = new Set/);
+  assert.match(source, /relevantProcesses/);
   assert.match(source, /Basic Windows smoke cleanup also failed/);
   assert.match(source, /RETRYABLE_TEMP_CLEANUP_ERRORS/);
   assert.match(source, /rm\(target, \{ recursive: true, force: true, maxRetries: 0 \}\)/);
@@ -165,6 +168,9 @@ test("Windows smoke scans persistence for UTF-8 and UTF-16 key canaries and reda
   assert.match(source, /Expected exactly one encrypted 9Router credential document/);
   assert.match(source, /Page\.captureScreenshot/);
   assert.match(source, /\[REDACTED-9ROUTER-KEY\]/);
+  assert.match(source, /--sand-local-exec-generation=\[REDACTED\]/);
+  assert.match(source, /local-exec-daemon\.json/);
+  assert.match(source, /Windows smoke relevant process inventory \(redacted\)/);
   assert.match(source, /Refusing to write an unredacted Windows smoke failure artifact/);
   assert.match(source, /process\.stderr\.write\(`\$\{failure\.message\}\\n`\)/);
   assert.match(source, /Windows smoke cleanup also failed/);

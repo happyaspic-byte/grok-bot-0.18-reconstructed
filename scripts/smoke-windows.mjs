@@ -144,6 +144,79 @@ function processHasExited(child) {
   return child == null || child.exitCode != null || child.signalCode != null;
 }
 
+function normalizeWindowsPath(value) {
+  return typeof value === "string" && value.length > 0
+    ? path.win32.normalize(value).toLowerCase()
+    : "";
+}
+
+async function inspectRelatedWindowsProcesses({ rootPid, executable, userDataDir, dataRoot }) {
+  let localExecDiscovery = null;
+  try {
+    const parsed = JSON.parse(await readFile(path.join(dataRoot, "local-exec-daemon.json"), "utf8"));
+    if (Number.isInteger(parsed?.pid) && parsed.pid > 0) {
+      localExecDiscovery = {
+        pid: parsed.pid,
+        startedAt: typeof parsed.startedAt === "number" ? parsed.startedAt : null,
+        entryRealpath: typeof parsed.entryRealpath === "string" ? parsed.entryRealpath : null,
+        generationTokenPresent: typeof parsed.generationToken === "string" && parsed.generationToken.length > 0,
+        inflightCount: Number.isInteger(parsed.inflightCount) ? parsed.inflightCount : null,
+      };
+    }
+  } catch {}
+
+  try {
+    const command = [
+      "$ErrorActionPreference = 'Stop'",
+      "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
+      "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine,CreationDate | ConvertTo-Json -Depth 3 -Compress",
+    ].join("; ");
+    const { stdout } = await execFileAsync(
+      "powershell.exe",
+      ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+      { timeout: 10_000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 },
+    );
+    const raw = String(stdout).trim();
+    const parsed = raw.length === 0 ? [] : JSON.parse(raw);
+    const processes = (Array.isArray(parsed) ? parsed : [parsed]).map(entry => ({
+      pid: Number(entry?.ProcessId),
+      parentPid: Number(entry?.ParentProcessId),
+      name: typeof entry?.Name === "string" ? entry.Name : null,
+      executablePath: typeof entry?.ExecutablePath === "string" ? entry.ExecutablePath : null,
+      commandLine: typeof entry?.CommandLine === "string" ? entry.CommandLine : null,
+      creationDate: entry?.CreationDate ?? null,
+    })).filter(entry => Number.isInteger(entry.pid) && entry.pid > 0 && Number.isInteger(entry.parentPid));
+
+    const relatedPids = new Set(Number.isInteger(rootPid) && rootPid > 0 ? [rootPid] : []);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const entry of processes) {
+        if (!relatedPids.has(entry.parentPid) || relatedPids.has(entry.pid)) continue;
+        relatedPids.add(entry.pid);
+        changed = true;
+      }
+    }
+    const executableKey = normalizeWindowsPath(executable);
+    const rootKeys = [userDataDir, dataRoot].map(normalizeWindowsPath).filter(Boolean);
+    const relevantProcesses = processes.filter(entry => {
+      const commandKey = entry.commandLine?.toLowerCase() ?? "";
+      return relatedPids.has(entry.pid)
+        || (executableKey.length > 0 && normalizeWindowsPath(entry.executablePath) === executableKey)
+        || rootKeys.some(root => commandKey.includes(root))
+        || entry.pid === localExecDiscovery?.pid;
+    }).sort((left, right) => left.pid - right.pid);
+    return { rootPid: rootPid ?? null, localExecDiscovery, relevantProcesses };
+  } catch (error) {
+    return {
+      rootPid: rootPid ?? null,
+      localExecDiscovery,
+      inventoryError: error instanceof Error ? error.message : String(error),
+      relevantProcesses: [],
+    };
+  }
+}
+
 async function waitForProcessClose(child, timeoutMs = 5_000) {
   if (child == null) return;
   const closed = childClosePromises.get(child);
@@ -804,10 +877,11 @@ function redactSensitive(value, secretCanary) {
   return String(value)
     .split(secretCanary).join("[REDACTED-9ROUTER-KEY]")
     .replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]")
+    .replace(/--sand-local-exec-generation=(?:"[^"]*"|'[^']*'|\S+)/gi, "--sand-local-exec-generation=[REDACTED]")
     .replace(/("apiKey"\s*:\s*")[^"]+("?)/gi, "$1[REDACTED]$2");
 }
 
-async function writeFailureArtifacts({ cdp, error, harness, logs, secretCanary, transcriptPath, phase }) {
+async function writeFailureArtifacts({ cdp, child, executable, userDataDir, dataRoot, error, harness, logs, secretCanary, transcriptPath, phase }) {
   const directory = path.resolve("reports", `windows-smoke-failure-${Date.now()}`);
   await mkdir(directory, { recursive: true });
   let renderer = null;
@@ -821,6 +895,12 @@ async function writeFailureArtifacts({ cdp, error, harness, logs, secretCanary, 
   } catch {}
   let transcript = "";
   try { transcript = await readFile(transcriptPath, "utf8"); } catch {}
+  const processState = await inspectRelatedWindowsProcesses({
+    rootPid: child?.pid,
+    executable,
+    userDataDir,
+    dataRoot,
+  });
   const harnessDiagnostic = harness == null ? null : {
     gatewayRequests: harness.gatewayRequests,
     routerRequests: harness.routerRequests,
@@ -839,10 +919,12 @@ async function writeFailureArtifacts({ cdp, error, harness, logs, secretCanary, 
     renderer,
     processOutput: logs.join("").slice(-64 * 1024),
     dockerTranscript: transcript.slice(-64 * 1024),
+    processState,
     harness: harnessDiagnostic,
   }, null, 2), secretCanary);
   if (diagnostic.includes(secretCanary)) throw new Error("Refusing to write an unredacted Windows smoke failure artifact");
   await writeFile(path.join(directory, "diagnostic.json"), diagnostic, "utf8");
+  process.stderr.write(`Windows smoke relevant process inventory (redacted): ${redactSensitive(JSON.stringify(processState), secretCanary)}\n`);
   process.stderr.write(`Windows smoke failure artifacts: ${directory}\n`);
 }
 
@@ -1122,7 +1204,19 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     console.log("Fresh profile saved an OS-encrypted credential, loaded models, enforced both readiness blockers, used Save & continue without sign-in, stopped its owned container on quit, restarted it on persistent relaunch, and stopped it again on final quit.");
     console.log("Docker and the bounded gateway control/roster protocol were simulated; live Docker Desktop, Tailscale, VNC, inference turns, and native tool execution remain separate environment tests.");
   } catch (error) {
-    await writeFailureArtifacts({ cdp: launched?.cdp, error, harness: servers, logs, secretCanary, transcriptPath: dockerTranscriptPath, phase }).catch(artifactError => {
+    await writeFailureArtifacts({
+      cdp: launched?.cdp,
+      child: launched?.child,
+      executable: verified.executable,
+      userDataDir,
+      dataRoot: environment.SAND_DATA_ROOT,
+      error,
+      harness: servers,
+      logs,
+      secretCanary,
+      transcriptPath: dockerTranscriptPath,
+      phase,
+    }).catch(artifactError => {
       process.stderr.write(`Could not write redacted Windows smoke diagnostics: ${redactSensitive(artifactError, secretCanary)}\n`);
     });
     if (logs.length > 0) process.stderr.write(`\n--- packaged process output (redacted) ---\n${redactSensitive(logs.join("").slice(-16_384), secretCanary)}\n`);
