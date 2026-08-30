@@ -11,6 +11,10 @@ import WebSocket from "ws";
 import { outputWindowsPortable } from "./lib/config.mjs";
 import { pathExists } from "./lib/windows-runtime.mjs";
 import { verifyWindowsPortable } from "./lib/windows-package.mjs";
+import {
+  inspectRelatedWindowsProcesses,
+  terminateVerifiedLocalExecDaemon,
+} from "./lib/windows-smoke-processes.mjs";
 
 const execFileAsync = promisify(execFile);
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -144,79 +148,6 @@ function processHasExited(child) {
   return child == null || child.exitCode != null || child.signalCode != null;
 }
 
-function normalizeWindowsPath(value) {
-  return typeof value === "string" && value.length > 0
-    ? path.win32.normalize(value).toLowerCase()
-    : "";
-}
-
-async function inspectRelatedWindowsProcesses({ rootPid, executable, userDataDir, dataRoot }) {
-  let localExecDiscovery = null;
-  try {
-    const parsed = JSON.parse(await readFile(path.join(dataRoot, "local-exec-daemon.json"), "utf8"));
-    if (Number.isInteger(parsed?.pid) && parsed.pid > 0) {
-      localExecDiscovery = {
-        pid: parsed.pid,
-        startedAt: typeof parsed.startedAt === "number" ? parsed.startedAt : null,
-        entryRealpath: typeof parsed.entryRealpath === "string" ? parsed.entryRealpath : null,
-        generationTokenPresent: typeof parsed.generationToken === "string" && parsed.generationToken.length > 0,
-        inflightCount: Number.isInteger(parsed.inflightCount) ? parsed.inflightCount : null,
-      };
-    }
-  } catch {}
-
-  try {
-    const command = [
-      "$ErrorActionPreference = 'Stop'",
-      "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
-      "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine,CreationDate | ConvertTo-Json -Depth 3 -Compress",
-    ].join("; ");
-    const { stdout } = await execFileAsync(
-      "powershell.exe",
-      ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
-      { timeout: 10_000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 },
-    );
-    const raw = String(stdout).trim();
-    const parsed = raw.length === 0 ? [] : JSON.parse(raw);
-    const processes = (Array.isArray(parsed) ? parsed : [parsed]).map(entry => ({
-      pid: Number(entry?.ProcessId),
-      parentPid: Number(entry?.ParentProcessId),
-      name: typeof entry?.Name === "string" ? entry.Name : null,
-      executablePath: typeof entry?.ExecutablePath === "string" ? entry.ExecutablePath : null,
-      commandLine: typeof entry?.CommandLine === "string" ? entry.CommandLine : null,
-      creationDate: entry?.CreationDate ?? null,
-    })).filter(entry => Number.isInteger(entry.pid) && entry.pid > 0 && Number.isInteger(entry.parentPid));
-
-    const relatedPids = new Set(Number.isInteger(rootPid) && rootPid > 0 ? [rootPid] : []);
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const entry of processes) {
-        if (!relatedPids.has(entry.parentPid) || relatedPids.has(entry.pid)) continue;
-        relatedPids.add(entry.pid);
-        changed = true;
-      }
-    }
-    const executableKey = normalizeWindowsPath(executable);
-    const rootKeys = [userDataDir, dataRoot].map(normalizeWindowsPath).filter(Boolean);
-    const relevantProcesses = processes.filter(entry => {
-      const commandKey = entry.commandLine?.toLowerCase() ?? "";
-      return relatedPids.has(entry.pid)
-        || (executableKey.length > 0 && normalizeWindowsPath(entry.executablePath) === executableKey)
-        || rootKeys.some(root => commandKey.includes(root))
-        || entry.pid === localExecDiscovery?.pid;
-    }).sort((left, right) => left.pid - right.pid);
-    return { rootPid: rootPid ?? null, localExecDiscovery, relevantProcesses };
-  } catch (error) {
-    return {
-      rootPid: rootPid ?? null,
-      localExecDiscovery,
-      inventoryError: error instanceof Error ? error.message : String(error),
-      relevantProcesses: [],
-    };
-  }
-}
-
 async function waitForProcessClose(child, timeoutMs = 5_000) {
   if (child == null) return;
   const closed = childClosePromises.get(child);
@@ -230,15 +161,40 @@ async function waitForProcessClose(child, timeoutMs = 5_000) {
   });
 }
 
-async function stopProcess(child) {
+async function settleExitedPortableProcess(launched) {
+  let closeError;
+  try { await waitForProcessClose(launched.child); }
+  catch (error) { closeError = error; }
+
+  const processState = await inspectRelatedWindowsProcesses({
+    rootPid: launched.child?.pid,
+    executable: launched.executable,
+    userDataDir: launched.userDataDir,
+    dataRoot: launched.dataRoot,
+    launchStartedAtMs: launched.launchStartedAtMs,
+  });
+  if (!processState.cleanExitSurvivors) {
+    const detail = processState.inventoryError != null
+      ? `process inventory failed: ${processState.inventoryError}`
+      : `unexpected surviving process PIDs: ${processState.unexpectedProcesses.map(process => process.pid).join(", ") || "unknown"}`;
+    throw new Error(`${closeError instanceof Error ? `${closeError.message}; ` : ""}${detail}`);
+  }
+  launched.child.stdout?.destroy();
+  launched.child.stderr?.destroy();
+  if (closeError != null) {
+    await waitForProcessClose(launched.child, 1_000).catch(() => undefined);
+  }
+  return processState;
+}
+
+async function stopProcess(launched) {
+  const child = launched?.child;
   if (child == null) return;
   if (!processHasExited(child) && child.pid != null) {
     try { await execFileAsync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { timeout: 10_000, windowsHide: true }); }
     catch { if (!processHasExited(child)) child.kill(); }
   }
-  await waitForProcessClose(child);
-  child.stdout?.destroy();
-  child.stderr?.destroy();
+  await settleExitedPortableProcess(launched);
 }
 
 async function stopPortableGracefully(launched, { label, leaseRevoked = () => true, timeoutMs = 60_000 }) {
@@ -258,9 +214,9 @@ async function stopPortableGracefully(launched, { label, leaseRevoked = () => tr
           throw new Error(`the packaged process did not exit cleanly (code=${launched.child.exitCode}, signal=${launched.child.signalCode})`);
         }
         if (!leaseRevoked()) throw new Error("the process exited before its final 9Router credential lease revocation was acknowledged");
-        await waitForProcessClose(launched.child);
+        const processState = await settleExitedPortableProcess(launched);
         launched.cdp.close();
-        return;
+        return processState;
       }
       await delay(100);
     }
@@ -268,9 +224,9 @@ async function stopPortableGracefully(launched, { label, leaseRevoked = () => tr
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     let cleanupDetail = "";
-    try { await stopProcess(launched.child); }
+    try { await stopProcess(launched); }
     catch (cleanupError) { cleanupDetail = `, which also failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`; }
-    throw new Error(`${label}: ${detail}; taskkill was used only as failure cleanup${cleanupDetail}`, { cause: error });
+    throw new Error(`${label}: ${detail}; forced process cleanup was used only after failure${cleanupDetail}`, { cause: error });
   }
 }
 
@@ -282,6 +238,7 @@ function appendBoundedLog(logs, chunk) {
 
 async function launchPortable(verified, environment, userDataDir, logs, onLaunch = () => {}) {
   await rm(path.join(userDataDir, "DevToolsActivePort"), { force: true }).catch(() => undefined);
+  const launchStartedAtMs = Date.now();
   const child = spawn(verified.executable, [
     `--user-data-dir=${userDataDir}`,
     "--remote-debugging-address=127.0.0.1",
@@ -296,7 +253,14 @@ async function launchPortable(verified, environment, userDataDir, logs, onLaunch
   });
   childClosePromises.set(child, new Promise(resolve => child.once("close", () => resolve())));
   child.once("error", error => childLaunchErrors.set(child, error));
-  const launched = { child, cdp: undefined };
+  const launched = {
+    child,
+    cdp: undefined,
+    executable: verified.executable,
+    userDataDir,
+    dataRoot: environment.SAND_DATA_ROOT,
+    launchStartedAtMs,
+  };
   // Publish ownership immediately: failures while discovering or mounting the
   // renderer must not orphan an Electron process that still owns this profile.
   onLaunch(launched);
@@ -881,7 +845,7 @@ function redactSensitive(value, secretCanary) {
     .replace(/("apiKey"\s*:\s*")[^"]+("?)/gi, "$1[REDACTED]$2");
 }
 
-async function writeFailureArtifacts({ cdp, child, executable, userDataDir, dataRoot, error, harness, logs, secretCanary, transcriptPath, phase }) {
+async function writeFailureArtifacts({ cdp, child, executable, userDataDir, dataRoot, launchStartedAtMs, error, harness, logs, secretCanary, transcriptPath, phase }) {
   const directory = path.resolve("reports", `windows-smoke-failure-${Date.now()}`);
   await mkdir(directory, { recursive: true });
   let renderer = null;
@@ -900,6 +864,7 @@ async function writeFailureArtifacts({ cdp, child, executable, userDataDir, data
     executable,
     userDataDir,
     dataRoot,
+    launchStartedAtMs,
   });
   const harnessDiagnostic = harness == null ? null : {
     gatewayRequests: harness.gatewayRequests,
@@ -929,6 +894,7 @@ async function writeFailureArtifacts({ cdp, child, executable, userDataDir, data
 }
 
 async function runBasicSmoke(verified, environment, userDataDir, logs) {
+  const smokeStartedAtMs = Date.now();
   let launched;
   let failure;
   try {
@@ -953,8 +919,18 @@ async function runBasicSmoke(verified, environment, userDataDir, logs) {
     const cleanupErrors = [];
     try { launched?.cdp?.close(); }
     catch (error) { cleanupErrors.push(error); }
-    try { await stopProcess(launched?.child); }
+    try { await stopProcess(launched); }
     catch (error) { cleanupErrors.push(error); }
+    try {
+      await terminateVerifiedLocalExecDaemon({
+        rootPid: launched?.child?.pid,
+        executable: verified.executable,
+        userDataDir,
+        dataRoot: environment.SAND_DATA_ROOT,
+        launchStartedAtMs: launched?.launchStartedAtMs ?? smokeStartedAtMs,
+        environment,
+      });
+    } catch (error) { cleanupErrors.push(error); }
     if (cleanupErrors.length > 0) {
       const cleanupFailure = new AggregateError(cleanupErrors, "Basic Windows smoke cleanup did not settle cleanly");
       if (failure != null) process.stderr.write(`Basic Windows smoke cleanup also failed: ${cleanupErrors.map(error => String(error)).join("; ")}\n`);
@@ -964,17 +940,19 @@ async function runBasicSmoke(verified, environment, userDataDir, logs) {
 }
 
 async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userDataDir, logs) {
+  const smokeStartedAtMs = Date.now();
   const secretCanary = `grok-smoke-${randomBytes(32).toString("hex")}`;
   const dockerStatePath = path.join(temporary, "fake-docker-state.json");
   const dockerTranscriptPath = path.join(temporary, "fake-docker-transcript.ndjson");
   let servers;
   let launched;
+  let environment = baseEnvironment;
   let failure;
   let phase = "harness-start";
   try {
     const fakeDockerDirectory = await buildStrictFakeDocker(temporary);
     servers = await startHarnessServers(secretCanary);
-    const environment = {
+    environment = {
       ...baseEnvironment,
       PATH: `${fakeDockerDirectory}${path.delimiter}${baseEnvironment.PATH ?? ""}`,
       GROK_BOT_SMOKE_DOCKER_STATE: dockerStatePath,
@@ -1112,12 +1090,16 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
 
     phase = "first-process-stop";
     const firstQuitRequestIndex = servers.gatewayRequests.length;
-    await stopPortableGracefully(launched, {
+    const firstExitState = await stopPortableGracefully(launched, {
       label: "First packaged process could not complete a clean lease-revoking quit",
       leaseRevoked: () => servers.gatewayRequests
         .slice(firstQuitRequestIndex)
         .some(request => request.url === "/api/setHostSettings" && request.clearedCliProxyLease === true),
     });
+    if (!firstExitState.onlyExpectedPersistentDaemon) {
+      throw new Error("First graceful quit did not leave exactly one identity-verified local-exec daemon");
+    }
+    const firstDaemonPid = firstExitState.verifiedLocalExecDaemonPid;
     launched = undefined;
     phase = "first-container-stopped";
     await assertFakeDockerContainerState(
@@ -1130,6 +1112,28 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     phase = "persistent-profile-relaunch";
     launched = await launchPortable(verified, environment, userDataDir, logs, handle => { launched = handle; });
     await assertLoginFreeWorkspace(launched.cdp, servers.routerBaseUrl, { probe: true });
+    const daemonRotationDeadline = Date.now() + 10_000;
+    let relaunchedProcessState;
+    while (Date.now() < daemonRotationDeadline) {
+      relaunchedProcessState = await inspectRelatedWindowsProcesses({
+        rootPid: launched.child.pid,
+        executable: launched.executable,
+        userDataDir: launched.userDataDir,
+        dataRoot: launched.dataRoot,
+        launchStartedAtMs: smokeStartedAtMs,
+      });
+      if (
+        relaunchedProcessState.verifiedLocalExecDaemonPid != null
+        && relaunchedProcessState.verifiedLocalExecDaemonPid !== firstDaemonPid
+      ) break;
+      await delay(250);
+    }
+    if (relaunchedProcessState?.verifiedLocalExecDaemonPid == null) {
+      throw new Error("Persistent relaunch did not publish an identity-verified local-exec daemon");
+    }
+    if (relaunchedProcessState.verifiedLocalExecDaemonPid === firstDaemonPid) {
+      throw new Error("Persistent relaunch reused an idle local-exec daemon instead of rotating its generation");
+    }
     phase = "persistent-container-recovered";
     await assertFakeDockerContainerState(
       dockerStatePath,
@@ -1141,12 +1145,15 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
 
     phase = "final-persistence-scan";
     const finalQuitRequestIndex = servers.gatewayRequests.length;
-    await stopPortableGracefully(launched, {
+    const finalExitState = await stopPortableGracefully(launched, {
       label: "Relaunched packaged process could not complete a clean lease-revoking quit",
       leaseRevoked: () => servers.gatewayRequests
         .slice(finalQuitRequestIndex)
         .some(request => request.url === "/api/setHostSettings" && request.clearedCliProxyLease === true),
     });
+    if (!finalExitState.onlyExpectedPersistentDaemon) {
+      throw new Error("Final graceful quit did not leave exactly one identity-verified local-exec daemon");
+    }
     launched = undefined;
     phase = "final-container-stopped";
     await assertFakeDockerContainerState(
@@ -1210,6 +1217,7 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
       executable: verified.executable,
       userDataDir,
       dataRoot: environment.SAND_DATA_ROOT,
+      launchStartedAtMs: launched?.launchStartedAtMs,
       error,
       harness: servers,
       logs,
@@ -1232,7 +1240,15 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     };
     await cleanup("release held 9Router model probe", async () => servers?.gatewayState.releaseHeldCliProxyProbe?.());
     await cleanup("close renderer debugger", async () => launched?.cdp?.close());
-    await cleanup("stop packaged process tree", async () => stopProcess(launched?.child));
+    await cleanup("stop packaged process tree", async () => stopProcess(launched));
+    await cleanup("stop identity-verified local-exec daemon", async () => terminateVerifiedLocalExecDaemon({
+      rootPid: launched?.child?.pid,
+      executable: verified.executable,
+      userDataDir,
+      dataRoot: environment.SAND_DATA_ROOT,
+      launchStartedAtMs: launched?.launchStartedAtMs ?? smokeStartedAtMs,
+      environment,
+    }));
     await cleanup("close gateway harness", async () => closeServer(servers?.gateway, "gateway harness"));
     await cleanup("close router harness", async () => closeServer(servers?.router, "router harness"));
     if (cleanupErrors.length > 0) {

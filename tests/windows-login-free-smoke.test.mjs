@@ -5,6 +5,7 @@ import test from "node:test";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const smokePath = path.join(repoRoot, "scripts", "smoke-windows.mjs");
+const processHelperPath = path.join(repoRoot, "scripts", "lib", "windows-smoke-processes.mjs");
 const fakeDockerRoot = path.join(repoRoot, "scripts", "fixtures", "windows-fake-docker");
 
 test("Windows packaged smoke exercises the complete signed-out 9Router setup in dependency order", async () => {
@@ -60,7 +61,10 @@ test("Windows packaged smoke exercises the complete signed-out 9Router setup in 
   assert.match(source, /firstQuitRequestIndex/);
   assert.match(source, /finalQuitRequestIndex/);
   assert.match(source, /process exited before its final 9Router credential lease revocation was acknowledged/);
-  assert.match(source, /taskkill was used only as failure cleanup/);
+  assert.match(source, /forced process cleanup was used only after failure/);
+  assert.match(source, /firstExitState\.onlyExpectedPersistentDaemon/);
+  assert.match(source, /finalExitState\.onlyExpectedPersistentDaemon/);
+  assert.match(source, /Persistent relaunch reused an idle local-exec daemon/);
 });
 
 test("Windows packaged smoke proves secure quit, persistent recovery, and final stop in order", async () => {
@@ -137,6 +141,7 @@ test("Windows packaged smoke uses authenticated loopback services and never embe
 
 test("Windows smoke preserves the basic and --app entrypoints while defaulting CI to the full flow", async () => {
   const source = await readFile(smokePath, "utf8");
+  const processSource = await readFile(processHelperPath, "utf8");
   assert.match(source, /\[--app portable-directory\] \[--basic\]/);
   assert.match(source, /if \(options\.basic\) await runBasicSmoke/);
   assert.match(source, /else await runFullLoginFreeSmoke/);
@@ -149,9 +154,11 @@ test("Windows smoke preserves the basic and --app entrypoints while defaulting C
   assert.match(source, /await waitForProcessClose\(launched\.child\)/);
   assert.match(source, /setTimeout\([\s\S]{0,180}Timed out waiting for packaged process close[\s\S]{0,180}closed\.then\(\(\) => \{ clearTimeout\(timeout\); resolve\(\); \}\)/);
   assert.match(source, /Timed out waiting for packaged process close/);
-  assert.match(source, /Get-CimInstance Win32_Process/);
-  assert.match(source, /const relatedPids = new Set/);
-  assert.match(source, /relevantProcesses/);
+  assert.match(processSource, /Get-CimInstance Win32_Process/);
+  assert.match(processSource, /const relatedPids = new Set/);
+  assert.match(processSource, /onlyExpectedPersistentDaemon/);
+  assert.match(source, /settleExitedPortableProcess/);
+  assert.match(source, /terminateVerifiedLocalExecDaemon/);
   assert.match(source, /Basic Windows smoke cleanup also failed/);
   assert.match(source, /RETRYABLE_TEMP_CLEANUP_ERRORS/);
   assert.match(source, /rm\(target, \{ recursive: true, force: true, maxRetries: 0 \}\)/);
@@ -162,6 +169,7 @@ test("Windows smoke preserves the basic and --app entrypoints while defaulting C
 
 test("Windows smoke scans persistence for UTF-8 and UTF-16 key canaries and redacts failure artifacts", async () => {
   const source = await readFile(smokePath, "utf8");
+  const processSource = await readFile(processHelperPath, "utf8");
   assert.match(source, /Buffer\.from\(secretCanary, "utf8"\)/);
   assert.match(source, /Buffer\.from\(secretCanary, "utf16le"\)/);
   assert.match(source, /apiKeyCiphertext/);
@@ -169,7 +177,8 @@ test("Windows smoke scans persistence for UTF-8 and UTF-16 key canaries and reda
   assert.match(source, /Page\.captureScreenshot/);
   assert.match(source, /\[REDACTED-9ROUTER-KEY\]/);
   assert.match(source, /--sand-local-exec-generation=\[REDACTED\]/);
-  assert.match(source, /local-exec-daemon\.json/);
+  assert.match(processSource, /local-exec-daemon\.json/);
+  assert.doesNotMatch(processSource, /console\.(?:log|error)|process\.stderr\.write/);
   assert.match(source, /Windows smoke relevant process inventory \(redacted\)/);
   assert.match(source, /Refusing to write an unredacted Windows smoke failure artifact/);
   assert.match(source, /process\.stderr\.write\(`\$\{failure\.message\}\\n`\)/);
