@@ -733,10 +733,11 @@ test("replacement coordinator launch ignores late events and problems from the o
           throw new Error("replacement launch failed");
         }
         const exited = Promise.withResolvers();
-        const record = { dependencies, exited, disposeCalls: 0 };
+        const rendererDataPort = { launch: launches.length + 1 };
+        const record = { dependencies, exited, rendererDataPort, disposeCalls: 0 };
         launches.push(record);
         return {
-          rendererDataPort: {},
+          rendererDataPort,
           mainDataPort: {},
           controlSettled: Promise.resolve(),
           processExited: exited.promise,
@@ -745,13 +746,21 @@ test("replacement coordinator launch ignores late events and problems from the o
       },
     });
 
+    const delivered = [];
+    const deliver = (port) => delivered.push(port);
     const first = launches[0];
+    runtime.requestRendererPort(deliver);
+    assert.deepEqual(delivered, [first.rendererDataPort]);
     first.dependencies.onEvent["transport-connected"]({ generation: 1 });
     assert.deepEqual(observed.map(([kind]) => kind), ["connected"]);
 
     const restarted = runtime.restart();
     const second = launches[1];
     assert.equal(first.disposeCalls, 1);
+    assert.equal(delivered.length, 1, "restart must not race a replacement port ahead of the old close");
+    runtime.requestRendererPort(deliver);
+    assert.deepEqual(delivered, [first.rendererDataPort, second.rendererDataPort]);
+    assert.equal(launches.length, 2, "the close-driven request must reuse the launched replacement");
     first.dependencies.onEvent["transport-down"]({ generation: 2, reason: "old child exit" });
     first.dependencies.onEvent["agents-event"]({ stale: true });
     first.dependencies.onProblem("old child control port closed");
@@ -786,6 +795,76 @@ test("replacement coordinator launch ignores late events and problems from the o
     ]);
     assert.deepEqual(problems, ["current child problem"]);
     second.exited.resolve({ code: 0 });
+    await disposed;
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("automatic relaunch hands off the launched replacement without a third coordinator", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-runtime.ts");
+  try {
+    const launches = [];
+    const delivered = [];
+    const scheduled = [];
+    const runtime = loaded.module.createCoordinatorRuntime({
+      fork() { assert.fail("custom launch should be used"); },
+      createChannel() { assert.fail("custom launch should be used"); },
+      executors: {},
+      onEvent: {
+        "transport-connected"() {},
+        "transport-down"() {},
+      },
+      onProblem() {},
+      processConfig: {},
+      artifactPath: "/coordinator.cjs",
+      monotonicNow: () => 1_000,
+      onMainDataPort() {},
+      onLifecycle() {},
+      relaunchBackoff: {
+        schedule() {
+          const elapsed = Promise.withResolvers();
+          scheduled.push(elapsed);
+          return { elapsed: elapsed.promise, dispose() {} };
+        },
+      },
+      launch(dependencies) {
+        const exited = Promise.withResolvers();
+        const rendererDataPort = { launch: launches.length + 1 };
+        const record = { dependencies, exited, rendererDataPort };
+        launches.push(record);
+        return {
+          rendererDataPort,
+          mainDataPort: {},
+          controlSettled: Promise.resolve(),
+          processExited: exited.promise,
+          dispose() {},
+          forceDispose() {},
+        };
+      },
+    });
+
+    const deliver = (port) => delivered.push(port);
+    runtime.requestRendererPort(deliver);
+    assert.deepEqual(delivered, [launches[0].rendererDataPort]);
+
+    launches[0].exited.resolve({ code: 1 });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(scheduled.length, 1);
+    scheduled[0].resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(launches.length, 2);
+    assert.equal(delivered.length, 1, "timer relaunch must wait for the renderer close-driven request");
+    runtime.requestRendererPort(deliver);
+    assert.deepEqual(delivered, [
+      launches[0].rendererDataPort,
+      launches[1].rendererDataPort,
+    ]);
+    assert.equal(launches.length, 2, "requesting the pending replacement must not launch a third child");
+
+    const disposed = runtime.dispose();
+    launches[1].exited.resolve({ code: 0 });
     await disposed;
   } finally {
     await loaded.dispose();

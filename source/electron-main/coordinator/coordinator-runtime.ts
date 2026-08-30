@@ -262,8 +262,11 @@ export function createCoordinatorRuntime(
             delayMs: dependencies.monotonicNow() - scheduledAtMs,
             relaunchSeq,
           });
+          // Keep the replacement port untransferred until the renderer observes
+          // the retired port closing and requests its next port. Proactively
+          // pushing here races that close-driven request across Electron channels
+          // and can otherwise launch an unnecessary third coordinator.
           launch();
-          serveRequester();
         },
         () => {},
       );
@@ -297,8 +300,10 @@ export function createCoordinatorRuntime(
       if (disposed) return Promise.resolve();
       cancelPendingRelaunch();
       const previous = current;
+      // The old renderer port close is the handoff acknowledgement. Its request
+      // receives this already-launched replacement through the !portTransferred
+      // branch without starting another child.
       launch();
-      serveRequester();
       return retireHandle(previous);
     },
     dispose() {
