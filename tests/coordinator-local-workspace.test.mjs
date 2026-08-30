@@ -1575,6 +1575,64 @@ function localExecIdentity(pid, startEpochMs, entryRealpath, generationToken) {
   };
 }
 
+test("durable startup quarantine retries do not consume the supervisor respawn budget", async () => {
+  const loaded = await loadModule("source/node-agent-coordinator/local-exec/supervisor.ts");
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-supervisor-"));
+  const discoveryPath = path.join(temporary, "local-exec-daemon.json");
+  const liveness = controlledLocalExecPollingPolicy();
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const identity = localExecIdentity(4_091, 1_000, entryRealpath, "recovered-generation");
+  const descriptor = {
+    pid: identity.pid,
+    startedAt: 2_000,
+    entryRealpath,
+    generationToken: identity.generationToken,
+    inflightCount: 0,
+  };
+  let blocked = true;
+  let spawnCalls = 0;
+  try {
+    const supervisor = loaded.module.createLocalExecDaemonSupervisor({
+      dataDir: temporary,
+      isPackaged: true,
+      refreshPolicy: inertLocalExecPollingPolicy(),
+      livenessPolicy: liveness.policy,
+      now: () => 3_000,
+      control: {
+        async resolveGatewayConnection() { return { endpoint: "loopback" }; },
+        async mintLocalExecDaemonCredential() { return null; },
+        async spawnLocalExecDaemon() {
+          spawnCalls += 1;
+          if (blocked) throw new Error("local-exec startup cleanup is quarantined: test process still live");
+          await writeFile(discoveryPath, JSON.stringify(descriptor), "utf8");
+          return identity;
+        },
+        async getProcessIdentity({ pid }) { return !blocked && pid === identity.pid ? identity : null; },
+        async isProcessAlive() { return false; },
+        async terminateProcess() { return { terminated: true }; },
+        async waitLocalExecDaemonExit() { return await new Promise(() => {}); },
+      },
+    });
+
+    await supervisor.start();
+    assert.equal(supervisor.state().phase, "failed");
+    assert.match(supervisor.state().reason, /startup cleanup is quarantined/);
+    for (let attempt = 0; attempt < loaded.module.LOCAL_EXEC_DAEMON_RESPAWN_LIMIT + 3; attempt += 1) {
+      await liveness.tick();
+    }
+    assert.equal(supervisor.state().phase, "failed");
+    assert.ok(spawnCalls > loaded.module.LOCAL_EXEC_DAEMON_RESPAWN_LIMIT);
+    blocked = false;
+    await liveness.tick();
+    assert.equal(supervisor.state().phase, "active");
+    assert.equal(supervisor.state().daemon.pid, identity.pid);
+    await supervisor.dispose();
+  } finally {
+    await loaded.dispose();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test("local-exec replacement fails closed when a verified predecessor refuses termination", async () => {
   const loaded = await loadModule("source/node-agent-coordinator/local-exec/supervisor.ts");
   const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-supervisor-"));
@@ -2032,6 +2090,22 @@ test("Windows local-exec identity parsing handles PowerShell dates with an absol
   }
 });
 
+test("process liveness distinguishes confirmed absence from inspection failure", async () => {
+  const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
+  try {
+    const errno = code => Object.assign(new Error(code), { code });
+    assert.equal(loaded.module.isProcessAlive(101, () => { throw errno("ESRCH"); }), false);
+    assert.equal(loaded.module.isProcessAlive(102, () => { throw errno("EPERM"); }, () => null), true);
+    assert.equal(loaded.module.isProcessAlive(103, () => true, () => "Z"), false);
+    assert.throws(
+      () => loaded.module.isProcessAlive(104, () => { throw errno("EIO"); }),
+      error => error?.code === "EIO",
+    );
+  } finally {
+    await loaded.dispose();
+  }
+});
+
 test("Windows local-exec termination uses absolute taskkill tree force and then verifies exit", async () => {
   const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
   try {
@@ -2143,6 +2217,7 @@ test("POSIX owned unidentified termination escalates a timed-out SIGTERM to SIGK
     await loaded.module.terminateProcess(4_201, {
       platform: "linux",
       allowUnidentifiedOwnedEscalation: true,
+      isUnidentifiedProcessStillOwned: () => true,
       kill(pid, signal) {
         assert.equal(pid, 4_201);
         signals.push(signal);
@@ -2161,19 +2236,20 @@ test("POSIX owned unidentified termination escalates a timed-out SIGTERM to SIGK
   }
 });
 
-test("POSIX identified termination will not SIGKILL a reused PID", async () => {
+test("POSIX unidentified escalation stops when the owned child exit becomes observable", async () => {
   const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
   try {
-    const expected = { pid: 4_201, startEpochMs: 10, command: "expected daemon" };
-    const replacement = { pid: expected.pid, startEpochMs: 11, command: "unrelated process" };
     const signals = [];
-    await loaded.module.terminateProcess(expected.pid, {
+    let ownershipChecks = 0;
+    await loaded.module.terminateProcess(4_202, {
       platform: "linux",
-      expectedIdentity: expected,
-      readIdentity: () => replacement,
-      isAlive: () => true,
+      allowUnidentifiedOwnedEscalation: true,
+      isUnidentifiedProcessStillOwned() {
+        ownershipChecks += 1;
+        return ownershipChecks === 1;
+      },
       kill(pid, signal) {
-        assert.equal(pid, expected.pid);
+        assert.equal(pid, 4_202);
         signals.push(signal);
         return true;
       },
@@ -2182,6 +2258,35 @@ test("POSIX identified termination will not SIGKILL a reused PID", async () => {
       },
     });
     assert.deepEqual(signals, ["SIGTERM"]);
+    assert.equal(ownershipChecks, 2);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("POSIX identified termination will not signal a reused PID", async () => {
+  const loaded = await loadModule("source/electron-main/local-exec/local-exec-native.ts");
+  try {
+    const expected = { pid: 4_201, startEpochMs: 10, command: "expected daemon" };
+    const replacement = { pid: expected.pid, startEpochMs: 11, command: "unrelated process" };
+    const signals = [];
+    await assert.rejects(
+      loaded.module.terminateProcess(expected.pid, {
+        platform: "linux",
+        expectedIdentity: expected,
+        readIdentity: () => replacement,
+        isAlive: () => true,
+        kill(pid, signal) {
+          assert.equal(pid, expected.pid);
+          signals.push(signal);
+          return true;
+        },
+        async waitForExit() { assert.fail("identity reuse must be rejected before waiting"); },
+      }),
+      error => error instanceof loaded.module.LocalExecTerminationIdentityError
+        && /changed identity before SIGTERM/.test(error.message),
+    );
+    assert.deepEqual(signals, []);
   } finally {
     await loaded.dispose();
   }
@@ -2196,10 +2301,15 @@ test("unidentified local-exec spawns use the native bounded termination path", a
   const next = source.indexOf("\n  };", helper);
   assert.ok(helper >= 0 && next > helper);
   const body = source.slice(helper, next);
-  assert.match(body, /unidentifiedSpawnQuarantine\.add\(pid\)/);
-  assert.match(body, /await native\.terminateProcess\(pid, \{ allowUnidentifiedOwnedEscalation: true \}\)/);
+  assert.match(body, /unidentifiedSpawnQuarantine\.set\(pid, candidate\)/);
+  assert.match(body, /writeStartupQuarantine\(candidate\)/);
+  assert.ok(body.indexOf("writeStartupQuarantine(candidate)") < body.indexOf("native.terminateProcess("));
+  assert.match(body, /isUnidentifiedProcessStillOwned: isStillOwned/);
+  assert.match(body, /observed == null/);
+  assert.match(body, /expectedIdentity: observed/);
+  assert.match(body, /startupQuarantineMatchesObserved\(quarantine, observed\)/);
   assert.match(body, /native\.isProcessAlive\(pid\)/);
-  assert.match(body, /unidentifiedSpawnQuarantine\.delete\(pid\)/);
+  assert.match(body, /releaseStartupQuarantine\(quarantine\)/);
   assert.doesNotMatch(body, /child\.kill\(/);
 });
 

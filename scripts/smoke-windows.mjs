@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import { mkdir, mkdtemp, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import WebSocket from "ws";
@@ -502,7 +503,7 @@ function exactObjectKeys(value, allowed, required = allowed) {
   return keys.every(key => allowed.includes(key)) && required.every(key => keys.includes(key));
 }
 
-async function startHarnessServers(secretCanary) {
+export async function startHarnessServers(secretCanary, { gatewayPort = 1340 } = {}) {
   const routerRequests = [];
   const router = createServer((request, response) => {
     const authorized = request.headers.authorization === `Bearer ${secretCanary}`;
@@ -543,6 +544,8 @@ async function startHarnessServers(secretCanary) {
     localExecPingFrames: 0,
     localExecHelloProviders: [],
     webauthnHelloProviders: [],
+    activeWebauthnStreams: 0,
+    activeLocalExecStreams: 0,
     holdNextCliProxyProbe: false,
     cliProxyProbeHeld: false,
     releaseHeldCliProxyProbe: null,
@@ -554,8 +557,12 @@ async function startHarnessServers(secretCanary) {
   const localExecProviderIds = new Set();
   const activeWebauthnProviderIds = new Set();
   const activeLocalExecProviderIds = new Set();
+  const activeWebauthnStreams = new Map();
+  const activeLocalExecStreams = new Map();
   const matchedWebauthnProviderIds = new Set();
   const matchedLocalExecProviderIds = new Set();
+  const webauthnHelloFingerprints = new Map();
+  const localExecHelloFingerprints = new Map();
   let cliProxyLease;
   let cliProxyLeaseExpiryTimer;
   const clearHarnessCliProxyLease = () => {
@@ -575,32 +582,40 @@ async function startHarnessServers(secretCanary) {
     const authorization = request.headers.authorization ?? "";
     const tokenMatch = /^Bearer ([A-Za-z0-9_-]{32,256})$/.exec(authorization);
     const presentedToken = tokenMatch?.[1] ?? null;
-    if (gatewayState.token == null && presentedToken != null && presentedToken !== secretCanary) gatewayState.token = presentedToken;
-    const authorized = presentedToken != null && presentedToken === gatewayState.token && presentedToken !== secretCanary;
+    const authorized = presentedToken != null
+      && presentedToken !== secretCanary
+      && (gatewayState.token == null || presentedToken === gatewayState.token);
     const audit = { method: request.method ?? "", url: request.url ?? "", authorized };
     request.windowsSmokeAudit = audit;
     gatewayRequests.push(audit);
-    if (!authorized) {
-      writeJson(response, 401, { error: "invalid smoke gateway credential" });
-      return;
-    }
     if (request.headers.origin != null) {
       audit.invalid = true;
       writeJson(response, 403, { error: "browser-originated gateway requests are forbidden" });
       return;
     }
+    if (!authorized) {
+      writeJson(response, 401, { error: "invalid smoke gateway credential" });
+      return;
+    }
+    if (gatewayState.token == null) gatewayState.token = presentedToken;
 
     if (request.method === "GET" && request.url === "/webauthn/requests") {
       gatewayState.webauthnRequestConnections += 1;
       const providerId = `windows-smoke-webauthn-${gatewayState.webauthnRequestConnections}`;
       webauthnProviderIds.add(providerId);
       activeWebauthnProviderIds.add(providerId);
+      activeWebauthnStreams.set(providerId, response);
+      gatewayState.activeWebauthnStreams = activeWebauthnStreams.size;
       audit.webauthnRequestConnection = gatewayState.webauthnRequestConnections;
       openHarnessEventStream(
         response,
         { kind: "welcome", providerId },
         "webauthn",
-        () => activeWebauthnProviderIds.delete(providerId),
+        () => {
+          activeWebauthnProviderIds.delete(providerId);
+          activeWebauthnStreams.delete(providerId);
+          gatewayState.activeWebauthnStreams = activeWebauthnStreams.size;
+        },
       );
       return;
     }
@@ -613,12 +628,18 @@ async function startHarnessServers(secretCanary) {
       const providerId = `windows-smoke-local-exec-${gatewayState.localExecRequestConnections}`;
       localExecProviderIds.add(providerId);
       activeLocalExecProviderIds.add(providerId);
+      activeLocalExecStreams.set(providerId, response);
+      gatewayState.activeLocalExecStreams = activeLocalExecStreams.size;
       audit.localExecRequestConnection = gatewayState.localExecRequestConnections;
       openHarnessEventStream(
         response,
         { kind: "welcome", providerId },
         "local-exec",
-        () => activeLocalExecProviderIds.delete(providerId),
+        () => {
+          activeLocalExecProviderIds.delete(providerId);
+          activeLocalExecStreams.delete(providerId);
+          gatewayState.activeLocalExecStreams = activeLocalExecStreams.size;
+        },
       );
       return;
     }
@@ -637,49 +658,83 @@ async function startHarnessServers(secretCanary) {
       const matchedProviderIds = isLocalExec ? matchedLocalExecProviderIds : matchedWebauthnProviderIds;
       let effectiveProviderId = batch.providerId;
       if (batch.providerId === undefined) {
-        if (!isLocalExec || batch.frames.length !== 1 || batch.frames[0]?.kind !== "hello") {
-          throw new Error("only one local-exec startup hello may precede providerId binding");
+        const startupFrame = batch.frames.length === 1 ? batch.frames[0] : null;
+        if (startupFrame == null || !["hello", "ping"].includes(startupFrame?.kind)) {
+          throw new Error("an unbound provider startup batch must contain exactly one hello or ping");
         }
-        const unmatched = [...activeLocalExecProviderIds].filter(providerId => !matchedLocalExecProviderIds.has(providerId));
-        if (unmatched.length !== 1) {
-          throw new Error("unbound local-exec startup hello did not have exactly one unmatched active request stream");
+        if (isLocalExec) {
+          const active = [...activeLocalExecProviderIds];
+          const unmatched = active.filter(providerId => !matchedLocalExecProviderIds.has(providerId));
+          const candidates = unmatched.length === 1
+            ? unmatched
+            : unmatched.length === 0 && active.length === 1
+              ? active
+              : [];
+          if (candidates.length !== 1) {
+            throw new Error("unbound local-exec startup frame did not have exactly one unambiguous active request stream");
+          }
+          effectiveProviderId = candidates[0];
+          if (startupFrame.kind === "hello") audit.unboundStartupHello = true;
+          else audit.unboundStartupPing = true;
+        } else {
+          if (startupFrame.kind !== "ping" || activeWebauthnProviderIds.size === 0) {
+            throw new Error("only a WebAuthn startup ping may omit providerId");
+          }
+          effectiveProviderId = undefined;
+          audit.unboundStartupPing = true;
         }
-        effectiveProviderId = unmatched[0];
-        audit.unboundStartupHello = true;
-      } else if (typeof batch.providerId !== "string" || !providerIds.has(batch.providerId) || !activeProviderIds.has(batch.providerId)) {
-        throw new Error("provider response batch used an unknown or inactive providerId");
+      } else if (typeof batch.providerId !== "string" || !providerIds.has(batch.providerId)) {
+        throw new Error("provider response batch used an unknown providerId");
       }
-      if (typeof effectiveProviderId !== "string") throw new Error("provider response batch could not be bound to a providerId");
-      audit.providerId = effectiveProviderId;
+      const providerFrameActive = effectiveProviderId === undefined || activeProviderIds.has(effectiveProviderId);
+      if (!providerFrameActive) audit.staleProviderBatch = true;
+      if (effectiveProviderId !== undefined) audit.providerId = effectiveProviderId;
       for (const frame of batch.frames) {
         if (isLocalExec && frame?.kind === "hello") {
+          if (typeof effectiveProviderId !== "string") throw new Error("local-exec hello could not be bound to a providerId");
           if (!exactObjectKeys(frame, ["kind", "localRoot", "terminalsFolder", "computerId", "label", "supervised", "variant"], ["kind", "localRoot", "terminalsFolder", "computerId", "label"])
             || ["localRoot", "terminalsFolder", "computerId", "label"].some(key => typeof frame[key] !== "string" || frame[key].length === 0)
             || (frame.supervised !== undefined && typeof frame.supervised !== "boolean")
             || (frame.variant !== undefined && typeof frame.variant !== "string")) {
             throw new Error("local-exec hello frame is invalid");
           }
-          if (matchedProviderIds.has(effectiveProviderId)) throw new Error("local-exec provider sent more than one hello");
-          matchedProviderIds.add(effectiveProviderId);
-          gatewayState.localExecHelloFrames += 1;
-          if (!gatewayState.localExecHelloProviders.includes(effectiveProviderId)) gatewayState.localExecHelloProviders.push(effectiveProviderId);
+          const helloFingerprint = JSON.stringify({ kind: frame.kind, localRoot: frame.localRoot, terminalsFolder: frame.terminalsFolder, computerId: frame.computerId, label: frame.label, supervised: frame.supervised ?? null, variant: frame.variant ?? null });
+          const priorHello = localExecHelloFingerprints.get(effectiveProviderId);
+          if (priorHello !== undefined && priorHello !== helloFingerprint) {
+            throw new Error("local-exec provider sent a conflicting hello retry");
+          }
+          audit.rehello = priorHello !== undefined;
+          if (providerFrameActive && audit.rehello !== true) {
+            localExecHelloFingerprints.set(effectiveProviderId, helloFingerprint);
+            matchedProviderIds.add(effectiveProviderId);
+            gatewayState.localExecHelloFrames += 1;
+            gatewayState.localExecHelloProviders.push(effectiveProviderId);
+          }
         } else if (isLocalExec && frame?.kind === "ping") {
-          if (!matchedProviderIds.has(effectiveProviderId)) throw new Error("local-exec provider ping preceded hello");
+          if (typeof effectiveProviderId !== "string") throw new Error("local-exec ping could not be bound to a providerId");
           if (!exactObjectKeys(frame, ["kind", "supervised"], ["kind"]) || (frame.supervised !== undefined && typeof frame.supervised !== "boolean")) {
             throw new Error("local-exec ping frame is invalid");
           }
           gatewayState.localExecPingFrames += 1;
         } else if (!isLocalExec && frame?.kind === "hello") {
+          if (typeof effectiveProviderId !== "string") throw new Error("webauthn hello must use its issued providerId");
           if (!exactObjectKeys(frame, ["kind", "computerId", "label"], ["kind"])
             || (frame.computerId !== undefined && typeof frame.computerId !== "string")
             || (frame.label !== undefined && typeof frame.label !== "string")) {
             throw new Error("webauthn hello frame is invalid");
           }
-          if (matchedProviderIds.has(effectiveProviderId)) throw new Error("webauthn provider sent more than one hello");
-          matchedProviderIds.add(effectiveProviderId);
-          if (!gatewayState.webauthnHelloProviders.includes(effectiveProviderId)) gatewayState.webauthnHelloProviders.push(effectiveProviderId);
+          const helloFingerprint = JSON.stringify({ kind: frame.kind, computerId: frame.computerId ?? null, label: frame.label ?? null });
+          const priorHello = webauthnHelloFingerprints.get(effectiveProviderId);
+          if (priorHello !== undefined && priorHello !== helloFingerprint) {
+            throw new Error("webauthn provider sent a conflicting hello retry");
+          }
+          audit.rehello = priorHello !== undefined;
+          if (providerFrameActive && audit.rehello !== true) {
+            webauthnHelloFingerprints.set(effectiveProviderId, helloFingerprint);
+            matchedProviderIds.add(effectiveProviderId);
+            gatewayState.webauthnHelloProviders.push(effectiveProviderId);
+          }
         } else if (!isLocalExec && frame?.kind === "ping") {
-          if (!matchedProviderIds.has(effectiveProviderId)) throw new Error("webauthn provider ping preceded hello");
           if (!exactObjectKeys(frame, ["kind"])) throw new Error("webauthn ping frame is invalid");
         } else {
           throw new Error(`unexpected ${isLocalExec ? "local-exec" : "webauthn"} response frame`);
@@ -878,8 +933,17 @@ async function startHarnessServers(secretCanary) {
       else writeJson(response, 500, { error: error instanceof Error ? error.message : String(error) });
     });
   });
-  gateway.once("close", clearHarnessCliProxyLease);
-  try { await listenLoopback(gateway, 1340); }
+  const disconnectProviderStreams = () => {
+    for (const response of [...activeWebauthnStreams.values(), ...activeLocalExecStreams.values()]) {
+      if (!response.destroyed && !response.writableEnded) response.end();
+    }
+  };
+  gateway.once("close", () => {
+    clearHarnessCliProxyLease();
+    disconnectProviderStreams();
+  });
+  let gatewayBoundPort;
+  try { gatewayBoundPort = await listenLoopback(gateway, gatewayPort); }
   catch (error) {
     try { await closeServer(router, "router harness after gateway bind failure"); }
     catch (cleanupError) {
@@ -894,6 +958,23 @@ async function startHarnessServers(secretCanary) {
     gatewayState,
     routerRequests,
     routerBaseUrl,
+    gatewayBaseUrl: `http://127.0.0.1:${gatewayBoundPort}`,
+    disconnectProviderStreams,
+    hasActiveProviderHandshake(channel, baseline) {
+      const active = channel === "local-exec" ? activeLocalExecProviderIds : activeWebauthnProviderIds;
+      const matched = channel === "local-exec" ? matchedLocalExecProviderIds : matchedWebauthnProviderIds;
+      return [...active].some(providerId => matched.has(providerId) && !baseline.has(providerId));
+    },
+    async close() {
+      clearHarnessCliProxyLease();
+      disconnectProviderStreams();
+      const errors = [];
+      try { await closeServer(gateway, "gateway harness"); }
+      catch (error) { errors.push(error); }
+      try { await closeServer(router, "router harness"); }
+      catch (error) { errors.push(error); }
+      if (errors.length > 0) throw new AggregateError(errors, "Windows smoke harness servers did not close cleanly");
+    },
   };
 }
 
@@ -1140,6 +1221,10 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
   try {
     const fakeDockerDirectory = await buildStrictFakeDocker(temporary);
     servers = await startHarnessServers(secretCanary);
+    const initialProviderBaseline = {
+      localExec: new Set(servers.gatewayState.localExecHelloProviders),
+      webauthn: new Set(servers.gatewayState.webauthnHelloProviders),
+    };
     environment = {
       ...baseEnvironment,
       PATH: `${fakeDockerDirectory}${path.delimiter}${baseEnvironment.PATH ?? ""}`,
@@ -1229,8 +1314,6 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
       eventConnections: servers.gatewayState.eventConnections,
       leaseInstalls: servers.gatewayState.cliProxyLeaseInstalls,
       modelProbes: servers.gatewayState.cliProxyModelProbes,
-      localExecHelloProviders: [...servers.gatewayState.localExecHelloProviders],
-      webauthnHelloProviders: [...servers.gatewayState.webauthnHelloProviders],
     };
     servers.gatewayState.holdNextCliProxyProbe = true;
     await clickButton(
@@ -1278,13 +1361,11 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     phase = "login-free-gate";
     await assertLoginFreeWorkspace(launched.cdp, servers.routerBaseUrl);
     await waitForHarnessState(
-      () => servers.gatewayState.localExecHelloProviders.some(providerId => !continueBaseline.localExecHelloProviders.includes(providerId))
-        && servers.gatewayState.webauthnHelloProviders.some(providerId => !continueBaseline.webauthnHelloProviders.includes(providerId)),
-      "First ready workspace did not complete fresh local-exec and WebAuthn provider handshakes",
+      () => servers.hasActiveProviderHandshake("local-exec", initialProviderBaseline.localExec)
+        && servers.hasActiveProviderHandshake("webauthn", initialProviderBaseline.webauthn),
+      "First ready workspace did not complete local-exec and WebAuthn provider handshakes",
       30_000,
     );
-    const firstLocalExecHelloProviders = new Set(servers.gatewayState.localExecHelloProviders);
-    const firstWebauthnHelloProviders = new Set(servers.gatewayState.webauthnHelloProviders);
 
     phase = "first-process-stop";
     const firstQuitRequestIndex = servers.gatewayRequests.length;
@@ -1314,12 +1395,6 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     phase = "persistent-profile-relaunch";
     launched = await launchPortable(verified, environment, userDataDir, logs, handle => { launched = handle; }, smokeStartedAtMs);
     await assertLoginFreeWorkspace(launched.cdp, servers.routerBaseUrl, { probe: true });
-    await waitForHarnessState(
-      () => servers.gatewayState.localExecHelloProviders.some(providerId => !firstLocalExecHelloProviders.has(providerId))
-        && servers.gatewayState.webauthnHelloProviders.some(providerId => !firstWebauthnHelloProviders.has(providerId)),
-      "Relaunched ready workspace did not complete fresh local-exec and WebAuthn provider handshakes",
-      30_000,
-    );
     const daemonRotationDeadline = Date.now() + 10_000;
     let relaunchedProcessState;
     while (Date.now() < daemonRotationDeadline) {
@@ -1355,6 +1430,18 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     ) {
       throw new Error("Persistent relaunch reused an idle local-exec daemon instead of rotating its generation");
     }
+    phase = "relaunch-provider-reconnect";
+    const relaunchProviderBaseline = {
+      localExec: new Set(servers.gatewayState.localExecHelloProviders),
+      webauthn: new Set(servers.gatewayState.webauthnHelloProviders),
+    };
+    servers.disconnectProviderStreams();
+    await waitForHarnessState(
+      () => servers.hasActiveProviderHandshake("local-exec", relaunchProviderBaseline.localExec)
+        && servers.hasActiveProviderHandshake("webauthn", relaunchProviderBaseline.webauthn),
+      "Verified relaunched daemon and coordinator did not reconnect both provider channels",
+      30_000,
+    );
     phase = "persistent-container-recovered";
     await assertFakeDockerContainerState(
       dockerStatePath,
@@ -1492,41 +1579,47 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
   }
 }
 
-const options = parseArguments(process.argv.slice(2));
-const verified = await verifyWindowsPortable(options.root);
-if (process.platform !== "win32") {
-  console.log(`PASS Windows structural smoke (launch skipped on ${process.platform}): ${verified.outputRoot}`);
-  process.exit(0);
-}
-
-const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-bot-reconstructed-win-smoke-"));
-const userDataDir = path.join(temporary, "user-data");
-const dataRoot = path.join(temporary, "sand-data");
-const logs = [];
-const environment = {
-  ...process.env,
-  APPDATA: path.join(temporary, "AppData", "Roaming"),
-  LOCALAPPDATA: path.join(temporary, "AppData", "Local"),
-  SAND_DATA_ROOT: dataRoot,
-  SAND_USER_DATA_DIR: userDataDir,
-  SAND_DISABLE_UPDATES: "1",
-  SAND_DISABLE_SENTRY: "1",
-  SAND_DISABLE_TELEMETRY: "1",
-  SAND_DISABLE_PROTOCOL_REGISTRATION: "1",
-};
-
-let smokeFailure;
-try {
-  if (options.basic) await runBasicSmoke(verified, environment, userDataDir, logs);
-  else await runFullLoginFreeSmoke(verified, temporary, environment, userDataDir, logs);
-} catch (error) {
-  smokeFailure = error;
-  throw error;
-} finally {
-  try { await removeTemporaryDirectory(temporary); }
-  catch (error) {
-    const cleanupFailure = new Error(`Windows smoke temporary directory cleanup failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
-    if (smokeFailure != null) process.stderr.write(`${cleanupFailure.message}\n`);
-    else throw cleanupFailure;
+export async function runWindowsSmokeCli(argv = process.argv.slice(2)) {
+  const options = parseArguments(argv);
+  const verified = await verifyWindowsPortable(options.root);
+  if (process.platform !== "win32") {
+    console.log(`PASS Windows structural smoke (launch skipped on ${process.platform}): ${verified.outputRoot}`);
+    return;
   }
+  
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-bot-reconstructed-win-smoke-"));
+  const userDataDir = path.join(temporary, "user-data");
+  const dataRoot = path.join(temporary, "sand-data");
+  const logs = [];
+  const environment = {
+    ...process.env,
+    APPDATA: path.join(temporary, "AppData", "Roaming"),
+    LOCALAPPDATA: path.join(temporary, "AppData", "Local"),
+    SAND_DATA_ROOT: dataRoot,
+    SAND_USER_DATA_DIR: userDataDir,
+    SAND_DISABLE_UPDATES: "1",
+    SAND_DISABLE_SENTRY: "1",
+    SAND_DISABLE_TELEMETRY: "1",
+    SAND_DISABLE_PROTOCOL_REGISTRATION: "1",
+  };
+  
+  let smokeFailure;
+  try {
+    if (options.basic) await runBasicSmoke(verified, environment, userDataDir, logs);
+    else await runFullLoginFreeSmoke(verified, temporary, environment, userDataDir, logs);
+  } catch (error) {
+    smokeFailure = error;
+    throw error;
+  } finally {
+    try { await removeTemporaryDirectory(temporary); }
+    catch (error) {
+      const cleanupFailure = new Error(`Windows smoke temporary directory cleanup failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+      if (smokeFailure != null) process.stderr.write(`${cleanupFailure.message}\n`);
+      else throw cleanupFailure;
+    }
+  }
+  
+}
+if (process.argv[1] != null && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
+  await runWindowsSmokeCli();
 }

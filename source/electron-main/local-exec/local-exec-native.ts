@@ -92,7 +92,7 @@ export function readProcessIdentity(
     : null;
 }
 export function readProcessState(pid: number, platform = process.platform): string | null { if (platform === "win32") return null; const queried = attemptSync(() => execFileSync("ps", ["-p", String(pid), "-o", "state="], { encoding: "utf8", timeout: 2_000 })); if (!queried.ok) return null; const state = queried.value.trim(); return state.length > 0 ? state : null; }
-export function isProcessAlive(pid: number, kill: typeof process.kill = process.kill.bind(process), readState: (pid: number) => string | null = readProcessState): boolean { let signalable = false; try { kill(pid, 0); signalable = true; } catch (error) { if (findSystemErrno(error) !== "EPERM") return false; signalable = true; } if (!signalable) return false; const state = readState(pid); return state == null || !state.startsWith("Z"); }
+export function isProcessAlive(pid: number, kill: typeof process.kill = process.kill.bind(process), readState: (pid: number) => string | null = readProcessState): boolean { let signalable = false; try { kill(pid, 0); signalable = true; } catch (error) { const code = findSystemErrno(error); if (code === "ESRCH") return false; if (code !== "EPERM") throw error; signalable = true; } if (!signalable) return false; const state = readState(pid); return state == null || !state.startsWith("Z"); }
 export function readProcessCommand(pid: number, platform = process.platform): string | null { const proc = attemptSync(() => readFileSync(`/proc/${pid}/cmdline`, "utf8")); if (proc.ok && proc.value.length > 0) return proc.value.replaceAll("\0", " ").trim(); const queried = attemptSync(() => platform === "win32" ? execFileSync(resolveWindowsPowerShellPath(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); (Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}').CommandLine`], { encoding: "utf8", timeout: 5_000, windowsHide: true }) : execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8", timeout: 2_000 })); if (!queried.ok) return null; const command = queried.value.trim(); return command.length > 0 ? command : null; }
 export function isLocalExecDaemonProcess(pid: number, entryRealpath?: string, generationToken?: string): boolean { if (entryRealpath == null || generationToken == null) return false; const identity = readProcessIdentity(pid); return identity != null && commandCarriesLocalExecGeneration(identity.command, entryRealpath, generationToken); }
 export { commandCarriesLocalExecGeneration, LOCAL_EXEC_GENERATION_TOKEN_ARG, LOCAL_EXEC_GENERATION_TOKEN_ENV };
@@ -140,6 +140,7 @@ export async function terminateProcess(
     readonly readIdentity?: (pid: number) => LocalExecProcessIdentity | null;
     readonly isAlive?: (pid: number) => boolean;
     readonly allowUnidentifiedOwnedEscalation?: boolean;
+    readonly isUnidentifiedProcessStillOwned?: () => boolean;
   } = {},
 ): Promise<void> {
   const platform = deps.platform ?? process.platform;
@@ -155,20 +156,28 @@ export async function terminateProcess(
   ));
   const expected = deps.expectedIdentity;
   const reportFailure = deps.reportFailure ?? ((failure: unknown) => reportLocalExecTerminationFailed(pid, failure));
+  const unidentifiedOwnership = deps.isUnidentifiedProcessStillOwned;
+  if (expected == null && deps.allowUnidentifiedOwnedEscalation === true) {
+    if (unidentifiedOwnership == null) {
+      throw new LocalExecTerminationIdentityError(pid, "requires an owned-child liveness proof before unidentified escalation");
+    }
+    if (!unidentifiedOwnership()) return;
+  }
   const expectedExitConfirmed = (): boolean => {
     const observed = readIdentity(pid);
     if (expected != null && observed != null && !sameNativeProcessIdentity(observed, expected)) return true;
     return observed == null && !alive(pid);
   };
 
-  if (platform === "win32" && expected != null) {
+  if (expected != null) {
     const observed = readIdentity(pid);
+    const signalName = platform === "win32" ? "taskkill" : "SIGTERM";
     if (observed == null) {
       if (!alive(pid)) return;
-      throw new LocalExecTerminationIdentityError(pid, "remained alive but its identity could not be verified before taskkill");
+      throw new LocalExecTerminationIdentityError(pid, `remained alive but its identity could not be verified before ${signalName}`);
     }
     if (!sameNativeProcessIdentity(observed, expected)) {
-      throw new LocalExecTerminationIdentityError(pid, "changed identity before taskkill");
+      throw new LocalExecTerminationIdentityError(pid, `changed identity before ${signalName}`);
     }
   }
 
@@ -215,6 +224,8 @@ export async function terminateProcess(
       throw new LocalExecTerminationIdentityError(pid, "remained alive but its identity could not be verified before SIGKILL escalation");
     }
     if (!sameNativeProcessIdentity(observed, expected)) return;
+  } else if (unidentifiedOwnership?.() !== true) {
+    return;
   }
   try {
     signal(pid, "SIGKILL");

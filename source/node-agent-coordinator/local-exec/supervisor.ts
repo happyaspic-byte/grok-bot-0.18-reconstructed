@@ -1,5 +1,6 @@
 import { createRealPollingPolicy, type PollingPolicy } from "../../internal/scheduling.js";
 import { SAND_CLIENT_PAUSE_REASON } from "../../shared/gateway-reachability.js";
+import { LOCAL_EXEC_STARTUP_QUARANTINE_REASON } from "../../shared/local-exec-daemon.js";
 import {
   commandCarriesLocalExecGeneration,
   localExecDiscoveryTimeMatchesProcess,
@@ -315,8 +316,11 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
     if (state.phase === "absent") { consecutiveRespawns = 0; await establishDaemon(); return; }
     if (state.phase === "failed") {
       if (await quarantineBlocksSpawn()) return;
-      if (consecutiveRespawns >= LOCAL_EXEC_DAEMON_RESPAWN_LIMIT) return;
-      consecutiveRespawns += 1;
+      const startupQuarantineRetry = state.reason.includes(LOCAL_EXEC_STARTUP_QUARANTINE_REASON);
+      if (!startupQuarantineRetry) {
+        if (consecutiveRespawns >= LOCAL_EXEC_DAEMON_RESPAWN_LIMIT) return;
+        consecutiveRespawns += 1;
+      }
       await establishDaemon();
       return;
     }
