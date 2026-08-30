@@ -223,12 +223,39 @@ test("Windows gateway harness accepts production startup ordering and rejects am
   assert.equal(missingAccept.status, 500);
   await missingAccept.text();
 
+  const unmatchedWeb = await openProviderStream(harness.gatewayBaseUrl, "/webauthn/requests", gatewayToken);
+  const reconnectBaseline = {
+    webauthn: harness.snapshotProviderIds("webauthn"),
+    localExec: harness.snapshotProviderIds("local-exec"),
+  };
   harness.disconnectProviderStreams();
-  await waitFor(
-    () => harness.gatewayState.activeWebauthnStreams === 0
-      && harness.gatewayState.activeLocalExecStreams === 0,
-    "forced provider disconnect did not clean both active stream sets",
+  assert.equal(harness.gatewayState.activeWebauthnStreams, 0);
+  assert.equal(harness.gatewayState.activeLocalExecStreams, 0);
+
+  assert.equal((await postJson(
+    harness.gatewayBaseUrl,
+    "/webauthn/responses",
+    gatewayToken,
+    { providerId: unmatchedWeb.providerId, frames: [webauthnHello] },
+  )).status, 200, "a late hello from a forcibly disconnected WebAuthn stream must drain as stale");
+  assert.equal((await postJson(
+    harness.gatewayBaseUrl,
+    "/local-exec/responses",
+    gatewayToken,
+    { providerId: ambiguousOne.providerId, frames: [localExecHello] },
+  )).status, 200, "a late hello from a forcibly disconnected local-exec stream must drain as stale");
+  assert.equal(
+    harness.gatewayRequests.some(entry => entry.providerId === unmatchedWeb.providerId && entry.staleProviderBatch === true),
+    true,
   );
+  assert.equal(
+    harness.gatewayRequests.some(entry => entry.providerId === ambiguousOne.providerId && entry.staleProviderBatch === true),
+    true,
+  );
+  assert.equal(harness.gatewayState.webauthnHelloProviders.includes(unmatchedWeb.providerId), false);
+  assert.equal(harness.gatewayState.localExecHelloProviders.includes(ambiguousOne.providerId), false);
+  assert.equal(harness.hasActiveProviderHandshake("webauthn", reconnectBaseline.webauthn), false);
+  assert.equal(harness.hasActiveProviderHandshake("local-exec", reconnectBaseline.localExec), false);
 
   const webReconnect = await openProviderStream(harness.gatewayBaseUrl, "/webauthn/requests", gatewayToken);
   const localReconnect = await openProviderStream(harness.gatewayBaseUrl, "/local-exec/requests", gatewayToken);
@@ -246,6 +273,8 @@ test("Windows gateway harness accepts production startup ordering and rejects am
     gatewayToken,
     { providerId: localReconnect.providerId, frames: [localExecHello] },
   )).status, 200);
+  assert.equal(harness.hasActiveProviderHandshake("webauthn", reconnectBaseline.webauthn), true);
+  assert.equal(harness.hasActiveProviderHandshake("local-exec", reconnectBaseline.localExec), true);
 
   await harness.close();
   closed = true;
@@ -260,6 +289,7 @@ test("Windows gateway harness accepts production startup ordering and rejects am
     local.abort(),
     ambiguousOne.abort(),
     ambiguousTwo.abort(),
+    unmatchedWeb.abort(),
     webReconnect.abort(),
     localReconnect.abort(),
   ]);

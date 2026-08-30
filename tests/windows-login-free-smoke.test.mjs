@@ -132,6 +132,13 @@ test("Windows packaged smoke uses authenticated loopback services and never embe
   assert.match(source, /First ready workspace did not complete local-exec and WebAuthn provider handshakes/);
   assert.match(source, /Verified relaunched daemon and coordinator did not reconnect both provider channels/);
   assert.match(source, /servers\.disconnectProviderStreams\(\)/);
+  assert.match(source, /activeWebauthnProviderIds\.clear\(\)/);
+  assert.match(source, /activeLocalExecProviderIds\.clear\(\)/);
+  assert.match(source, /activeWebauthnStreams\.clear\(\)/);
+  assert.match(source, /activeLocalExecStreams\.clear\(\)/);
+  assert.match(source, /snapshotProviderIds\(channel\)/);
+  assert.equal((source.match(/servers\.snapshotProviderIds\("local-exec"\)/g) ?? []).length, 2);
+  assert.equal((source.match(/servers\.snapshotProviderIds\("webauthn"\)/g) ?? []).length, 2);
   assert.match(source, /hasActiveProviderHandshake\(channel, baseline\)/);
   assert.match(source, /matched\.has\(providerId\) && !baseline\.has\(providerId\)/);
   assert.match(source, /\["listAllAutomations", "getTrays"\]\.includes\(command\)/);

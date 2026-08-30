@@ -170,8 +170,11 @@ export async function composeCoordinator(dependencies: ComposeCoordinatorDepende
       resolveGatewayConnection: (args) => command(commands, "resolveGatewayConnection", args),
       mintLocalExecDaemonCredential: (args) => command(commands, "mintLocalExecDaemonCredential", args),
       spawnLocalExecDaemon: (args) => command(commands, "spawnLocalExecDaemon", args),
+      reconcileLocalExecStartupQuarantine: (args) => command(commands, "reconcileLocalExecStartupQuarantine", args),
+      confirmLocalExecDaemonReady: (args) => command(commands, "confirmLocalExecDaemonReady", args),
       isProcessAlive: (args) => command(commands, "isProcessAlive", args),
       getProcessIdentity: (args) => command(commands, "getProcessIdentity", args),
+      inspectLocalExecProcessIdentity: (args) => command(commands, "inspectLocalExecProcessIdentity", args),
       waitLocalExecDaemonExit: (args) => command(commands, "waitLocalExecDaemonExit", args),
       terminateProcess: (args) => command(commands, "terminateProcess", args)
     },

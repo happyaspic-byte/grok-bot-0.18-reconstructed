@@ -130,7 +130,6 @@ export async function waitForWindowsProcessExit(
 export async function terminateProcess(
   pid: number,
   deps: {
-    readonly kill?: typeof process.kill;
     readonly waitForExit?: (pid: number) => Promise<void>;
     readonly reportFailure?: (error: unknown) => void;
     readonly platform?: NodeJS.Platform;
@@ -139,12 +138,12 @@ export async function terminateProcess(
     readonly expectedIdentity?: LocalExecProcessIdentity;
     readonly readIdentity?: (pid: number) => LocalExecProcessIdentity | null;
     readonly isAlive?: (pid: number) => boolean;
+    readonly ownedChild?: Pick<ChildProcess, "pid" | "exitCode" | "signalCode" | "kill" | "once" | "off">;
     readonly allowUnidentifiedOwnedEscalation?: boolean;
     readonly isUnidentifiedProcessStillOwned?: () => boolean;
   } = {},
 ): Promise<void> {
   const platform = deps.platform ?? process.platform;
-  const signal = deps.kill ?? process.kill.bind(process);
   const alive = deps.isAlive ?? isProcessAlive;
   const readIdentity = deps.readIdentity ?? ((candidate: number) => readProcessIdentity(
     candidate,
@@ -155,8 +154,15 @@ export async function terminateProcess(
     },
   ));
   const expected = deps.expectedIdentity;
+  const ownedChild = deps.ownedChild;
   const reportFailure = deps.reportFailure ?? ((failure: unknown) => reportLocalExecTerminationFailed(pid, failure));
   const unidentifiedOwnership = deps.isUnidentifiedProcessStillOwned;
+  if (ownedChild == null) {
+    throw new LocalExecTerminationIdentityError(pid, "has no retained child-process handle, so PID-only termination is forbidden");
+  }
+  if (ownedChild.pid !== pid) {
+    throw new LocalExecTerminationIdentityError(pid, "does not match the retained child-process handle");
+  }
   if (expected == null && deps.allowUnidentifiedOwnedEscalation === true) {
     if (unidentifiedOwnership == null) {
       throw new LocalExecTerminationIdentityError(pid, "requires an owned-child liveness proof before unidentified escalation");
@@ -168,29 +174,41 @@ export async function terminateProcess(
     if (expected != null && observed != null && !sameNativeProcessIdentity(observed, expected)) return true;
     return observed == null && !alive(pid);
   };
+  const signalOwnedChild = (signalName: NodeJS.Signals): void => {
+    if (ownedChild.exitCode !== null || ownedChild.signalCode !== null) return;
+    if (!ownedChild.kill(signalName) && ownedChild.exitCode === null && ownedChild.signalCode === null) {
+      throw new Error(`retained child-process handle refused ${signalName}`);
+    }
+  };
+  const waitForOwnedChildExit = async (): Promise<void> => {
+    if (ownedChild.exitCode !== null || ownedChild.signalCode !== null) return;
+    await new Promise<void>((resolve, reject) => {
+      const onExit = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        ownedChild.off("exit", onExit);
+        reject(new LocalExecTerminationTimeoutError(pid));
+      }, 5_000);
+      timer.unref?.();
+      ownedChild.once("exit", onExit);
+    });
+  };
 
   if (expected != null) {
     const observed = readIdentity(pid);
-    const signalName = platform === "win32" ? "taskkill" : "SIGTERM";
     if (observed == null) {
-      if (!alive(pid)) return;
-      throw new LocalExecTerminationIdentityError(pid, `remained alive but its identity could not be verified before ${signalName}`);
+      if (ownedChild?.exitCode !== null || ownedChild?.signalCode !== null || !alive(pid)) return;
+      throw new LocalExecTerminationIdentityError(pid, "remained alive but its identity could not be verified before owned-handle termination");
     }
     if (!sameNativeProcessIdentity(observed, expected)) {
-      throw new LocalExecTerminationIdentityError(pid, `changed identity before ${signalName}`);
+      throw new LocalExecTerminationIdentityError(pid, "changed identity before owned-handle termination");
     }
   }
 
   try {
-    if (platform === "win32" && deps.kill == null) {
-      (deps.execFileSync ?? execFileSync)(
-        resolveWindowsTaskkillPath(deps.environment),
-        ["/PID", String(pid), "/T", "/F"],
-        { encoding: "utf8", timeout: 10_000, windowsHide: true },
-      );
-    } else {
-      signal(pid, "SIGTERM");
-    }
+    signalOwnedChild("SIGTERM");
   } catch (error) {
     const code = findSystemErrno(error);
     if (code === "ESRCH" || expectedExitConfirmed()) return;
@@ -198,14 +216,7 @@ export async function terminateProcess(
     throw new LocalExecTerminationSignalError(pid, code, error);
   }
 
-  const waitForExit = deps.waitForExit
-    ?? (platform === "win32"
-      ? (candidate: number) => waitForWindowsProcessExit(candidate, {
-          ...(expected === undefined ? {} : { expectedIdentity: expected }),
-          readIdentity,
-          isAlive: alive,
-        })
-      : waitForProcessExit);
+  const waitForExit = deps.waitForExit ?? (async () => waitForOwnedChildExit());
   try {
     await waitForExit(pid);
     return;
@@ -220,7 +231,7 @@ export async function terminateProcess(
   if (expected != null) {
     const observed = readIdentity(pid);
     if (observed == null) {
-      if (!alive(pid)) return;
+      if (ownedChild?.exitCode !== null || ownedChild?.signalCode !== null || !alive(pid)) return;
       throw new LocalExecTerminationIdentityError(pid, "remained alive but its identity could not be verified before SIGKILL escalation");
     }
     if (!sameNativeProcessIdentity(observed, expected)) return;
@@ -228,7 +239,7 @@ export async function terminateProcess(
     return;
   }
   try {
-    signal(pid, "SIGKILL");
+    signalOwnedChild("SIGKILL");
   } catch (error) {
     const code = findSystemErrno(error);
     if (code === "ESRCH" || expectedExitConfirmed()) return;

@@ -17,6 +17,7 @@ export interface LocalExecDiscovery { readonly pid: number; readonly startedAt: 
 export interface LocalExecStartupQuarantine {
   readonly version: 1;
   readonly pid: number;
+  readonly spawnRequestedAt: number;
   readonly recordedAt: number;
   readonly entryRealpath: string;
   readonly generationToken: string;
@@ -50,15 +51,17 @@ export function parseLocalExecDiscovery(value: unknown): LocalExecDiscovery | nu
 export function parseLocalExecStartupQuarantine(value: unknown): LocalExecStartupQuarantine | null {
   if (!record(value)) return null;
   const keys = Object.keys(value).sort();
-  const expectedKeys = ["entryRealpath", "generationToken", "pid", "recordedAt", "version"];
+  const expectedKeys = ["entryRealpath", "generationToken", "pid", "recordedAt", "spawnRequestedAt", "version"];
   if (keys.length !== expectedKeys.length || keys.some((key, index) => key !== expectedKeys[index])) return null;
   if (value.version !== 1 || !Number.isInteger(value.pid) || (value.pid as number) <= 0) return null;
-  if (typeof value.recordedAt !== "number" || !Number.isFinite(value.recordedAt) || value.recordedAt <= 0) return null;
+  if (typeof value.spawnRequestedAt !== "number" || !Number.isFinite(value.spawnRequestedAt) || value.spawnRequestedAt <= 0) return null;
+  if (typeof value.recordedAt !== "number" || !Number.isFinite(value.recordedAt) || value.recordedAt < value.spawnRequestedAt || value.recordedAt - value.spawnRequestedAt > 60_000) return null;
   if (typeof value.entryRealpath !== "string" || value.entryRealpath.length === 0) return null;
   if (typeof value.generationToken !== "string" || value.generationToken.length === 0) return null;
   return {
     version: 1,
     pid: value.pid as number,
+    spawnRequestedAt: value.spawnRequestedAt,
     recordedAt: value.recordedAt,
     entryRealpath: value.entryRealpath,
     generationToken: value.generationToken,
@@ -71,6 +74,7 @@ function sameLocalExecStartupQuarantine(
 ): boolean {
   return left.version === right.version
     && left.pid === right.pid
+    && left.spawnRequestedAt === right.spawnRequestedAt
     && left.recordedAt === right.recordedAt
     && left.entryRealpath === right.entryRealpath
     && left.generationToken === right.generationToken;

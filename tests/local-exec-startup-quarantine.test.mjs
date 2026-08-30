@@ -93,6 +93,7 @@ test("startup quarantine protocol keeps immutable records separate and rejects c
   const directory = await mkdtemp(path.join(os.tmpdir(), "grok-startup-quarantine-ledger-"));
   const first = {
     version: 1,
+    spawnRequestedAt: 9_900,
     pid: 4_201,
     recordedAt: 10_000,
     entryRealpath: "C:\\app\\daemon.cjs",
@@ -100,6 +101,7 @@ test("startup quarantine protocol keeps immutable records separate and rejects c
   };
   const second = {
     version: 1,
+    spawnRequestedAt: 9_900,
     pid: 4_202,
     recordedAt: 10_001,
     entryRealpath: "C:\\app\\daemon.cjs",
@@ -107,6 +109,8 @@ test("startup quarantine protocol keeps immutable records separate and rejects c
   };
   try {
     assert.equal(loaded.module.parseLocalExecStartupQuarantine({ ...first, extra: true }), null);
+    assert.equal(loaded.module.parseLocalExecStartupQuarantine({ ...first, spawnRequestedAt: undefined }), null);
+    assert.equal(loaded.module.parseLocalExecStartupQuarantine({ ...first, recordedAt: first.spawnRequestedAt + 60_001 }), null);
     assert.deepEqual(await loaded.module.writeLocalExecStartupQuarantine(first, directory), first);
     assert.deepEqual(await loaded.module.writeLocalExecStartupQuarantine(second, directory), second);
     assert.deepEqual((await loaded.module.readLocalExecStartupQuarantines(directory)).map(record => record.generationToken).sort(), ["generation-one", "generation-two"]);
@@ -166,7 +170,7 @@ test("failed unidentified cleanup persists before signalling and blocks a new ex
     }));
     await assert.rejects(
       first.spawnLocalExecDaemon({ logPath: "test.log", env: {} }),
-      /local-exec startup cleanup is quarantined/,
+      /spawn verification and owned-child cleanup did not settle safely/,
     );
     assert.equal(firstSpawnCalls, 1);
     assert.equal(terminationCalls, 1);
@@ -175,6 +179,7 @@ test("failed unidentified cleanup persists before signalling and blocks a new ex
     assert.equal(ledger.records.length, 1);
     assert.deepEqual(ledger.records[0], {
       version: 1,
+      spawnRequestedAt: 9_900,
       pid: 4_301,
       recordedAt: 10_000,
       entryRealpath,
@@ -213,6 +218,7 @@ test("restart reconciliation releases a reused PID without signalling it and the
   const ledger = {
     records: [{
       version: 1,
+      spawnRequestedAt: 9_900,
       pid: 4_401,
       recordedAt: 10_000,
       entryRealpath: oldEntry,
@@ -249,7 +255,8 @@ test("restart reconciliation releases a reused PID without signalling it and the
     assert.deepEqual(spawned, { ...freshIdentity, entryRealpath: freshEntry, generationToken: freshGeneration });
     assert.equal(spawnCalls, 1);
     assert.equal(terminationCalls, 0);
-    assert.deepEqual(ledger.records, []);
+    assert.equal(ledger.records.length, 1);
+    assert.equal(ledger.records[0].generationToken, freshGeneration);
   } finally {
     await loaded.dispose();
   }
@@ -259,6 +266,7 @@ test("restart reconciliation signals only an exact generation and clears it afte
   const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
   const quarantined = {
     version: 1,
+    spawnRequestedAt: 9_900,
     pid: 4_501,
     recordedAt: 10_000,
     entryRealpath: "C:\\app\\local-exec-daemon\\main.cjs",
@@ -295,7 +303,218 @@ test("restart reconciliation signals only an exact generation and clears it afte
     const spawned = await executors.spawnLocalExecDaemon({ logPath: "test.log", env: {} });
     assert.equal(spawned.pid, freshIdentity.pid);
     assert.equal(terminationCalls, 1);
+    assert.equal(ledger.records.length, 1);
+    assert.equal(ledger.records[0].generationToken, freshGeneration);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("verified spawn quarantine survives until matching discovery readiness is acknowledged", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const ledger = { records: [] };
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const generationToken = "ready-ack-generation";
+  const identity = matchingIdentity(4_601, entryRealpath, generationToken);
+  let discovery = null;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      overrides: {
+        async readLocalExecDaemonDiscovery() { return discovery; },
+      },
+      native: {
+        async spawnLocalExecDaemon() {
+          return { child: fakeChild(identity.pid), entryRealpath, generationToken };
+        },
+        async terminateProcess() {},
+        isProcessAlive() { return true; },
+        readProcessIdentity(pid) { return pid === identity.pid ? identity : null; },
+        resolveLocalExecDaemonEntryRealpath() { return entryRealpath; },
+      },
+    }));
+    const spawned = await executors.spawnLocalExecDaemon({ logPath: "test.log", env: {} });
+    assert.equal(spawned.pid, identity.pid);
+    assert.equal(ledger.records.length, 1, "identity verification alone must not erase the crash fence");
+    assert.deepEqual(await executors.confirmLocalExecDaemonReady({ identity: spawned }), { confirmed: false });
+    assert.equal(ledger.records.length, 1);
+    discovery = {
+      pid: identity.pid,
+      startedAt: 9_950,
+      entryRealpath,
+      generationToken,
+      inflightCount: 0,
+    };
+    assert.deepEqual(await executors.confirmLocalExecDaemonReady({ identity: spawned }), { confirmed: true });
     assert.deepEqual(ledger.records, []);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("startup quarantine is durable before the first identity-poll delay and blocks a second executor", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const ledger = { records: [] };
+  const events = [];
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const generationToken = "poll-window-generation";
+  const identity = matchingIdentity(4_701, entryRealpath, generationToken);
+  let releaseDelay;
+  const delayGate = new Promise(resolve => { releaseDelay = resolve; });
+  let firstIdentityReads = 0;
+  let secondSpawnCalls = 0;
+  try {
+    const first = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      events,
+      overrides: { delay: async () => { events.push("identity-delay"); await delayGate; } },
+      native: {
+        async spawnLocalExecDaemon() {
+          events.push("spawn");
+          return { child: fakeChild(identity.pid), entryRealpath, generationToken };
+        },
+        async terminateProcess() {},
+        isProcessAlive() { return true; },
+        readProcessIdentity(pid) {
+          firstIdentityReads += 1;
+          return firstIdentityReads > 1 && pid === identity.pid ? identity : null;
+        },
+        resolveLocalExecDaemonEntryRealpath() { return entryRealpath; },
+      },
+    }));
+    const firstSpawn = first.spawnLocalExecDaemon({ logPath: "test.log", env: {} });
+    for (let attempt = 0; attempt < 20 && !events.includes("identity-delay"); attempt += 1) {
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    assert.equal(events.includes("identity-delay"), true);
+    assert.ok(events.indexOf("write-quarantine") < events.indexOf("identity-delay"));
+    assert.equal(ledger.records.length, 1);
+
+    const second = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      native: {
+        async spawnLocalExecDaemon() {
+          secondSpawnCalls += 1;
+          assert.fail("the durable crash fence must block a concurrent second spawn");
+        },
+        async terminateProcess() { assert.fail("an unreadable live PID must not be signalled"); },
+        isProcessAlive() { return true; },
+        readProcessIdentity() { return null; },
+        resolveLocalExecDaemonEntryRealpath() { return entryRealpath; },
+      },
+    }));
+    assert.deepEqual(
+      await second.reconcileLocalExecStartupQuarantine(),
+      { blocked: true, reason: "local-exec startup cleanup is quarantined: live, ambiguous, or uninspectable process IDs 4701" },
+    );
+    await assert.rejects(
+      second.spawnLocalExecDaemon({ logPath: "test.log", env: {} }),
+      /local-exec startup cleanup is quarantined/,
+    );
+    assert.equal(secondSpawnCalls, 0);
+
+    releaseDelay();
+    const spawned = await firstSpawn;
+    assert.equal(spawned.pid, identity.pid);
+    assert.equal(ledger.records.length, 1);
+  } finally {
+    releaseDelay?.();
+    await loaded.dispose();
+  }
+});
+
+test("identity-unreadable initial spawn is never signalled and remains durably fenced", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const ledger = { records: [] };
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  let terminationCalls = 0;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      native: {
+        async spawnLocalExecDaemon() {
+          return { child: fakeChild(4_801), entryRealpath, generationToken: "unreadable-generation" };
+        },
+        async terminateProcess() { terminationCalls += 1; },
+        isProcessAlive() { return true; },
+        readProcessIdentity() { return null; },
+        resolveLocalExecDaemonEntryRealpath() { return entryRealpath; },
+      },
+    }));
+    await assert.rejects(
+      executors.spawnLocalExecDaemon({ logPath: "test.log", env: {} }),
+      /spawn verification and owned-child cleanup did not settle safely/,
+    );
+    assert.equal(terminationCalls, 0);
+    assert.equal(ledger.records.length, 1);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("same PID and generation with a later process start is treated as reuse without signalling", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const record = {
+    version: 1,
+    spawnRequestedAt: 9_900,
+    pid: 4_901,
+    recordedAt: 10_000,
+    entryRealpath,
+    generationToken: "reused-same-arguments",
+  };
+  const later = { ...matchingIdentity(record.pid, entryRealpath, record.generationToken), startEpochMs: 10_001 };
+  const ledger = { records: [record] };
+  let terminationCalls = 0;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      native: {
+        async spawnLocalExecDaemon() { assert.fail("reconciliation only"); },
+        async terminateProcess() { terminationCalls += 1; },
+        isProcessAlive() { return true; },
+        readProcessIdentity(pid) { return pid === record.pid ? later : null; },
+        resolveLocalExecDaemonEntryRealpath() { return entryRealpath; },
+      },
+    }));
+    assert.deepEqual(await executors.reconcileLocalExecStartupQuarantine(), { blocked: false, reason: null });
+    assert.equal(terminationCalls, 0);
+    assert.deepEqual(ledger.records, []);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("same PID and generation with an implausibly old process start stays ambiguous and unsignalled", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const record = {
+    version: 1,
+    spawnRequestedAt: 9_900,
+    pid: 5_001,
+    recordedAt: 10_000,
+    entryRealpath,
+    generationToken: "ambiguous-same-arguments",
+  };
+  const older = { ...matchingIdentity(record.pid, entryRealpath, record.generationToken), startEpochMs: 8_899 };
+  const ledger = { records: [record] };
+  let terminationCalls = 0;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      native: {
+        async spawnLocalExecDaemon() { assert.fail("reconciliation only"); },
+        async terminateProcess() { terminationCalls += 1; },
+        isProcessAlive() { return true; },
+        readProcessIdentity(pid) { return pid === record.pid ? older : null; },
+        resolveLocalExecDaemonEntryRealpath() { return entryRealpath; },
+      },
+    }));
+    const status = await executors.reconcileLocalExecStartupQuarantine();
+    assert.equal(status.blocked, true);
+    assert.match(status.reason, /startup cleanup is quarantined/);
+    assert.equal(terminationCalls, 0);
+    assert.deepEqual(ledger.records, [record]);
   } finally {
     await loaded.dispose();
   }

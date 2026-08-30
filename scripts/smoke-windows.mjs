@@ -934,7 +934,14 @@ export async function startHarnessServers(secretCanary, { gatewayPort = 1340 } =
     });
   });
   const disconnectProviderStreams = () => {
-    for (const response of [...activeWebauthnStreams.values(), ...activeLocalExecStreams.values()]) {
+    const responses = [...activeWebauthnStreams.values(), ...activeLocalExecStreams.values()];
+    activeWebauthnProviderIds.clear();
+    activeLocalExecProviderIds.clear();
+    activeWebauthnStreams.clear();
+    activeLocalExecStreams.clear();
+    gatewayState.activeWebauthnStreams = 0;
+    gatewayState.activeLocalExecStreams = 0;
+    for (const response of responses) {
       if (!response.destroyed && !response.writableEnded) response.end();
     }
   };
@@ -960,6 +967,9 @@ export async function startHarnessServers(secretCanary, { gatewayPort = 1340 } =
     routerBaseUrl,
     gatewayBaseUrl: `http://127.0.0.1:${gatewayBoundPort}`,
     disconnectProviderStreams,
+    snapshotProviderIds(channel) {
+      return new Set(channel === "local-exec" ? localExecProviderIds : webauthnProviderIds);
+    },
     hasActiveProviderHandshake(channel, baseline) {
       const active = channel === "local-exec" ? activeLocalExecProviderIds : activeWebauthnProviderIds;
       const matched = channel === "local-exec" ? matchedLocalExecProviderIds : matchedWebauthnProviderIds;
@@ -1222,8 +1232,8 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     const fakeDockerDirectory = await buildStrictFakeDocker(temporary);
     servers = await startHarnessServers(secretCanary);
     const initialProviderBaseline = {
-      localExec: new Set(servers.gatewayState.localExecHelloProviders),
-      webauthn: new Set(servers.gatewayState.webauthnHelloProviders),
+      localExec: servers.snapshotProviderIds("local-exec"),
+      webauthn: servers.snapshotProviderIds("webauthn"),
     };
     environment = {
       ...baseEnvironment,
@@ -1432,8 +1442,8 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     }
     phase = "relaunch-provider-reconnect";
     const relaunchProviderBaseline = {
-      localExec: new Set(servers.gatewayState.localExecHelloProviders),
-      webauthn: new Set(servers.gatewayState.webauthnHelloProviders),
+      localExec: servers.snapshotProviderIds("local-exec"),
+      webauthn: servers.snapshotProviderIds("webauthn"),
     };
     servers.disconnectProviderStreams();
     await waitForHarnessState(
