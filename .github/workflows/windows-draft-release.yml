@@ -66,7 +66,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           Set-StrictMode -Version Latest
-          $assetName = 'Grok-Bot-0.18.0-reconstructed.1-windows-x64-portable-unsigned.zip'
+          $assetName = 'Grok-Bot-0.18.0-reconstructed.2-windows-x64-portable-unsigned.zip'
           $portable = Join-Path $PWD 'dist/Grok Bot 0.18 Reconstructed-win32-x64'
           $releaseDirectory = Join-Path $PWD '.release/windows-x64'
           $zip = Join-Path $releaseDirectory $assetName
@@ -97,7 +97,7 @@ jobs:
           $manifest = [ordered]@{
             schemaVersion = 1
             visibility = 'owner-only-draft'
-            releaseTag = 'v0.18.0-reconstructed.1'
+            releaseTag = 'v0.18.0-reconstructed.2'
             commit = (git rev-parse HEAD).Trim()
             tree = (git rev-parse 'HEAD^{tree}').Trim()
             createdAtUtc = [DateTime]::UtcNow.ToString('o')
@@ -139,25 +139,29 @@ jobs:
             "$zipHash *$assetName"
           ) | Set-Content -LiteralPath (Join-Path $releaseDirectory 'SHA256SUMS.txt') -Encoding ascii
           @'
-          # Grok Bot 0.18 Reconstructed 1 — Windows x64 Portable (Unsigned)
+          # Grok Bot 0.18 Reconstructed 2 — Windows x64 Portable (Unsigned)
 
           This is an owner-only draft, not a public release. The asset is an unofficial,
           unsigned reconstruction and is not affiliated with Anysphere, Cursor, or xAI.
 
           The workflow verified the pinned installer and ASAR, ran all source tests,
-          built on Windows x64, launched a fresh isolated profile, reached the 9Router
-          settings surface, then re-extracted and repeated verification and launch smoke.
+          built on Windows x64, launched a fresh isolated profile, reached the login-free
+          Local 9Router settings surface, then re-extracted and repeated verification and
+          launch smoke. This build adds the native agent, shell, file, and computer tool
+          path through an owned local Docker VM.
 
-          Use Windows 10/11 x64 and 9Router 0.4.82 or newer. The default API root is
-          http://127.0.0.1:20128/v1. Windows SmartScreen may warn because the reconstructed
-          distribution is not code-signed. Do not publish this draft without completing
-          the repository's independent rights, trademark, third-party license, and signing review.
+          Use Windows 10/11 x64, Docker Desktop, Tailscale, and the current stable 9Router
+          release (v0.5.35 when reviewed). The reviewed remote API root is
+          http://100.112.10.8:20128/v1; enable the explicit Tailscale HTTP option and use a
+          dedicated proxy/client key. Windows SmartScreen may warn because the reconstructed
+          distribution is not code-signed. Do not publish this draft without completing the
+          repository's independent rights, trademark, third-party license, and signing review.
           '@ | Set-Content -LiteralPath (Join-Path $releaseDirectory 'RELEASE_NOTES.md') -Encoding utf8NoBOM
           "asset=$zip" >> $env:GITHUB_OUTPUT
       - name: Attest the exact portable ZIP
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
-          subject-path: .release/windows-x64/Grok-Bot-0.18.0-reconstructed.1-windows-x64-portable-unsigned.zip
+          subject-path: .release/windows-x64/Grok-Bot-0.18.0-reconstructed.2-windows-x64-portable-unsigned.zip
       - name: Transfer the verified bundle to the isolated draft job
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -191,12 +195,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: v0.18.0-reconstructed.1
-          RELEASE_TITLE: Grok Bot 0.18 Reconstructed 1 — Windows x64 Portable (Unsigned Draft)
+          RELEASE_TAG: v0.18.0-reconstructed.2
+          RELEASE_TITLE: Grok Bot 0.18 Reconstructed 2 — Windows x64 Portable (Unsigned Draft)
         run: |
           set -euo pipefail
           assets=(
-            release-assets/Grok-Bot-0.18.0-reconstructed.1-windows-x64-portable-unsigned.zip
+            release-assets/Grok-Bot-0.18.0-reconstructed.2-windows-x64-portable-unsigned.zip
             release-assets/SHA256SUMS.txt
             release-assets/release-manifest.json
             release-assets/sbom.cdx.json

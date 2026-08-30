@@ -29,6 +29,25 @@ test("publication ignore rules retain reconstructed frontend source", async () =
   assert.equal(matcher.ignores("recovered/generated-output.txt"), true, "root recovery output must remain ignored");
 });
 
+test("Windows owner draft release identities stay aligned", async () => {
+  const [packageJson, packageLock, windowsPackage, workflow] = await Promise.all([
+    readFile(path.join(repoRoot, "package.json"), "utf8").then(JSON.parse),
+    readFile(path.join(repoRoot, "package-lock.json"), "utf8").then(JSON.parse),
+    readFile(path.join(repoRoot, "scripts", "lib", "windows-package.mjs"), "utf8"),
+    readFile(path.join(repoRoot, ".github", "workflows", "windows-draft-release.yml"), "utf8"),
+  ]);
+  const version = "0.18.0-reconstructed.2";
+  assert.equal(packageJson.version, version);
+  assert.equal(packageLock.version, version);
+  assert.equal(packageLock.packages[""].version, version);
+  assert.match(windowsPackage, /reconstructedVersion: "0\.18\.0-reconstructed\.2"/);
+  assert.match(workflow, /v0\.18\.0-reconstructed\.2/);
+  assert.match(workflow, /Grok-Bot-0\.18\.0-reconstructed\.2-windows-x64-portable-unsigned\.zip/);
+  assert.match(workflow, /http:\/\/100\.112\.10\.8:20128\/v1/);
+  assert.match(workflow, /v0\.5\.35/);
+  assert.doesNotMatch(workflow, /reconstructed\.1/);
+});
+
 test("default packaging keeps the polished checksum-pinned renderer", async () => {
   const source = await readFile(path.join(repoRoot, "scripts", "package-macos.mjs"), "utf8");
   assert.match(source, /import \{ buildFidelityReconstructedAsar \} from "\.\/clean-build\.mjs"/);

@@ -34,7 +34,7 @@ export async function assembleWindowsPortable({ runtime, builtAsar, builtAsarUnp
   await writeFile(path.join(outputRoot, "README-PORTABLE.txt"), notice);
   const manifest = {
     schemaVersion: 1, kind: "unofficial-reconstructed-windows-portable", platform: "win32", arch: "x64", productName: reconstructedWindowsName,
-    executable: reconstructedWindowsExecutableName, upstreamVersion: "0.18.0", reconstructedVersion: "0.18.0-reconstructed.1",
+    executable: reconstructedWindowsExecutableName, upstreamVersion: "0.18.0", reconstructedVersion: "0.18.0-reconstructed.2",
     trust: { distributionSigned: false, upstreamShellRetained: true, publicReleaseEligible: false },
     upstream: { installerSha256: windowsInstallerSha256, appAsarSha256: upstreamWindowsAsarSha256 },
     reconstructed: { appAsarSha256: await sha256File(packagedAsar), updates: "hard-disabled", updaterArtifacts: "removed", protocolRegistration: "disabled", profileName: reconstructedWindowsName },
