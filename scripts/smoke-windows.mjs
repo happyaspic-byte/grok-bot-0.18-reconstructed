@@ -460,9 +460,9 @@ async function startHarnessServers(secretCanary) {
     hostSettings: {},
     healthChecks: 0,
     eventConnections: 0,
-    holdNextEventStream: false,
-    eventStreamHeld: false,
-    releaseHeldEventStream: null,
+    holdNextCliProxyProbe: false,
+    cliProxyProbeHeld: false,
+    releaseHeldCliProxyProbe: null,
     cliProxyLeaseActive: false,
     cliProxyLeaseInstalls: 0,
     cliProxyModelProbes: 0,
@@ -498,20 +498,6 @@ async function startHarnessServers(secretCanary) {
     if (request.method === "GET" && request.url === "/events") {
       gatewayState.eventConnections += 1;
       audit.eventConnection = gatewayState.eventConnections;
-      if (gatewayState.holdNextEventStream) {
-        gatewayState.holdNextEventStream = false;
-        gatewayState.eventStreamHeld = true;
-        await new Promise(resolve => {
-          const safety = setTimeout(resolve, 10_000);
-          safety.unref?.();
-          gatewayState.releaseHeldEventStream = () => {
-            clearTimeout(safety);
-            resolve();
-          };
-        });
-        gatewayState.eventStreamHeld = false;
-        gatewayState.releaseHeldEventStream = null;
-      }
       response.writeHead(200, {
         "content-type": "text/event-stream",
         "cache-control": "no-store",
@@ -617,6 +603,24 @@ async function startHarnessServers(secretCanary) {
         if (lease == null || lease.expiresAtMs <= Date.now()) {
           clearHarnessCliProxyLease();
           throw new Error("probeCliProxyModels requires an active credential lease");
+        }
+        if (gatewayState.holdNextCliProxyProbe) {
+          gatewayState.holdNextCliProxyProbe = false;
+          gatewayState.cliProxyProbeHeld = true;
+          audit.cliProxyProbeHeld = true;
+          await new Promise(resolve => {
+            const safety = setTimeout(resolve, 30_000);
+            safety.unref?.();
+            gatewayState.releaseHeldCliProxyProbe = () => {
+              clearTimeout(safety);
+              resolve();
+            };
+          });
+          gatewayState.cliProxyProbeHeld = false;
+          gatewayState.releaseHeldCliProxyProbe = null;
+          if (cliProxyLease?.generation !== lease.generation || lease.expiresAtMs <= Date.now()) {
+            throw new Error("held 9Router model probe lease was superseded");
+          }
         }
         const probeStartedAtMs = Date.now();
         const probeResponse = await fetch(`${lease.config.baseUrl}/models`, {
@@ -803,7 +807,7 @@ function redactSensitive(value, secretCanary) {
     .replace(/("apiKey"\s*:\s*")[^"]+("?)/gi, "$1[REDACTED]$2");
 }
 
-async function writeFailureArtifacts({ cdp, error, logs, secretCanary, transcriptPath, phase }) {
+async function writeFailureArtifacts({ cdp, error, harness, logs, secretCanary, transcriptPath, phase }) {
   const directory = path.resolve("reports", `windows-smoke-failure-${Date.now()}`);
   await mkdir(directory, { recursive: true });
   let renderer = null;
@@ -817,12 +821,25 @@ async function writeFailureArtifacts({ cdp, error, logs, secretCanary, transcrip
   } catch {}
   let transcript = "";
   try { transcript = await readFile(transcriptPath, "utf8"); } catch {}
+  const harnessDiagnostic = harness == null ? null : {
+    gatewayRequests: harness.gatewayRequests,
+    routerRequests: harness.routerRequests,
+    gatewayState: {
+      healthChecks: harness.gatewayState.healthChecks,
+      eventConnections: harness.gatewayState.eventConnections,
+      cliProxyLeaseActive: harness.gatewayState.cliProxyLeaseActive,
+      cliProxyLeaseInstalls: harness.gatewayState.cliProxyLeaseInstalls,
+      cliProxyModelProbes: harness.gatewayState.cliProxyModelProbes,
+      cliProxyProbeHeld: harness.gatewayState.cliProxyProbeHeld,
+    },
+  };
   const diagnostic = redactSensitive(JSON.stringify({
     phase,
     error: error instanceof Error ? { name: error.name, message: error.message, stack: error.stack } : String(error),
     renderer,
     processOutput: logs.join("").slice(-64 * 1024),
     dockerTranscript: transcript.slice(-64 * 1024),
+    harness: harnessDiagnostic,
   }, null, 2), secretCanary);
   if (diagnostic.includes(secretCanary)) throw new Error("Refusing to write an unredacted Windows smoke failure artifact");
   await writeFile(path.join(directory, "diagnostic.json"), diagnostic, "utf8");
@@ -960,29 +977,53 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     );
 
     phase = "save-and-continue-without-sign-in";
-    servers.gatewayState.holdNextEventStream = true;
+    const continueBaseline = {
+      eventConnections: servers.gatewayState.eventConnections,
+      leaseInstalls: servers.gatewayState.cliProxyLeaseInstalls,
+      modelProbes: servers.gatewayState.cliProxyModelProbes,
+    };
+    servers.gatewayState.holdNextCliProxyProbe = true;
     await clickButton(
       launched.cdp,
       "Save & continue without sign-in",
       "Ready local 9Router workspace did not expose its sign-in-free continuation",
     );
     await waitForHarnessState(
-      () => servers.gatewayState.eventStreamHeld === true,
-      "Save & continue did not restart the production coordinator event stream",
+      () => servers.gatewayState.cliProxyProbeHeld === true,
+      "Save & continue did not reach the leased production model probe",
       60_000,
     );
     const blockedContinue = await launched.cdp.evaluate(`(() => { const dialog = document.querySelector('[role="dialog"][aria-label="Grok Bot settings"]'); return { settingsOpen: dialog != null, preparing: /Preparing workspace/i.test(dialog?.textContent ?? '') }; })()`);
     if (blockedContinue?.settingsOpen !== true || blockedContinue.preparing !== true) {
-      throw new Error(`Settings closed before the restarted coordinator transport became ready: ${JSON.stringify(blockedContinue)}`);
+      throw new Error(`Settings closed before the leased model probe and coordinator readiness completed: ${JSON.stringify(blockedContinue)}`);
     }
-    servers.gatewayState.releaseHeldEventStream?.();
+    servers.gatewayState.releaseHeldCliProxyProbe?.();
     await waitForRendererState(
       launched.cdp,
-      `(() => ({ settingsOpen: document.querySelector('[role="dialog"][aria-label="Grok Bot settings"]') != null, workspace: document.querySelector('.sand-shell')?.getAttribute('data-workspace') ?? null, text: document.body?.innerText ?? '' }))()`,
-      value => value?.settingsOpen === false && value.workspace === "local-9router",
+      `(() => { const connected = document.querySelector('[role="status"][aria-label="Connected"]'); return { settingsOpen: document.querySelector('[role="dialog"][aria-label="Grok Bot settings"]') != null, workspace: document.querySelector('.sand-shell')?.getAttribute('data-workspace') ?? null, connected: connected != null && connected.isConnected && connected.getClientRects().length > 0, text: document.body?.innerText ?? '' }; })()`,
+      value => value?.settingsOpen === false && value.workspace === "local-9router" && value.connected === true,
       "Save & continue did not close settings into the local 9Router workspace",
       60_000,
     );
+    const readContinueDelta = () => ({
+      eventConnections: servers.gatewayState.eventConnections - continueBaseline.eventConnections,
+      leaseInstalls: servers.gatewayState.cliProxyLeaseInstalls - continueBaseline.leaseInstalls,
+      modelProbes: servers.gatewayState.cliProxyModelProbes - continueBaseline.modelProbes,
+    });
+    const continueDelta = readContinueDelta();
+    if (continueDelta.eventConnections !== 1 || continueDelta.leaseInstalls !== 1 || continueDelta.modelProbes !== 1) {
+      throw new Error(`Save & continue did not perform exactly one fresh coordinator activation: ${JSON.stringify(continueDelta)}`);
+    }
+    const activationStabilityDeadline = Date.now() + 2_000;
+    while (Date.now() < activationStabilityDeadline) {
+      const stableDelta = readContinueDelta();
+      const stableRenderer = await launched.cdp.evaluate(`(() => { const connected = document.querySelector('[role="status"][aria-label="Connected"]'); return { settingsOpen: document.querySelector('[role="dialog"][aria-label="Grok Bot settings"]') != null, workspace: document.querySelector('.sand-shell')?.getAttribute('data-workspace') ?? null, connected: connected != null && connected.isConnected && connected.getClientRects().length > 0 }; })()`);
+      if (stableDelta.eventConnections !== 1 || stableDelta.leaseInstalls !== 1 || stableDelta.modelProbes !== 1
+        || stableRenderer?.settingsOpen !== false || stableRenderer.workspace !== "local-9router" || stableRenderer.connected !== true) {
+        throw new Error(`Save & continue activation did not remain stable: ${JSON.stringify({ delta: stableDelta, renderer: stableRenderer })}`);
+      }
+      await delay(100);
+    }
 
     phase = "login-free-gate";
     await assertLoginFreeWorkspace(launched.cdp, servers.routerBaseUrl);
@@ -1081,7 +1122,7 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     console.log("Fresh profile saved an OS-encrypted credential, loaded models, enforced both readiness blockers, used Save & continue without sign-in, stopped its owned container on quit, restarted it on persistent relaunch, and stopped it again on final quit.");
     console.log("Docker and the bounded gateway control/roster protocol were simulated; live Docker Desktop, Tailscale, VNC, inference turns, and native tool execution remain separate environment tests.");
   } catch (error) {
-    await writeFailureArtifacts({ cdp: launched?.cdp, error, logs, secretCanary, transcriptPath: dockerTranscriptPath, phase }).catch(artifactError => {
+    await writeFailureArtifacts({ cdp: launched?.cdp, error, harness: servers, logs, secretCanary, transcriptPath: dockerTranscriptPath, phase }).catch(artifactError => {
       process.stderr.write(`Could not write redacted Windows smoke diagnostics: ${redactSensitive(artifactError, secretCanary)}\n`);
     });
     if (logs.length > 0) process.stderr.write(`\n--- packaged process output (redacted) ---\n${redactSensitive(logs.join("").slice(-16_384), secretCanary)}\n`);
@@ -1095,7 +1136,7 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
       try { await operation(); }
       catch (error) { cleanupErrors.push(new Error(`${label}: ${error instanceof Error ? error.message : String(error)}`, { cause: error })); }
     };
-    await cleanup("release held gateway stream", async () => servers?.gatewayState.releaseHeldEventStream?.());
+    await cleanup("release held 9Router model probe", async () => servers?.gatewayState.releaseHeldCliProxyProbe?.());
     await cleanup("close renderer debugger", async () => launched?.cdp?.close());
     await cleanup("stop packaged process tree", async () => stopProcess(launched?.child));
     await cleanup("close gateway harness", async () => closeServer(servers?.gateway, "gateway harness"));

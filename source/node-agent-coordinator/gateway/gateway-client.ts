@@ -98,6 +98,11 @@ export function withAuth(headers: Record<string, string>, connection: GatewayCon
   return merged;
 }
 
+function isEventStreamContentType(value: string | null): boolean {
+  if (value == null) return false;
+  return value.split(";", 1)[0]?.trim().toLowerCase() === "text/event-stream";
+}
+
 export interface CoordinatorGatewayClientOptions {
   readonly resolveConnection: (signal?: AbortSignal) => Promise<GatewayConnection>;
   readonly timing: GatewayClientTiming;
@@ -430,6 +435,14 @@ export class CoordinatorGatewayClient {
             throw new Error("gateway connect superseded");
           }
           if (!response.ok || response.body == null) throw new SandGatewayUnreachableError(outcomeForHttpStatus(response.status) ?? "network", `gateway events failed: ${response.status}`, { httpStatus: response.status });
+          if (!isEventStreamContentType(response.headers.get("content-type"))) {
+            try { await response.body.cancel(); } catch {}
+            throw new SandGatewayUnreachableError(
+              "network",
+              "gateway events failed: expected a text/event-stream response",
+              { causeSummary: "invalid-content-type" },
+            );
+          }
           return { connection: resolved, reader: response.body.getReader() };
         }, controller.signal);
       } catch (error) { if (error instanceof DeadlineExceededError) controller.abort(); throw error; }

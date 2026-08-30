@@ -44,8 +44,11 @@ test("Windows packaged smoke exercises the complete signed-out 9Router setup in 
   assert.match(source, /9Router without Local Docker incorrectly bypassed sign-in/);
   assert.match(source, /"Save & continue without sign-in"/);
   assert.match(source, /settingsOpen === false && value\.workspace === "local-9router"/);
-  assert.match(source, /eventStreamHeld === true/);
-  assert.match(source, /Settings closed before the restarted coordinator transport became ready/);
+  assert.match(source, /cliProxyProbeHeld === true/);
+  assert.match(source, /Settings closed before the leased model probe and coordinator readiness completed/);
+  assert.match(source, /Save & continue did not perform exactly one fresh coordinator activation/);
+  assert.match(source, /activationStabilityDeadline = Date\.now\(\) \+ 2_000/);
+  assert.match(source, /Save & continue activation did not remain stable/);
   assert.match(source, /runtimeReady === true/);
   assert.match(source, /document\.querySelector\('\[role="dialog"\]\[aria-label="Grok Bot settings"\]'\)/);
   assert.match(source, /matching\.length === 1/);
@@ -112,6 +115,11 @@ test("Windows packaged smoke uses authenticated loopback services and never embe
   assert.match(source, /redirect: "error"/);
   assert.match(source, /audit\.credentialFreeCliProxyProbe = true/);
   assert.match(source, /audit\.authenticatedRouterProbe = probeModels\.includes\(SMOKE_MODEL\)/);
+  assert.match(source, /holdNextCliProxyProbe/);
+  assert.match(source, /held 9Router model probe lease was superseded/);
+  assert.match(source, /gatewayRequests: harness\.gatewayRequests/);
+  assert.match(source, /routerRequests: harness\.routerRequests/);
+  assert.match(source, /cliProxyModelProbes: harness\.gatewayState\.cliProxyModelProbes/);
   assert.match(source, /9Router API key reached the gateway audit log/);
   assert.match(source, /"\/api\/leaseCliProxyCredential", "\/api\/probeCliProxyModels"/);
   assert.match(source, /leaseRequests\.length < 2/);

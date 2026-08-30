@@ -61,6 +61,77 @@ export interface LocalWorkspaceActivationState {
   readonly claimStatus: DesktopLocalWorkspaceStatus | null;
 }
 
+export interface LocalWorkspaceActivationQueue {
+  generation: number;
+  pending: Promise<DesktopLocalWorkspaceStatus> | null;
+  requiresFresh: boolean;
+}
+
+interface LocalWorkspaceClaimReference {
+  current: DesktopLocalWorkspaceStatus;
+}
+
+export async function activateLocalWorkspaceThroughQueue({
+  activate,
+  claim,
+  forceFresh = false,
+  queue
+}: {
+  readonly activate: () => Promise<DesktopLocalWorkspaceStatus>;
+  readonly claim: LocalWorkspaceClaimReference;
+  readonly forceFresh?: boolean;
+  readonly queue: LocalWorkspaceActivationQueue;
+}): Promise<DesktopLocalWorkspaceStatus> {
+  const existing = queue.pending;
+  const startFresh = forceFresh || queue.requiresFresh;
+  if (existing != null && !startFresh) return await existing;
+  const generation = ++queue.generation;
+  queue.requiresFresh = false;
+  claim.current = { kind: "disabled" };
+  const pending = (async (): Promise<DesktopLocalWorkspaceStatus> => {
+    if (existing != null) {
+      // A credential save supersedes the old lease, but its fresh activation
+      // still has to wait for the serialized main-process restart to settle.
+      try { await existing; }
+      catch { /* The fresh activation below is the recovery path. */ }
+    }
+    if (generation !== queue.generation) return { kind: "disabled" };
+    claim.current = { kind: "disabled" };
+    const activated = await activate();
+    if (generation !== queue.generation) return { kind: "disabled" };
+    const normalized: DesktopLocalWorkspaceStatus = isLocalWorkspaceClaimReady(activated)
+      ? activated
+      : { kind: "disabled" };
+    claim.current = normalized;
+    return normalized;
+  })();
+  queue.pending = pending;
+  try {
+    return await pending;
+  } finally {
+    if (queue.pending === pending) queue.pending = null;
+  }
+}
+
+export function invalidateLocalWorkspaceActivationQueue(
+  queue: LocalWorkspaceActivationQueue,
+  claim: LocalWorkspaceClaimReference
+): void {
+  queue.generation += 1;
+  queue.requiresFresh = true;
+  claim.current = { kind: "disabled" };
+}
+
+export function localWorkspaceActivationStateEqual(
+  left: LocalWorkspaceActivationState,
+  right: LocalWorkspaceActivationState
+): boolean {
+  if (left.transportState !== right.transportState) return false;
+  if (left.claimStatus?.kind !== right.claimStatus?.kind) return false;
+  if (left.claimStatus?.kind !== "ready" || right.claimStatus?.kind !== "ready") return true;
+  return left.claimStatus.workspaceId === right.claimStatus.workspaceId;
+}
+
 const LOCAL_WORKSPACE_CONFIGURATION_CHECKS: readonly LocalWorkspaceCheckId[] = [
   "provider",
   "runtime",

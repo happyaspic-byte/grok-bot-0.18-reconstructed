@@ -77,7 +77,9 @@ export interface SettingsDesktopSurfaceProps {
   initialLocalWorkspace?: LocalWorkspaceReadiness;
   initialSection?: SettingsSectionId;
   isOpen: boolean;
+  onActivateLocalWorkspace(): Promise<DesktopLocalWorkspaceStatus>;
   onClose(): void;
+  onInvalidateLocalWorkspace(): void;
   onLocalWorkspaceReady?(readiness: Extract<LocalWorkspaceReadiness, { kind: "ready" }>): void;
   onNotice?(event: SettingsNoticeEvent): void;
   onStatus?(status: string): void;
@@ -85,7 +87,7 @@ export interface SettingsDesktopSurfaceProps {
   computer?: SettingsComputerMount;
 }
 
-export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initialLocalWorkspace, initialSection = "general", isOpen, onClose, onLocalWorkspaceReady, onNotice, onStatus, computer }: SettingsDesktopSurfaceProps) {
+export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initialLocalWorkspace, initialSection = "general", isOpen, onActivateLocalWorkspace, onClose, onInvalidateLocalWorkspace, onLocalWorkspaceReady, onNotice, onStatus, computer }: SettingsDesktopSurfaceProps) {
   const [snapshot, setSnapshot] = useState<SettingsDesktopSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
@@ -298,6 +300,7 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
                 if (boxRuntimePending) return;
                 if (boxRuntime?.mode === mode
                   && (mode !== "local-docker" || boxRuntime.status?.ready === true)) return;
+                onInvalidateLocalWorkspace();
                 setBoxRuntimePending(true);
                 setBoxRuntimeError(null);
                 localWorkspaceClaimRef.current = { kind: "disabled" };
@@ -318,6 +321,7 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
               status: cliProxyStatus,
               pending: cliProxyPending,
               onSave: async (config, onCredentialPersisted) => {
+                onInvalidateLocalWorkspace();
                 setCliProxyPending(true);
                 localWorkspaceClaimRef.current = { kind: "disabled" };
                 try {
@@ -331,6 +335,7 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
                 } finally { setCliProxyPending(false); }
               },
               onDelete: async () => {
+                onInvalidateLocalWorkspace();
                 setCliProxyPending(true);
                 localWorkspaceClaimRef.current = { kind: "disabled" };
                 try {
@@ -358,6 +363,7 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
               error: localWorkspaceError,
               onContinue: async (config, onCredentialPersisted) => {
                 if (cliProxyPending || routerPending || boxRuntimePending) return;
+                onInvalidateLocalWorkspace();
                 setCliProxyPending(true);
                 setLocalWorkspaceError(null);
                 localWorkspaceClaimRef.current = { kind: "disabled" };
@@ -370,7 +376,7 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
                       ? configuredReadiness.blockers[0]?.message ?? "Local 9Router setup is incomplete."
                       : "Local 9Router status is still being checked.");
                   }
-                  const claimed = await bridge.forceGatewayReconnect();
+                  const claimed = await onActivateLocalWorkspace();
                   localWorkspaceClaimRef.current = isLocalWorkspaceClaimReady(claimed) ? claimed : { kind: "disabled" };
                   if (!isLocalWorkspaceClaimReady(claimed)) {
                     const failedReadiness = await refreshLocalWorkspace(false);
@@ -410,6 +416,7 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
             }}
             onChange={async (provider) => {
               if (routerPending || provider === routerProvider) return;
+              onInvalidateLocalWorkspace();
               const previous = routerProvider;
               setRouterProvider(provider);
               setRouterPending(true);

@@ -161,7 +161,11 @@ test("9Router settings expose secure Tailscale setup without weakening the defau
   assert.match(preload, /forceGatewayReconnect: \(\) => edge\("forceReconnectGateway"\)/);
   assert.match(desktopBridge, /\{ readonly kind: "ready"; readonly workspaceId: "local:9router" \}/);
   assert.match(desktopBridge, /forceGatewayReconnect\(\): Promise<DesktopLocalWorkspaceStatus>/);
-  assert.match(desktopSurface, /const claimed = await bridge\.forceGatewayReconnect\(\)/);
+  assert.match(desktopSurface, /onActivateLocalWorkspace\(\): Promise<DesktopLocalWorkspaceStatus>/);
+  assert.match(desktopSurface, /onInvalidateLocalWorkspace\(\): void/);
+  assert.match(desktopSurface, /const claimed = await onActivateLocalWorkspace\(\)/);
+  assert.doesNotMatch(desktopSurface, /const claimed = await bridge\.forceGatewayReconnect\(\)/);
+  assert.equal(desktopSurface.match(/onInvalidateLocalWorkspace\(\);/g)?.length, 5);
   assert.match(desktopSurface, /await coordinatorClient\.waitForTransportConnected\(20_000\)/);
   assert.match(desktopSurface, /transportState: coordinatorClient\?\.getTransportState\(\) \?\? "down"/);
   assert.match(desktopSurface, /isLocalWorkspaceClaimReady\(claimed\)/);

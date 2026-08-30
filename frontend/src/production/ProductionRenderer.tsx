@@ -134,11 +134,15 @@ import { createProductionReactionRootScope } from "./reaction-root";
 import { createStrictModeDisposalGuard, type StrictModeDisposable } from "./strict-mode-disposal";
 import {
   LOCAL_WORKSPACE_CHANGED_EVENT,
+  activateLocalWorkspaceThroughQueue,
+  invalidateLocalWorkspaceActivationQueue,
   isLocalWorkspaceClaimReady,
+  localWorkspaceActivationStateEqual,
   localWorkspaceConfigurationReady,
   localWorkspaceNextAction,
   projectWorkspaceSession,
   readLocalWorkspaceReadiness,
+  type LocalWorkspaceActivationQueue,
   type LocalWorkspaceReadiness
 } from "./local-workspace";
 import { MessageReactionAction, ReactionPills } from "../recovered/features/conversation/cards/transcript-card/reaction-picker";
@@ -908,7 +912,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
   const [account, setAccount] = useState<CursorAuthStatus | null>(null);
   const [localWorkspace, setLocalWorkspace] = useState<LocalWorkspaceReadiness>({ kind: "checking" });
   const localWorkspaceClaimRef = useRef<DesktopLocalWorkspaceStatus>({ kind: "disabled" });
-  const localWorkspaceActivationRef = useRef<Promise<DesktopLocalWorkspaceStatus> | null>(null);
+  const localWorkspaceActivationQueueRef = useRef<LocalWorkspaceActivationQueue>({ generation: 0, pending: null, requiresFresh: false });
   const [sandAccess, setSandAccess] = useState(SAND_ACCESS_UNKNOWN);
   const [accessFirstBox, setAccessFirstBox] = useState(INITIAL_FIRST_BOX_GATE);
   const [privacyBlocked, setPrivacyBlocked] = useState(false);
@@ -2771,28 +2775,32 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
 
   useStrictModeSafeDisposal(linkMetadataProvider);
 
-  const activateLocalWorkspace = useCallback(async (): Promise<DesktopLocalWorkspaceStatus> => {
+  const invalidateRootLocalWorkspace = useCallback(() => {
+    invalidateLocalWorkspaceActivationQueue(localWorkspaceActivationQueueRef.current, localWorkspaceClaimRef);
+    setLocalWorkspace({ kind: "checking" });
+  }, []);
+
+  const activateLocalWorkspace = useCallback(async (forceFresh = false): Promise<DesktopLocalWorkspaceStatus> => {
     if (client == null) return { kind: "disabled" };
-    const existing = localWorkspaceActivationRef.current;
-    if (existing != null) return await existing;
-    localWorkspaceClaimRef.current = { kind: "disabled" };
-    const pending = (async (): Promise<DesktopLocalWorkspaceStatus> => {
-      const claimed = await bridge.forceGatewayReconnect();
-      const normalized: DesktopLocalWorkspaceStatus = isLocalWorkspaceClaimReady(claimed)
-        ? claimed
-        : { kind: "disabled" };
-      localWorkspaceClaimRef.current = normalized;
-      if (normalized.kind !== "ready") return normalized;
-      await client.waitForTransportConnected(20_000);
-      return normalized;
-    })();
-    localWorkspaceActivationRef.current = pending;
-    try {
-      return await pending;
-    } finally {
-      if (localWorkspaceActivationRef.current === pending) localWorkspaceActivationRef.current = null;
-    }
+    return await activateLocalWorkspaceThroughQueue({
+      claim: localWorkspaceClaimRef,
+      forceFresh,
+      queue: localWorkspaceActivationQueueRef.current,
+      activate: async () => {
+        const claimed = await bridge.forceGatewayReconnect();
+        const normalized: DesktopLocalWorkspaceStatus = isLocalWorkspaceClaimReady(claimed)
+          ? claimed
+          : { kind: "disabled" };
+        if (normalized.kind === "ready") await client.waitForTransportConnected(20_000);
+        return normalized;
+      }
+    });
   }, [bridge, client]);
+
+  const activateFreshLocalWorkspace = useCallback(
+    async () => await activateLocalWorkspace(true),
+    [activateLocalWorkspace]
+  );
 
   useEffect(() => {
     let active = true;
@@ -2813,12 +2821,17 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     };
     const refresh = async (allowActivation = false) => {
       const generation = ++requestGeneration;
-      const next = await readLocalWorkspaceReadiness(bridge, activationState());
+      const observedActivation = activationState();
+      const next = await readLocalWorkspaceReadiness(bridge, observedActivation);
       if (!active || generation !== requestGeneration) return;
+      if (!localWorkspaceActivationStateEqual(observedActivation, activationState())) {
+        void refresh(allowActivation);
+        return;
+      }
       setLocalWorkspace(next);
       scheduleRetry(next);
       if (!allowActivation || activationAttempted || account?.kind !== "logged-out" || client == null
-        || !localWorkspaceConfigurationReady(next) || next.kind === "ready") return;
+        || overlay === "settings" || !localWorkspaceConfigurationReady(next) || next.kind === "ready") return;
       activationAttempted = true;
       try { await activateLocalWorkspace(); }
       catch { /* The final fail-closed reread below supplies the stable blocker. */ }
@@ -2828,13 +2841,45 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       activationAttempted = false;
       void refresh(true);
     };
-    const onWorkspaceChanged = () => retryActivation();
+    const onWorkspaceChanged = () => {
+      invalidateRootLocalWorkspace();
+      retryActivation();
+    };
     const onWindowFocus = () => retryActivation();
+    const refreshAfterCurrentActivation = (allowActivationWhenIdle = false) => {
+      const pending = localWorkspaceActivationQueueRef.current.pending;
+      if (pending == null) {
+        void refresh(allowActivationWhenIdle);
+        return;
+      }
+      const waitForLatest = (awaited: Promise<DesktopLocalWorkspaceStatus>) => {
+        const afterSettled = () => {
+          if (!active) return;
+          const latest = localWorkspaceActivationQueueRef.current.pending;
+          if (latest != null && latest !== awaited) {
+            waitForLatest(latest);
+            return;
+          }
+          void refresh(false);
+        };
+        void awaited.then(afterSettled, afterSettled);
+      };
+      waitForLatest(pending);
+    };
     const stopTransport = client?.subscribeTransport((state) => {
-      if (state === "down") localWorkspaceClaimRef.current = { kind: "disabled" };
-      // Both edges reopen activation. A connected edge can race and supersede
-      // the readiness read started by the preceding down edge; a fail-closed
-      // claim must still be reclaimable in that ordering.
+      if (state === "connected") {
+        // Do not replace an activation that just connected. If a down-edge
+        // readiness read had not started its activation yet, preserve that
+        // one recovery intent when this connected reread supersedes it.
+        refreshAfterCurrentActivation(overlay !== "settings");
+        return;
+      }
+      localWorkspaceClaimRef.current = { kind: "disabled" };
+      setLocalWorkspace({ kind: "checking" });
+      if (overlay === "settings" || localWorkspaceActivationQueueRef.current.pending != null) {
+        refreshAfterCurrentActivation();
+        return;
+      }
       retryActivation();
     });
     void refresh(true);
@@ -2848,7 +2893,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       window.removeEventListener(LOCAL_WORKSPACE_CHANGED_EVENT, onWorkspaceChanged);
       window.removeEventListener("focus", onWindowFocus);
     };
-  }, [account?.kind, activateLocalWorkspace, bridge, client]);
+  }, [account?.kind, activateLocalWorkspace, bridge, client, invalidateRootLocalWorkspace, overlay]);
 
   useEffect(() => {
     if (bridge == null) return;
@@ -3787,7 +3832,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       />}
 
       {overlay === "hidden-chats" ? <div style={OVERLAY_FRAME_STYLE}><Suspense fallback={null}><HiddenChatsDialog hiddenAgents={hiddenAgents} isOpen onClose={() => setOverlay(null)} onOpenAgent={(id) => void openAgent(id)} onUnhide={(id) => void unhide(id)} /></Suspense></div> : null}
-      {overlay === "settings" && bridge != null ? <div style={OVERLAY_FRAME_STYLE}><Suspense fallback={overlayFallback(UI_TEXT.settings)}><SettingsOverlayErrorBoundary onClose={() => setOverlay(null)}><SettingsDesktopSurface bridge={bridge} computer={settingsComputerMount} coordinatorClient={client} initialLocalWorkspace={localWorkspace} initialSection={settingsSection} isOpen onClose={() => setOverlay(null)} onLocalWorkspaceReady={(readiness) => { localWorkspaceClaimRef.current = { kind: "ready", workspaceId: readiness.workspaceId }; setLocalWorkspace(readiness); setOverlay(null); }} onNotice={publishSettingsNotice} /></SettingsOverlayErrorBoundary></Suspense></div> : null}
+      {overlay === "settings" && bridge != null ? <div style={OVERLAY_FRAME_STYLE}><Suspense fallback={overlayFallback(UI_TEXT.settings)}><SettingsOverlayErrorBoundary onClose={() => setOverlay(null)}><SettingsDesktopSurface bridge={bridge} computer={settingsComputerMount} coordinatorClient={client} initialLocalWorkspace={localWorkspace} initialSection={settingsSection} isOpen onActivateLocalWorkspace={activateFreshLocalWorkspace} onClose={() => setOverlay(null)} onInvalidateLocalWorkspace={invalidateRootLocalWorkspace} onLocalWorkspaceReady={(readiness) => { localWorkspaceClaimRef.current = { kind: "ready", workspaceId: readiness.workspaceId }; setLocalWorkspace(readiness); setOverlay(null); }} onNotice={publishSettingsNotice} /></SettingsOverlayErrorBoundary></Suspense></div> : null}
       {overlay === "plugins" && bridge != null && isCursorLoggedIn ? <div style={OVERLAY_FRAME_STYLE}><Suspense fallback={overlayFallback(UI_TEXT.plugins)}><PluginsDesktopSurface activeAgentId={activeAgent?.id ?? null} bridge={bridge} githubAuth={pluginAuthBanner} initialQuery={pluginQuery} isOpen key={pluginQuery} onClose={() => setOverlay(null)} onNotice={publishSettingsNotice} privateSkillEnableSource={privateSkillEnableSource} privateSkillSource={pluginPrivateSkillSource} /></Suspense></div> : null}
       {overlay === "about" && bridge != null ? <div style={OVERLAY_FRAME_STYLE}><RecoveredAboutDialog
         bridge={bridge}

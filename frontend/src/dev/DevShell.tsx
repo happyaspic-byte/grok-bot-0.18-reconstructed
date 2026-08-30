@@ -188,7 +188,9 @@ export function DevShell({ upstreamBoot }: DevShellProps) {
           {previewDataMode === "desktop" && desktopBridge != null ? <SettingsDesktopPreview
             bridge={desktopBridge}
             isOpen
+            onActivateLocalWorkspace={() => desktopBridge.forceGatewayReconnect()}
             onClose={() => setSourcePreview(null)}
+            onInvalidateLocalWorkspace={() => {}}
             onStatus={setPreviewStatus}
           /> : <SettingsModalShell
             initialSection="general"

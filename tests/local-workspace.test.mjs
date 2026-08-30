@@ -112,6 +112,81 @@ test("local workspace readiness requires an authoritative claim and replayed coo
   }
 });
 
+test("activation snapshots detect transport and claim changes during asynchronous readiness reads", async () => {
+  const loaded = await loadModule();
+  try {
+    const disabled = { transportState: "down", claimStatus: { kind: "disabled" } };
+    const disabledCopy = { transportState: "down", claimStatus: { kind: "disabled" } };
+    const connected = { transportState: "connected", claimStatus: { kind: "disabled" } };
+    const ready = { transportState: "connected", claimStatus: { kind: "ready", workspaceId: "local:9router" } };
+    assert.equal(loaded.module.localWorkspaceActivationStateEqual(disabled, disabledCopy), true);
+    assert.equal(loaded.module.localWorkspaceActivationStateEqual(disabled, connected), false);
+    assert.equal(loaded.module.localWorkspaceActivationStateEqual(connected, ready), false);
+    assert.equal(loaded.module.localWorkspaceActivationStateEqual(ready, { ...ready, claimStatus: { ...ready.claimStatus } }), true);
+  } finally {
+    await rm(loaded.directory, { recursive: true, force: true });
+  }
+});
+
+test("fresh activation fences an older result and publishes only the latest claim", async () => {
+  const loaded = await loadModule();
+  try {
+    const deferred = () => {
+      let resolve;
+      let reject;
+      const promise = new Promise((onResolve, onReject) => { resolve = onResolve; reject = onReject; });
+      return { promise, reject, resolve };
+    };
+    const ready = { kind: "ready", workspaceId: "local:9router" };
+    const queue = { generation: 0, pending: null, requiresFresh: false };
+    const claim = { current: { kind: "disabled" } };
+    const first = deferred();
+    const second = deferred();
+    let activations = 0;
+    const initial = loaded.module.activateLocalWorkspaceThroughQueue({
+      activate: async () => { activations += 1; return await first.promise; },
+      claim,
+      queue
+    });
+    loaded.module.invalidateLocalWorkspaceActivationQueue(queue, claim);
+    assert.equal(queue.requiresFresh, true);
+    const fresh = loaded.module.activateLocalWorkspaceThroughQueue({
+      activate: async () => { activations += 1; return await second.promise; },
+      claim,
+      queue
+    });
+    assert.equal(queue.requiresFresh, false);
+    assert.deepEqual(claim.current, { kind: "disabled" });
+    first.resolve(ready);
+    assert.deepEqual(await initial, { kind: "disabled" });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(activations, 2);
+    assert.deepEqual(claim.current, { kind: "disabled" }, "superseded success must not publish while the fresh activation is pending");
+    second.resolve(ready);
+    assert.deepEqual(await fresh, ready);
+    assert.deepEqual(claim.current, ready);
+    assert.equal(queue.pending, null);
+
+    const failureQueue = { generation: 0, pending: null, requiresFresh: false };
+    const failureClaim = { current: { kind: "disabled" } };
+    const stale = deferred();
+    const staleRun = loaded.module.activateLocalWorkspaceThroughQueue({ activate: async () => await stale.promise, claim: failureClaim, queue: failureQueue });
+    const failedFresh = loaded.module.activateLocalWorkspaceThroughQueue({
+      activate: async () => { throw new Error("fresh restart failed"); },
+      claim: failureClaim,
+      forceFresh: true,
+      queue: failureQueue
+    });
+    stale.resolve(ready);
+    assert.deepEqual(await staleRun, { kind: "disabled" });
+    await assert.rejects(failedFresh, /fresh restart failed/);
+    assert.deepEqual(failureClaim.current, { kind: "disabled" });
+    assert.equal(failureQueue.pending, null);
+  } finally {
+    await rm(loaded.directory, { recursive: true, force: true });
+  }
+});
+
 test("local workspace readiness fails closed when an existing settings edge fails", async () => {
   const loaded = await loadModule();
   try {
@@ -184,14 +259,23 @@ test("production renderer unlocks local core while keeping account-only surfaces
   assert.match(renderer, /transcriptCardListenerIntegrations\?\.setScope\(isCursorLoggedIn/);
   assert.match(renderer, /const showSignIn = bridge != null && workspaceSession\.kind === "unavailable"/);
   assert.match(renderer, /localWorkspace=\{localWorkspace\}/);
+  assert.match(renderer, /const activateLocalWorkspace = useCallback\(async \(forceFresh = false\)/);
+  assert.match(renderer, /activateLocalWorkspaceThroughQueue\(\{/);
+  assert.match(renderer, /forceFresh,[\s\S]{0,120}queue: localWorkspaceActivationQueueRef\.current/);
   assert.match(renderer, /const claimed = await bridge\.forceGatewayReconnect\(\)/);
   assert.match(renderer, /await client\.waitForTransportConnected\(20_000\)/);
   assert.match(renderer, /client\?\.getTransportState\(\) \?\? "down"/);
+  assert.match(renderer, /localWorkspaceActivationStateEqual\(observedActivation, activationState\(\)\)/);
+  assert.match(renderer, /overlay === "settings" \|\| !localWorkspaceConfigurationReady\(next\)/);
+  assert.match(renderer, /invalidateLocalWorkspaceActivationQueue\(localWorkspaceActivationQueueRef\.current, localWorkspaceClaimRef\);[\s\S]{0,100}setLocalWorkspace\(\{ kind: "checking" \}\)/);
   assert.match(
     renderer,
-    /if \(state === "down"\) localWorkspaceClaimRef\.current = \{ kind: "disabled" \};[\s\S]{0,280}retryActivation\(\);/,
-    "down and connected edges must both reopen bounded local activation",
+    /if \(state === "connected"\) \{[\s\S]{0,360}refreshAfterCurrentActivation\(overlay !== "settings"\);[\s\S]{0,360}localWorkspaceActivationQueueRef\.current\.pending != null[\s\S]{0,180}retryActivation\(\);/,
+    "transport edges must preserve one recovery intent without replacing an in-flight activation",
   );
+  assert.match(renderer, /\[account\?\.kind, activateLocalWorkspace, bridge, client, invalidateRootLocalWorkspace, overlay\]/);
+  assert.match(renderer, /onActivateLocalWorkspace=\{activateFreshLocalWorkspace\}/);
+  assert.match(renderer, /onInvalidateLocalWorkspace=\{invalidateRootLocalWorkspace\}/);
   assert.match(renderer, /onLocalWorkspaceReady=\{\(readiness\) => \{ localWorkspaceClaimRef\.current = \{ kind: "ready", workspaceId: readiness\.workspaceId \}; setLocalWorkspace\(readiness\); setOverlay\(null\); \}\}/);
   assert.doesNotMatch(renderer, /setAccount\(\{\s*kind:\s*"logged-in"/);
 });
