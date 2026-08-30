@@ -510,6 +510,18 @@ module.exports = {
 
     assert.deepEqual(exit, { code: 0, signal: null }, stderr);
     assert.match(stdout, /__SAND_BROWSER_ENCRYPTED_RESULT__/);
+    const marker = "__SAND_BROWSER_ENCRYPTED_RESULT__";
+    const encodedPacket = stdout.slice(stdout.lastIndexOf(marker) + marker.length).trim().split(/\r?\n/u, 1)[0];
+    const packet = Buffer.from(encodedPacket, "base64");
+    const decipher = createDecipheriv("aes-256-gcm", responseKey, packet.subarray(1, 13));
+    decipher.setAAD(Buffer.from("sand-browser-result-v1", "utf8"));
+    decipher.setAuthTag(packet.subarray(13, 29));
+    const result = JSON.parse(Buffer.concat([
+      decipher.update(packet.subarray(29)),
+      decipher.final(),
+    ]).toString("utf8"));
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.viewId, "view-private");
     assert.equal(stdout.includes(token), false);
     assert.equal(stdout.includes(pageUrl), false);
     const rawState = await readFile(statePath, "utf8");
