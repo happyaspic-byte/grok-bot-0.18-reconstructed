@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -33,7 +33,6 @@ test("gateway token file must be a private direct file and excludes a duplicate 
     const token = "a".repeat(64);
     const target = path.join(temporary, "gateway-token");
     await writeFile(target, `${token}\n`, { mode: 0o600 });
-    await chmod(target, 0o600);
     const config = loaded.module.resolveGatewayServerConfig({
       SAND_GATEWAY_BIND_HOST: "0.0.0.0",
       SAND_GATEWAY_TOKEN_FILE: target,
@@ -44,12 +43,26 @@ test("gateway token file must be a private direct file and excludes a duplicate 
       SAND_GATEWAY_TOKEN_FILE: target,
     }), /either a direct token or a token file/);
 
-    await chmod(target, 0o644);
-    assert.throws(() => loaded.module.readPrivateGatewayTokenFile(target), /private gateway token file/);
-    await chmod(target, 0o600);
-    const linked = path.join(temporary, "gateway-token-link");
-    await symlink(target, linked);
-    assert.throws(() => loaded.module.readPrivateGatewayTokenFile(linked), /private gateway token file/);
+    const insecureState = {
+      isSymbolicLink: () => false,
+      isFile: () => true,
+      uid: 1000,
+      mode: 0o100644,
+    };
+    assert.throws(() => loaded.module.readPrivateGatewayTokenFile(target, {
+      platform: "linux",
+      currentUid: 1000,
+      lstat: () => insecureState,
+    }), /private gateway token file/);
+    const linkedState = {
+      isSymbolicLink: () => true,
+      isFile: () => true,
+      uid: 1000,
+      mode: 0o100600,
+    };
+    assert.throws(() => loaded.module.readPrivateGatewayTokenFile(target, {
+      lstat: () => linkedState,
+    }), /private gateway token file/);
   } finally {
     await loaded.dispose();
     await rm(temporary, { recursive: true, force: true });
