@@ -262,9 +262,21 @@ test("production renderer unlocks local core while keeping account-only surfaces
   assert.match(renderer, /const activateLocalWorkspace = useCallback\(async \(forceFresh = false\)/);
   assert.match(renderer, /activateLocalWorkspaceThroughQueue\(\{/);
   assert.match(renderer, /forceFresh,[\s\S]{0,120}queue: localWorkspaceActivationQueueRef\.current/);
-  assert.match(renderer, /const claimed = await bridge\.forceGatewayReconnect\(\)/);
-  assert.match(renderer, /const portGeneration = client\.getPortGeneration\(\)/);
-  assert.match(renderer, /await client\.waitForTransportConnectedAfterPortGeneration\(portGeneration, 20_000\)/);
+  const activationStart = renderer.indexOf("const activateLocalWorkspace = useCallback");
+  const activationEnd = renderer.indexOf("const activateFreshLocalWorkspace", activationStart);
+  assert.ok(activationStart >= 0 && activationEnd > activationStart);
+  const activationSource = renderer.slice(activationStart, activationEnd);
+  const portGenerationCapture = activationSource.indexOf("const portGeneration = client.getPortGeneration()");
+  const forcedReconnect = activationSource.indexOf("const claimed = await bridge.forceGatewayReconnect()");
+  const replacementTransportWait = activationSource.indexOf(
+    "await client.waitForTransportConnectedAfterPortGeneration(portGeneration, 20_000)"
+  );
+  assert.ok(
+    portGenerationCapture >= 0
+      && portGenerationCapture < forcedReconnect
+      && forcedReconnect < replacementTransportWait,
+    "activation must capture the old port generation before reconnect and await the replacement afterward"
+  );
   assert.match(renderer, /client\?\.getTransportState\(\) \?\? "down"/);
   assert.match(renderer, /localWorkspaceActivationStateEqual\(observedActivation, activationState\(\)\)/);
   assert.match(renderer, /overlay === "settings" \|\| !localWorkspaceConfigurationReady\(next\)/);
