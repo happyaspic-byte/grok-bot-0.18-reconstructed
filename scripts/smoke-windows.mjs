@@ -726,10 +726,17 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     await clickButton(launched.cdp, "Test & load models", "Fresh profile could not test the saved 9Router credential");
     await waitForRendererState(
       launched.cdp,
-      `(async () => { const status = await window.desktop.cliProxy.status(); return { models: status?.probe?.models ?? [], options: [...document.querySelectorAll('#sand-9router-models option')].map(option => option.value), text: document.body?.innerText ?? '' }; })()`,
-      value => value?.models?.includes(SMOKE_MODEL) && value.options?.includes(SMOKE_MODEL) && /Connected and loaded 2 models/i.test(value.text ?? ""),
+      `(() => ({ options: [...document.querySelectorAll('#sand-9router-models option')].map(option => option.value), text: document.body?.innerText ?? '' }))()`,
+      value => value?.options?.length === 2
+        && value.options.includes(SMOKE_MODEL)
+        && value.options.includes(SECOND_SMOKE_MODEL)
+        && /Connected and loaded 2 models/i.test(value.text ?? ""),
       "Authenticated /v1/models probe did not populate the packaged model chooser",
     );
+    const firstProbeRequests = servers.routerRequests.filter(request => request.url === "/v1/models");
+    if (firstProbeRequests.length < 1 || firstProbeRequests.some(request => request.method !== "GET" || request.authorized !== true)) {
+      throw new Error(`Initial model chooser probe was not authenticated: ${JSON.stringify(servers.routerRequests)}`);
+    }
 
     phase = "blank-model-blocker";
     await closeSettings(launched.cdp);

@@ -85,6 +85,9 @@ test("Windows packaged smoke uses authenticated loopback services and never embe
   const source = await readFile(smokePath, "utf8");
   assert.match(source, /request\.headers\.authorization === `Bearer \$\{secretCanary\}`/);
   assert.match(source, /request\.method === "GET" && request\.url === "\/v1\/models"/);
+  assert.match(source, /firstProbeRequests\.length < 1 \|\| firstProbeRequests\.some\(request => request\.method !== "GET" \|\| request\.authorized !== true\)/);
+  assert.match(source, /value\?\.options\?\.length === 2[\s\S]*value\.options\.includes\(SECOND_SMOKE_MODEL\)/);
+  assert.doesNotMatch(source, /const status = await window\.desktop\.cliProxy\.status\(\); return \{ models:/);
   assert.match(source, /routerBaseUrl: `http:\/\/127\.0\.0\.1:\$\{routerPort\}\/v1`/);
   assert.match(source, /listenLoopback\(gateway, 1340\)/);
   assert.match(source, /request\.url === "\/events"/);
