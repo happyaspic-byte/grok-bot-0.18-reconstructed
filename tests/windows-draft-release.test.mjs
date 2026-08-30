@@ -156,6 +156,8 @@ test("Windows launch smoke uses the credential-independent first-run Router entr
   assert.match(smoke, /\.trim\(\)\.toLowerCase\(\) === 'openai-compatible \/ 9router'/);
   assert.match(smoke, /input\[aria-label="9Router Base URL"\]/);
   assert.match(renderer, /aria-label="Configure 9Router"/);
+  assert.match(renderer, /aria-label=\{UI_TEXT\.title\}[\s\S]{0,100}role="main"/);
+  assert.match(smoke, /document\.querySelector\('\[role="main"\]\[aria-label="Grok Bot"\]'\)/);
   assert.match(renderer, /setSettingsSection\("router"\);[\s\S]{0,120}setOverlay\("settings"\)/);
   assert.match(renderer, /showSignIn && overlay !== "settings"/);
   assert.match(panel, /ariaLabel="Router provider"/);

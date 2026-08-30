@@ -35,7 +35,7 @@ test("Windows packaged smoke exercises the complete signed-out 9Router setup in 
 
   assert.match(source, /window\.desktop\.cursorAccount\.getStatus\(\)/);
   assert.match(source, /authKind === "logged-out"/);
-  assert.match(source, /main\[aria-label=\"Grok Bot\"\]/);
+  assert.match(source, /\[role=\"main\"\]\[aria-label=\"Grok Bot\"\]/);
   assert.match(source, /button\[aria-label=\"New\"\]/);
   assert.match(source, /\[role=\"status\"\]\[aria-label=\"Connected\"\]/);
   assert.match(source, /main\[aria-label=\"New chat\"\]/);

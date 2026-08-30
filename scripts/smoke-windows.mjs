@@ -256,7 +256,7 @@ async function closeSettings(cdp) {
 async function assertSignedOutLanding(cdp, label) {
   return await waitForRendererState(
     cdp,
-    `(async () => { const visible = node => node != null && node.isConnected && node.getClientRects().length > 0; const auth = await window.desktop.cursorAccount.getStatus(); const landing = document.querySelector('main[aria-label="Grok Bot"]'); const configure = document.querySelector('button[aria-label="Configure 9Router"]'); return { authKind: auth?.kind ?? null, landing: visible(landing), configure: visible(configure) }; })()`,
+    `(async () => { const visible = node => node != null && node.isConnected && node.getClientRects().length > 0; const auth = await window.desktop.cursorAccount.getStatus(); const landing = document.querySelector('[role="main"][aria-label="Grok Bot"]'); const configure = document.querySelector('button[aria-label="Configure 9Router"]'); return { authKind: auth?.kind ?? null, landing: visible(landing), configure: visible(configure) }; })()`,
     value => value?.authKind === "logged-out" && value.landing === true && value.configure === true,
     label,
   );
@@ -271,7 +271,7 @@ async function assertLoginFreeWorkspace(cdp, expectedBaseUrl, { probe = false } 
       window.desktop.agent.getBoxRuntime(),
       window.desktop.cliProxy.status(${probe ? "{ testConnection: true }" : ""}),
     ]);
-    const landing = document.querySelector('main[aria-label="Grok Bot"]');
+    const landing = document.querySelector('[role="main"][aria-label="Grok Bot"]');
     const configure = document.querySelector('button[aria-label="Configure 9Router"]');
     const create = document.querySelector('button[aria-label="New"]');
     const connected = document.querySelector('[role="status"][aria-label="Connected"]');
