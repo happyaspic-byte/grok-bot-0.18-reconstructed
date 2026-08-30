@@ -397,7 +397,10 @@ test("generated Browser driver migrates legacy URL state to fingerprints and re-
   const packageRoot = path.join(dependencyRoot, "playwright-core");
   const driverPath = path.join(runtimeRoot, "driver.mjs");
   const display = 20_000 + randomBytes(2).readUInt16BE(0);
-  const statePath = `/tmp/.sand-browser/views-${display}.json`;
+  // A leading slash is drive-relative on Windows. Resolve it from the child
+  // cwd so parent and child address the same C:/tmp-style driver state even
+  // when the checkout and runner temp directory are on different drives.
+  const statePath = path.resolve(runtimeRoot, `/tmp/.sand-browser/views-${display}.json`);
   const lockPath = `${statePath}.lock`;
   const token = "LEGACY-QUERY-TOKEN-c39211";
   const pageUrl = `https://example.test/private/report?access_token=${token}&mode=full`;
