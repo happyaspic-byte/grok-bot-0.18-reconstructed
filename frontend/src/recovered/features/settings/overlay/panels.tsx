@@ -463,6 +463,12 @@ export interface RouterSettingsPanelProps {
   provider: RouterProviderId;
   pending?: boolean;
   onChange(provider: RouterProviderId): void | Promise<unknown>;
+  boxRuntime?: {
+    state: RouterBoxRuntimeState | null;
+    pending: boolean;
+    error?: string | null;
+    onChange(mode: RouterBoxRuntimeMode): void | Promise<unknown>;
+  };
   cliProxy?: {
     status: CliProxyStatus | null;
     pending: boolean;
@@ -472,12 +478,27 @@ export interface RouterSettingsPanelProps {
   };
 }
 
-export function RouterSettingsPanel({ provider, pending = false, onChange, cliProxy }: RouterSettingsPanelProps) {
+export type RouterBoxRuntimeMode = "remote" | "local-docker";
+
+export interface RouterBoxRuntimeState {
+  readonly mode: RouterBoxRuntimeMode;
+  readonly status: {
+    readonly available: boolean;
+    readonly running: boolean;
+    readonly ready: boolean;
+    readonly containerName: string;
+    readonly image: string;
+    readonly detail: string;
+  } | null;
+}
+
+export function RouterSettingsPanel({ provider, pending = false, onChange, boxRuntime, cliProxy }: RouterSettingsPanelProps) {
   const selectedProvider = routerProviderById(provider);
   const [baseUrl, setBaseUrl] = useState("");
   const [model, setModel] = useState("");
   const [protocol, setProtocol] = useState<"auto" | "chat-completions" | "responses">("chat-completions");
   const [allowRemoteHttps, setAllowRemoteHttps] = useState(false);
+  const [allowTailscaleHttp, setAllowTailscaleHttp] = useState(false);
   const [apiKey, setApiKey] = useState("");
   useEffect(() => {
     if (cliProxy?.status == null) return;
@@ -485,11 +506,12 @@ export function RouterSettingsPanel({ provider, pending = false, onChange, cliPr
     setModel(cliProxy.status.model);
     setProtocol(cliProxy.status.protocol);
     setAllowRemoteHttps(cliProxy.status.allowRemoteHttps);
+    setAllowTailscaleHttp(cliProxy.status.allowTailscaleHttp === true);
   }, [cliProxy?.status]);
   const saveCliProxy = async () => {
     if (cliProxy == null || cliProxy.pending) return;
     try {
-      await cliProxy.onSave({ baseUrl, model, protocol, allowRemoteHttps, ...(apiKey.trim().length === 0 ? {} : { apiKey }) });
+      await cliProxy.onSave({ baseUrl, model, protocol, allowRemoteHttps, allowTailscaleHttp, ...(apiKey.trim().length === 0 ? {} : { apiKey }) });
       setApiKey("");
     } catch {}
   };
@@ -513,14 +535,35 @@ export function RouterSettingsPanel({ provider, pending = false, onChange, cliPr
           />
         </label>
       </SettingsGroup>
+      {boxRuntime ? <SettingsGroup title="Computer">
+        <div className="sand-provider-usage-card" style={{ gap: 10 }}>
+          <SandSwitch
+            checked={boxRuntime.state?.mode === "local-docker"}
+            disabled={boxRuntime.pending || boxRuntime.state == null}
+            label={<span className="sand-settings-copy">
+              <strong>Use local Docker VM</strong>
+              <small>{boxRuntime.state?.mode === "local-docker"
+                ? "Agent shell, files, and computer tools run in a Docker container on this Windows PC."
+                : "Turn this on to run agent shell, files, and computer tools locally on this Windows PC."}</small>
+            </span>}
+            onCheckedChange={(checked) => void boxRuntime.onChange(checked ? "local-docker" : "remote")}
+          />
+          <small aria-live="polite" role={boxRuntime.error == null ? "status" : "alert"}>{boxRuntime.error ?? (boxRuntime.state == null
+            ? "Loading Docker status…"
+            : boxRuntime.pending
+              ? boxRuntime.state.mode === "local-docker" ? "Stopping the local Docker VM…" : "Starting the local Docker VM…"
+              : boxRuntime.state.status?.detail ?? (boxRuntime.state.mode === "local-docker" ? "Local Docker VM selected." : "Remote computer selected."))}</small>
+        </div>
+      </SettingsGroup> : null}
       {provider === "cli-proxy" && cliProxy ? <SettingsGroup title="9Router connection">
         <div className="sand-provider-usage-card" style={{ gap: 12 }}>
-          <label><span className="sand-settings-copy"><strong>Base URL</strong><small>Use the authenticated API root, normally http://127.0.0.1:20128/v1. Do not use /codex.</small></span><input aria-label="9Router Base URL" disabled={cliProxy.pending} onChange={(event) => setBaseUrl(event.currentTarget.value)} spellCheck={false} type="url" value={baseUrl} /></label>
-          <label><span className="sand-settings-copy"><strong>Model ID</strong><small>Enter the exact 9Router model ID. Manual entry stays available because /v1/models can omit free/no-auth models.</small></span><input aria-label="9Router model" disabled={cliProxy.pending} list="sand-9router-models" onChange={(event) => setModel(event.currentTarget.value)} placeholder="provider/model-id" spellCheck={false} type="text" value={model} /><datalist id="sand-9router-models">{cliProxy.status?.probe?.models.map((id) => <option key={id} value={id} />)}</datalist></label>
-          <label><span className="sand-settings-copy"><strong>API key</strong><small>{cliProxy.status?.configured ? "A key is saved. Leave this blank to keep it." : "Use the 9Router proxy/client API key, not its management key."}</small></span><input aria-label="9Router API key" autoComplete="new-password" disabled={cliProxy.pending} onChange={(event) => setApiKey(event.currentTarget.value)} placeholder={cliProxy.status?.configured ? "Saved key (enter to replace)" : "Proxy API key"} type="password" value={apiKey} /></label>
-          <label><span className="sand-settings-copy"><strong>Protocol</strong><small>Chat Completions is recommended for current 9Router releases. Responses and Auto are available for compatible reasoning models.</small></span><SandSelect ariaLabel="9Router protocol" disabled={cliProxy.pending} onValueChange={setProtocol} options={[{ value: "chat-completions", label: "Chat Completions" }, { value: "responses", label: "Responses" }, { value: "auto", label: "Auto fallback" }]} placement="bottom-end" value={protocol} /></label>
-          <SandSwitch checked={allowRemoteHttps} disabled={cliProxy.pending} label={<span className="sand-settings-copy"><strong>Allow a remote HTTPS endpoint</strong><small>Off by default. Plain HTTP is always restricted to loopback.</small></span>} onCheckedChange={setAllowRemoteHttps} />
-          <small>Use 9Router 0.4.82 or newer. MCP/plugin tools stay disabled on this route unless an administrator explicitly enables the advanced environment opt-in.</small>
+          <label><span className="sand-settings-copy"><strong>Base URL</strong><small>Use the authenticated API root, normally http://127.0.0.1:20128/v1. For this Tailscale server, use http://100.112.10.8:20128/v1. Do not use /codex.</small></span><input aria-label="9Router Base URL" disabled={cliProxy.pending} onChange={(event) => setBaseUrl(event.currentTarget.value)} spellCheck={false} type="url" value={baseUrl} /></label>
+          <label><span className="sand-settings-copy"><strong>Model ID</strong><small>Enter the exact ID. If unknown, save the key first, run Test &amp; load models, choose one, then save again. Manual entry stays available when /v1/models omits a model.</small></span><input aria-label="9Router model" disabled={cliProxy.pending} list="sand-9router-models" onChange={(event) => setModel(event.currentTarget.value)} placeholder="provider/model-id" spellCheck={false} type="text" value={model} /><datalist id="sand-9router-models">{cliProxy.status?.probe?.models.map((id) => <option key={id} value={id} />)}</datalist></label>
+          <label><span className="sand-settings-copy"><strong>API key</strong><small>{cliProxy.status?.configured ? "A required proxy/client API key is saved. Leave this blank to keep it." : "Required. Use the 9Router proxy/client API key, not its management key."}</small></span><input aria-label="9Router API key" autoComplete="new-password" disabled={cliProxy.pending} onChange={(event) => setApiKey(event.currentTarget.value)} placeholder={cliProxy.status?.configured ? "Saved key (enter to replace)" : "Proxy API key"} type="password" value={apiKey} /></label>
+          <label><span className="sand-settings-copy"><strong>Protocol</strong><small>Use Chat Completions (or Auto, which prefers it) for the full Local Docker tool loop. Explicit Responses mode is blocked for native-agent turns.</small></span><SandSelect ariaLabel="9Router protocol" disabled={cliProxy.pending} onValueChange={setProtocol} options={[{ value: "chat-completions", label: "Chat Completions" }, { value: "responses", label: "Responses (not for Local Docker)" }, { value: "auto", label: "Auto (Chat first)" }]} placement="bottom-end" value={protocol} /></label>
+          <SandSwitch checked={allowTailscaleHttp} disabled={cliProxy.pending} label={<span className="sand-settings-copy"><strong>Allow HTTP over Tailscale</strong><small>Off by default. Only numeric Tailscale IP addresses are accepted; verify the peer separately with tailscale ping.</small></span>} onCheckedChange={setAllowTailscaleHttp} />
+          <SandSwitch checked={allowRemoteHttps} disabled={cliProxy.pending} label={<span className="sand-settings-copy"><strong>Allow a remote HTTPS endpoint</strong><small>Off by default. This separate opt-in does not allow arbitrary remote HTTP.</small></span>} onCheckedChange={setAllowRemoteHttps} />
+          <small>Use the current stable 9Router release (v0.5.35 when reviewed); older builds have known authorization bypasses. Local Docker enables built-in agent, shell, file, browser, and computer tools; account-bound cloud features remain unavailable without sign-in.</small>
           <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
             <SandButton disabled={cliProxy.pending || !cliProxy.status?.configured} onClick={() => void cliProxy.onDelete().catch(() => undefined)} size="sm" variant="secondary">Delete credential</SandButton>
             <SandButton disabled={cliProxy.pending || !cliProxy.status?.configured} onClick={() => void cliProxy.onTest().catch(() => undefined)} size="sm" variant="secondary">Test &amp; load models</SandButton>

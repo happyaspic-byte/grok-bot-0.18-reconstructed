@@ -12,18 +12,26 @@ host, coordinator, local-execution, protocol, and renderer boundaries, plus a
 deterministic toolchain for turning those sources back into a working macOS
 application.
 
+The Windows portable build also has a login-independent **Local 9Router
+workspace**. In that mode 9Router supplies model inference while an owned local
+Docker VM supplies Grok Bot's agent, shell, file, and computer capabilities. It
+does not create or emulate a Cursor account session.
+
 It also adds a few practical experiments:
 
 - an inference router for Cursor, Claude Code, Codex, OpenRouter, and local
   OpenAI-compatible APIs such as 9Router;
 - Grok Bot plugin/MCP tools across the routed providers;
 - local usage tracking for routed inference;
-- an optional local Docker sandbox in place of the remote box; and
+- an optional local Docker sandbox in place of the remote box, including a
+  Windows Local 9Router workspace that does not require Cursor sign-in; and
 - a reconstructed settings surface integrated into the polished shipped UI.
 
 This is a hacking and research project, not Anysphere's original monorepo and
-not an official Grok Bot release. Names and module boundaries inferred from a
-compiled application may differ from the original source.
+not an official Grok Bot release. It remains a reconstruction of the pinned
+0.18.0 application; the Local 9Router workspace does not make it the latest
+official Grok Bot. Names and module boundaries inferred from a compiled
+application may differ from the original source.
 
 ## What is in the repository?
 
@@ -93,7 +101,7 @@ Open **Settings → Router** to choose the backend used for new turns:
 | Claude Code | Existing Claude Code login | Routed Grok Bot MCP tools |
 | Codex | Existing local ChatGPT/Codex login | Direct Responses transport with Grok Bot tools |
 | OpenRouter | API key saved through the desktop secrets bridge | Grok Bot tool-execution loop |
-| OpenAI-compatible / 9Router | Dedicated OS-encrypted proxy/client API key | Disabled by default; advanced environment opt-in only |
+| OpenAI-compatible / 9Router | Dedicated OS-encrypted proxy/client API key | Native agents, shell, files, and computer in the Local Docker workspace; account-only cloud features stay unavailable |
 
 Cursor is the default. Claude Code and Codex do not require separate API keys
 when their local clients are already authenticated. The application preserves
@@ -102,30 +110,43 @@ tool execution across routed conversations.
 
 #### 9Router / OpenAI-compatible setup
 
-Use **9Router 0.4.82 or newer**. On a fresh Windows portable profile, choose
-**Configure 9Router** on the sign-in screen; otherwise open **Settings →
-Router**. Select **OpenAI-compatible / 9Router**. The default API root is
-`http://127.0.0.1:20128/v1`. Save the 9Router **proxy/client API key** (not its
-management key), use **Test & load models**, and enter or select the exact model
-ID. Manual model entry remains available because 9Router's `/v1/models` result
-can omit free or no-auth models.
+Use the **current stable 9Router release** (v0.5.35 when this path was reviewed).
+On a fresh Windows portable profile, choose **Configure 9Router** on the
+sign-in screen; otherwise open **Settings → Router**. Select
+**OpenAI-compatible / 9Router** (the internal provider ID is `cli-proxy`). Save
+the 9Router **proxy/client API key** (not its management key). If the exact
+model ID is not known, first save the URL and key with the model blank, select
+**Test & load models**, choose a model, and save again. Manual model entry
+remains available because 9Router's `/v1/models` result can omit free or
+no-auth models.
 
 Chat Completions is the default protocol because it currently has the broadest
-9Router compatibility. Responses and Auto fallback remain explicit choices for
-models that support them. Use only authenticated `/v1` endpoints; the `/codex`
-rewrite is intentionally rejected. Plain HTTP is loopback-only. A non-loopback
-endpoint must use HTTPS and requires the explicit UI opt-in.
+9Router compatibility. Auto also uses Chat Completions first. Explicit
+Responses remains available for non-native routes, but the Local Docker native
+agent path rejects it because tool-call replay has not been verified there. Use
+only authenticated `/v1` endpoints; the `/codex`
+rewrite is intentionally rejected. Plain HTTP is denied by default outside
+loopback. The separate **Allow HTTP over Tailscale** switch permits only literal
+Tailscale IP addresses; it does not permit arbitrary private or public HTTP
+hosts. MagicDNS names are deliberately rejected for HTTP. Remote DNS names
+require HTTPS and the separate HTTPS opt-in. Numeric-range validation does not
+prove which Windows route is active, so confirm `tailscale ping 100.112.10.8`
+succeeds before enabling plain HTTP.
 
 The 9Router key is stored in its own fixed-purpose Electron `safeStorage` file.
 It is never placed in user secrets, box-secret synchronization, environment
 variables, settings, renderer status responses, or transcripts. If OS secure
 storage is unavailable, it is held only in memory for the current session.
-Each inference turn obtains a transient main-to-coordinator lease.
+Immediately before a local native turn, the authenticated local gateway gives
+the Docker host a short-lived, memory-only credential lease. The host cannot
+read a prior lease back through that gateway and does not persist it. Changing
+the endpoint origin (scheme, host, or port) does not reuse the previous key;
+the user must enter the key again.
 
-MCP/plugin tools are intentionally disabled for this provider. Administrators
-who have independently reviewed the proxy and tool effects can opt in before
-launch with `SAND_9ROUTER_ENABLE_UNREVIEWED_MCP_TOOLS=1`; duplicate tool names
-are rejected. This advanced switch does not persist or sync to the box.
+The login-free workspace exposes the local agent runtime and its shell, file,
+and computer tools. It does not fabricate a Cursor login, so shared rooms,
+remote boxes, account-backed plugins, billing, and other cloud/account-only
+features remain unavailable until a real account session exists.
 
 **Usage & Billing** shows the locally recorded request and token totals for
 providers that return usage data. These figures are activity records, not an
@@ -139,21 +160,40 @@ of connecting to the remote sandbox.
 
 The container:
 
-- is bound only to loopback ports;
-- mounts content-addressed host and daemon artifacts read-only;
-- reuses the user's existing provider authentication where needed;
+- pins the reviewed linux/amd64 sandbox image by immutable manifest digest;
+- publishes only gateway/VNC ports `1340`, `6080`, and `6081` to Windows
+  loopback; execution/control ports `1337`, `1339`, and `8790` are not
+  published to the host;
+- mounts the reviewed host bundle and stock-daemon launcher read-only and
+  replaces the owned container when their content hashes change;
+- in standalone 9Router mode, runs the stock Computer-capable model-facing
+  daemon as the non-root `box` user with no effective capabilities and
+  `no_new_privs`; its directly spawned window forks inherit that identity, and
+  this login-free model path has no root shell;
+- gives only the root host process a read-only, root-owned gateway-token volume
+  that the model-facing daemon cannot read;
+- uses a short-lived in-memory 9Router credential lease in the login-free
+  workspace, or the user's existing provider authentication where needed;
+- omits host Codex/Claude credential mounts, host-control environment values,
+  and raw-packet capture in standalone 9Router mode;
 - is validated before the coordinator connects; and
 - is stopped or replaced through the same settings lifecycle.
 
 Docker Desktop, or another compatible local Docker daemon, must be running.
-Remote mode remains the default.
+Remote mode remains the default for account-backed operation. The no-login
+Windows Local 9Router workspace requires **Use local Docker VM** to be enabled.
+These controls do not defend against a Windows or Docker administrator, and an
+agent in the box intentionally retains control of its own workspace and
+browser. Startup live-attests the primary model daemon; later window forks rely
+on inherited restrictions and are not individually live-attested.
 
 ## Requirements
 
 All builds require Node.js 26.5.x and Git LFS. macOS packaging requires Apple
 Silicon and Xcode Command Line Tools. Windows packaging requires Windows 10/11
 x64; the exact 7-Zip extractor is supplied by the locked `7zip-bin` dependency.
-Docker Desktop is optional and needed only for the local sandbox.
+Docker Desktop is optional for other routes but required for the full
+login-independent Local 9Router workspace.
 
 ## macOS quick start
 
@@ -232,23 +272,57 @@ SBOM, and attaches the exact files to an unpublished Draft Release. It never
 publishes a public release automatically. The draft remains subject to the
 rights and signing review described below.
 
-### Using 9Router or another OpenAI-compatible local API
+### Windows login-free Local 9Router workspace
 
-Run 9Router separately, create a proxy/client API key in its Dashboard, and use
-the model IDs shown by that Dashboard. A fresh Windows portable profile exposes
-**Configure 9Router** before Cursor sign-in; existing profiles can use
-**Settings → Router**. Select the OpenAI-compatible/9Router provider. The
-default local endpoint is:
+This is the reviewed path for using the reconstructed Windows app without a
+Cursor login while retaining local agents and computer tools. Before starting,
+make sure all of the following are true:
 
-```text
-http://127.0.0.1:20128/v1
-```
+- Windows 10/11 x64 is running the reconstructed portable app;
+- Docker Desktop is installed, running, and able to start Linux containers;
+- this Windows PC can reach the 9Router server over Tailscale at the literal IP
+  `100.112.10.8`;
+- the server runs the current stable 9Router release (v0.5.35 when reviewed)
+  and exposes its authenticated `/v1` API on port `20128`;
+- a 9Router proxy/client API key has been issued; and
+- at least one exact model ID is known or is returned by `/v1/models`.
 
-Use `127.0.0.1`, rather than `localhost`, to avoid an IPv6/IPv4 loopback
-mismatch. The proxy/client API key is a credential; on Windows its store is
-protected with a real DACL (current user, SYSTEM, and Administrators), not a
-POSIX `0600` claim. The shared credential helper enforces and re-verifies that
-boundary.
+Configure the workspace as follows:
+
+1. Start Docker Desktop, confirm Tailscale is connected, and run `tailscale
+   ping 100.112.10.8` from Windows. Do not enable plain HTTP if that check does
+   not reach the intended tailnet peer.
+2. On a fresh profile, select **Configure 9Router** on the sign-in screen. On an
+   existing profile, open **Settings → Router**.
+3. Under **Route agent requests through**, select **OpenAI-compatible /
+   9Router** (`cli-proxy`).
+4. Set **Base URL** to `http://100.112.10.8:20128/v1` and enable **Allow HTTP
+   over Tailscale**. Use the numeric IP exactly; an HTTP MagicDNS hostname is
+   rejected.
+5. Enter the issued proxy/client API key and leave **Chat Completions** selected
+   (or use **Auto**) for the native agent and computer tool loop. Do not select
+   explicit **Responses** for the Local Docker workspace.
+6. If the exact model ID is known, enter it and select **Save 9Router**. If it
+   is not known, leave the model blank, save the URL and key, select **Test &
+   load models**, choose a returned model, and select **Save 9Router** again. A
+   manual model value remains valid when the models response omits it.
+7. Enable **Use local Docker VM**. The workspace becomes available when the
+   provider is `cli-proxy`, a credential and exact model ID are configured,
+   Chat Completions or Auto is selected, and the local Docker runtime is
+   selected.
+
+No Cursor sign-in is needed for this local workspace. 9Router performs model
+inference; the Docker host performs agent orchestration, shell commands, file
+operations, and computer/browser actions. Cursor-backed remote boxes, shared
+rooms, account billing, and other cloud/account-only features do not become
+available merely because this workspace is ready.
+
+For a same-PC 9Router deployment, the loopback default remains
+`http://127.0.0.1:20128/v1`. HTTP hostnames, including `localhost`, are
+rejected; use the literal loopback address. The proxy/client API key is a
+credential; on Windows its store is protected with a real DACL (current user,
+SYSTEM, and Administrators), not a POSIX `0600` claim. The shared credential
+helper enforces and re-verifies that boundary.
 
 ### Windows trust and identity boundary
 
@@ -264,30 +338,25 @@ removes updater executables/configuration, and does not register the inherited
 `sand:` callback. That default avoids taking the official app's protocol
 association. Consequently, a fresh isolated profile does not use Cursor's
 desktop OAuth callback; 9Router/OpenAI-compatible mode is the supported
-credential-independent first-run path for this portable build.
+Cursor-account-independent first-run path for this portable build. It still
+requires the dedicated 9Router proxy/client API key described above.
 
 ## Architecture
 
-```text
-polished shipped renderer
-          │
-          │ desktop preload / RPC
-          ▼
-     Electron main
-          │
-          ├── settings, secrets, auth and plugin lifecycle
-          ├── remote box connector
-          └── owned local Docker connector
-                       │
-                       ▼
-              coordinator + host
-                       │
-              inference router
-           ┌───────────┼───────────┐
-        Cursor      Claude       Codex / OpenRouter
-                       │
-                 Grok Bot MCP tools
+```mermaid
+flowchart TD
+    UI["Renderer"] --> Main["Electron main"]
+    Main --> Coordinator["Coordinator"]
+    Coordinator --> Host["Local Docker host"]
+    Host --> Router["9Router over Tailscale"]
+    Host --> Tools["Agents, shell, files, computer"]
 ```
+
+The diagram shows the login-free Windows path. Electron main owns settings and
+the OS-encrypted key store; the coordinator passes a short-lived lease over the
+authenticated local gateway; and the Docker host combines 9Router inference
+with the native local toolset. Account-backed provider and remote-box paths
+remain separate and continue to require their real authentication.
 
 The main source areas are:
 

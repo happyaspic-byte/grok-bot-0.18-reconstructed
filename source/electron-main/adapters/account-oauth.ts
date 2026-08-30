@@ -31,6 +31,7 @@ function defaultWiringDeps(context: ProductionServiceContext): CursorAuthWiringD
   return {
     openExternal: async (url) => { await context.native.shell.openExternal(url); },
     getAccountRuntime: () => accountRuntimeOf(context),
+    runtimeObservationOwner: "coordinator",
     emitAuthStatus: (status) => context.requireMainEdge().emit("cursor-auth-changed", status),
     sentryEnabled: context.env.SAND_DISABLE_SENTRY !== "1",
     settingsStore: context.settings.settingsStore,

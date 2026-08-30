@@ -275,6 +275,7 @@ export interface ProductionMcpService extends ProductionDisposable {
 }
 export interface ProductionCoordinatorResyncPort {
   pushHostSettings(update: unknown): Promise<Record<string, any> | null>;
+  pushHostSettingsStrict(update: unknown): Promise<Record<string, any>>;
   readHostSettings(): Promise<unknown>;
 }
 export interface ProductionMcpHostPort {
@@ -285,6 +286,9 @@ export interface ProductionCoordinatorService extends ProductionDisposable {
   start(status: ProductionAccountStatus): Promise<void>;
   setWindowFocused(state: { readonly isFocused: boolean }): Promise<unknown>;
   pushHostSettings(update: unknown): Promise<Record<string, any> | null>;
+  pushHostSettingsStrict(update: unknown): Promise<Record<string, any>>;
+  beginCliProxyCredentialMutation(): void;
+  endCliProxyCredentialMutation(): void;
   readHostSettings(): Promise<unknown>;
   getAccountRuntime?(): unknown;
   restartCoordinator(): void;
@@ -682,6 +686,7 @@ export function createElectronMainProductionComposition(bindings: ElectronMainPr
       };
       const coordinatorResync: ProductionCoordinatorResyncPort = {
         pushHostSettings: (update) => requireValue(coordinator, "coordinator").pushHostSettings(update),
+        pushHostSettingsStrict: (update) => requireValue(coordinator, "coordinator").pushHostSettingsStrict(update),
         readHostSettings: () => requireValue(coordinator, "coordinator").readHostSettings(),
       };
       const hostSettingsFields = createDesktopHostSettingsFields({

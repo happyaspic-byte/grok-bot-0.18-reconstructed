@@ -3,6 +3,7 @@ import type { ProductionDisposable, ProductionServiceContext } from "../main-pro
 import { registerExperimentsIpc } from "../experiments/experiments-ipc.js";
 import { registerSettingsIpc } from "../prefs/settings-ipc.js";
 import { createTrustedSenderGuards, registerSecretsIpc } from "../secrets/secrets-ipc.js";
+import { revokeCliProxyLeaseOrStopOwnedLocalDocker } from "../box/local-docker-host-connector.js";
 import { reportDesktopEdgeFailure } from "../desktop-edge-failures.js";
 import { requireDisposable, requireFunction, requireObject } from "./provider-guards.js";
 
@@ -44,6 +45,22 @@ export function createProductionSecretsIpcRegistrar(): ProductionIpcRegistrar {
       guards: createTrustedSenderGuards(context.getTrustedContents),
       stores: context.secretsStores,
       pushBoxSecrets: () => context.secretsStores.pushBoxSecrets.push("edit"),
+      beforeCliProxyMutation: async () => {
+        const coordinator = context.requireCoordinator();
+        coordinator.beginCliProxyCredentialMutation();
+        await revokeCliProxyLeaseOrStopOwnedLocalDocker(() =>
+          coordinator.pushHostSettingsStrict({
+            clearCliProxyCredentialLease: true,
+          }));
+      },
+      afterCliProxyMutation: async () => {
+        const coordinator = context.requireCoordinator() as ReturnType<typeof context.requireCoordinator> & {
+          readonly localWorkspace?: { refresh(): Promise<unknown> };
+        };
+        coordinator.endCliProxyCredentialMutation();
+        if (coordinator.localWorkspace != null) await coordinator.localWorkspace.refresh();
+        else coordinator.restartCoordinator();
+      },
     });
   };
 }

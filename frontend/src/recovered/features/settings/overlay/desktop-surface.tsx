@@ -28,7 +28,7 @@ import {
   usageMetersFromSummary,
   type SettingsDesktopSnapshot
 } from "./desktop";
-import { GeneralSettingsPanel, RouterSettingsPanel, UpdatesSettingsPanel, UsageSettingsPanel } from "./panels";
+import { GeneralSettingsPanel, RouterSettingsPanel, UpdatesSettingsPanel, UsageSettingsPanel, type RouterBoxRuntimeMode, type RouterBoxRuntimeState } from "./panels";
 import { SettingsModalShell, type SettingsSectionId } from "./view";
 import { DEFAULT_ROUTER_PROVIDER, isRouterProviderId, type RouterProviderId } from "./router";
 import type { CliProxyStatus } from "../../../../../../source/shared/cli-proxy";
@@ -39,6 +39,31 @@ import { publishSurfaceNotice, type SettingsNoticeEvent } from "../../../contrac
 import { SandButton } from "../../../ui/sand-kit-primitives";
 
 const SETTINGS_FALLBACK_LABELS = { retry: "Retry" };
+const LOCAL_WORKSPACE_CHANGED_EVENT = "sand-local-workspace-changed";
+
+function normalizeRouterBoxRuntimeState(value: unknown): RouterBoxRuntimeState {
+  if (typeof value !== "object" || value == null || Array.isArray(value)) throw new Error("Docker runtime returned an invalid status.");
+  const record = value as Record<string, unknown>;
+  if (record.mode !== "remote" && record.mode !== "local-docker") throw new Error("Docker runtime returned an unknown mode.");
+  const rawStatus = record.status;
+  if (typeof rawStatus !== "object" || rawStatus == null || Array.isArray(rawStatus)) return { mode: record.mode, status: null };
+  const status = rawStatus as Record<string, unknown>;
+  if (typeof status.available !== "boolean" || typeof status.running !== "boolean" || typeof status.ready !== "boolean"
+    || typeof status.containerName !== "string" || typeof status.image !== "string" || typeof status.detail !== "string") {
+    return { mode: record.mode, status: null };
+  }
+  return {
+    mode: record.mode,
+    status: {
+      available: status.available,
+      running: status.running,
+      ready: status.ready,
+      containerName: status.containerName,
+      image: status.image,
+      detail: status.detail
+    }
+  };
+}
 
 export interface SettingsDesktopSurfaceProps {
   bridge: DesktopBridge;
@@ -60,6 +85,9 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
   const [cancelTrialDialogOpen, setCancelTrialDialogOpen] = useState(false);
   const [routerProvider, setRouterProvider] = useState<RouterProviderId>(DEFAULT_ROUTER_PROVIDER);
   const [routerPending, setRouterPending] = useState(false);
+  const [boxRuntime, setBoxRuntime] = useState<RouterBoxRuntimeState | null>(null);
+  const [boxRuntimePending, setBoxRuntimePending] = useState(false);
+  const [boxRuntimeError, setBoxRuntimeError] = useState<string | null>(null);
   const [cliProxyStatus, setCliProxyStatus] = useState<CliProxyStatus | null>(null);
   const [cliProxyPending, setCliProxyPending] = useState(false);
   const handleCancelTrialDialogOpen = useCallback((open: boolean) => setCancelTrialDialogOpen(open), []);
@@ -67,10 +95,15 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
     setSurfaceNotice(settingsNoticeFromEvent(event));
     onNotice?.(event);
   }, [onNotice]);
+  const refreshLocalWorkspace = useCallback(async () => {
+    try { await bridge.forceGatewayReconnect(); } catch {}
+    window.dispatchEvent(new Event(LOCAL_WORKSPACE_CHANGED_EVENT));
+  }, [bridge]);
 
   useEffect(() => {
     if (!isOpen) return;
     let active = true;
+    setBoxRuntimeError(null);
     let unsubscribe = () => {};
     setSnapshot(null);
     setError(null);
@@ -146,6 +179,13 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
       if (active) setRouterProvider(DEFAULT_ROUTER_PROVIDER);
     });
     void bridge.cliProxy.status().then((status) => { if (active) setCliProxyStatus(status); }).catch(() => { if (active) setCliProxyStatus(null); });
+    void bridge.agent.getBoxRuntime().then((status) => {
+      if (active) setBoxRuntime(normalizeRouterBoxRuntimeState(status));
+    }).catch((reason: unknown) => {
+      if (!active) return;
+      setBoxRuntime(null);
+      setBoxRuntimeError(reason instanceof Error ? reason.message : String(reason));
+    });
     return () => { active = false; };
   }, [bridge, isOpen]);
 
@@ -193,12 +233,36 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
         // settings snapshot so a fresh profile can configure 9Router first.
         if (section === "router") return (
           <RouterSettingsPanel
+            boxRuntime={{
+              state: boxRuntime,
+              pending: boxRuntimePending,
+              error: boxRuntimeError,
+              onChange: async (mode) => {
+                if (boxRuntimePending || boxRuntime?.mode === mode) return;
+                setBoxRuntimePending(true);
+                setBoxRuntimeError(null);
+                try {
+                  const result = normalizeRouterBoxRuntimeState(await bridge.agent.setBoxRuntime(mode));
+                  setBoxRuntime(result);
+                  await refreshLocalWorkspace();
+                } catch (reason) {
+                  const message = reason instanceof Error ? reason.message : String(reason);
+                  setBoxRuntimeError(message);
+                  publishSurfaceNotice({ kind: "error", operation: "settings-router-provider", message }, handleNotice, onStatus);
+                } finally {
+                  setBoxRuntimePending(false);
+                }
+              }
+            }}
             cliProxy={{
               status: cliProxyStatus,
               pending: cliProxyPending,
               onSave: async (config) => {
                 setCliProxyPending(true);
-                try { setCliProxyStatus(await bridge.cliProxy.save(config)); }
+                try {
+                  setCliProxyStatus(await bridge.cliProxy.save(config));
+                  await refreshLocalWorkspace();
+                }
                 catch (reason) {
                   const message = reason instanceof Error ? reason.message : String(reason);
                   publishSurfaceNotice({ kind: "error", operation: "settings-router-provider", message }, handleNotice, onStatus);
@@ -207,7 +271,10 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
               },
               onDelete: async () => {
                 setCliProxyPending(true);
-                try { setCliProxyStatus(await bridge.cliProxy.remove()); }
+                try {
+                  setCliProxyStatus(await bridge.cliProxy.remove());
+                  await refreshLocalWorkspace();
+                }
                 catch (reason) {
                   const message = reason instanceof Error ? reason.message : String(reason);
                   publishSurfaceNotice({ kind: "error", operation: "settings-router-provider", message }, handleNotice, onStatus);
@@ -234,6 +301,7 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
                 const applied = typeof result === "object" && result != null && "provider" in result ? result.provider : provider;
                 if (!isRouterProviderId(applied)) throw new Error("Router returned an unknown provider.");
                 setRouterProvider(applied);
+                await refreshLocalWorkspace();
               } catch (reason) {
                 setRouterProvider(previous);
                 const message = reason instanceof Error ? reason.message : String(reason);

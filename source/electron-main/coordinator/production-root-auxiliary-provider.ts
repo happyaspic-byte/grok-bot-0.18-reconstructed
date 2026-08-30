@@ -34,6 +34,7 @@ export interface ProductionCoordinatorAuxiliaryPorts {
     | "setMcpDisabledToolsByServerId"
     | "detectTimeZone"
     | "getUserTimeZoneOverride"
+    | "getInferenceProvider"
     | "getComputerUseModel"
     | "getAutoReviewInstructions"
     | "getLocalToolPermission"
@@ -121,12 +122,13 @@ export function createProductionCoordinatorAuxiliaryPorts(
         return zone.length === 0 ? null : zone;
       },
       getUserTimeZoneOverride: () => settings.getUserTimeZoneOverride(),
+      getInferenceProvider: () => settings.getInferenceProvider(),
       getComputerUseModel: () => computerUseModel(context),
       getAutoReviewInstructions: () => settings.getAutoReviewInstructions(),
       getLocalToolPermission: () => settings.getLocalToolPermission(),
       getWebauthnProxyEnabled: () => settings.getWebauthnProxyEnabled(),
       getFeatureFlagOverrides: () => context.requireExperiments().getFeatureFlagOverridesRecord(),
-      pushBoxSecrets: () => context.secretsStores.pushBoxSecrets.push("resync"),
+      pushBoxSecrets: () => context.secretsStores.pushBoxSecrets.pushOrThrow("resync"),
       onHostSettingsTransportConnected: () => context.hostSettingsFields.onTransportConnected(),
       onHostSettingsTransportDown: () => context.hostSettingsFields.setBoxStreamLive(false),
     },

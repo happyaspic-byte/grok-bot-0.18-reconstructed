@@ -12,6 +12,12 @@ export interface CoordinatorAccountTransition {
   readonly previousSlot: string | null | undefined;
 }
 
+/** A real account or an explicitly local owner of one coordinator process. */
+export interface CoordinatorRuntimeClaim {
+  readonly kind: "account" | "local-workspace";
+  readonly slot: string;
+}
+
 export interface CoordinatorRefusedAccountResult<Status extends CoordinatorAuthStatus> {
   readonly kind: string;
   readonly status: Status;
@@ -19,7 +25,7 @@ export interface CoordinatorRefusedAccountResult<Status extends CoordinatorAuthS
 }
 
 export interface CoordinatorAccountRuntimeDependencies<Status extends CoordinatorAuthStatus> {
-  readonly createRuntime: () => CoordinatorRuntime;
+  readonly createRuntime: (claim: CoordinatorRuntimeClaim) => CoordinatorRuntime;
   readonly authorizeAccount: (
     slot: string,
     context: CoordinatorAccountTransition,
@@ -39,8 +45,8 @@ export interface CoordinatorAccountRuntimeDependencies<Status extends Coordinato
 }
 
 export interface CoordinatorAccountRuntime<Status extends CoordinatorAuthStatus> {
-  start(status: Status): Promise<void>;
-  observe(status: Status): void;
+  start(status: Status, claim?: CoordinatorRuntimeClaim | null): Promise<void>;
+  observe(status: Status, claim?: CoordinatorRuntimeClaim | null): void;
   whenIdle(): Promise<Status>;
   requestRendererPort(sink: (port: unknown) => void): void;
   restart(): Promise<void>;
@@ -52,15 +58,15 @@ type RuntimeState =
   | { readonly kind: "inactive" }
   | {
       readonly kind: "active";
-      readonly slot: string;
+      readonly claim: CoordinatorRuntimeClaim;
       readonly session: CoordinatorRuntime;
       readonly appliedVersion: number;
       readonly rendererRequestRevoked: boolean;
     }
   | {
       readonly kind: "blocked";
-      readonly slot: string | null;
-      readonly previousSlot: string | null | undefined;
+      readonly claim: CoordinatorRuntimeClaim | null;
+      readonly previousClaim: CoordinatorRuntimeClaim | null | undefined;
     }
   | { readonly kind: "disposed" };
 
@@ -93,10 +99,20 @@ function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-function cursorAccountSlot(status: CoordinatorAuthStatus): string | null {
+function cursorAccountClaim(status: CoordinatorAuthStatus): CoordinatorRuntimeClaim | null {
   if (status.kind !== "logged-in") return null;
   const slot = status.authId ?? status.email;
-  return slot == null || slot.length === 0 ? null : slot;
+  return slot == null || slot.length === 0
+    ? null
+    : { kind: "account", slot };
+}
+
+function sameClaim(
+  left: CoordinatorRuntimeClaim | null | undefined,
+  right: CoordinatorRuntimeClaim | null | undefined,
+): boolean {
+  if (left == null || right == null) return left === right;
+  return left.kind === right.kind && left.slot === right.slot;
 }
 
 /**
@@ -114,6 +130,7 @@ export function createCoordinatorAccountRuntime<Status extends CoordinatorAuthSt
   let state: RuntimeState = { kind: "unstarted" };
   let requester: ((port: unknown) => void) | null = null;
   let settledStatus = loggedOut;
+  let settledClaim: CoordinatorRuntimeClaim | null = null;
   let observedVersion = 0;
   let chain: Promise<void> = Promise.resolve();
   let startWork: Promise<void> = Promise.resolve();
@@ -124,7 +141,7 @@ export function createCoordinatorAccountRuntime<Status extends CoordinatorAuthSt
 
   const isDisposed = (): boolean => state.kind === "disposed";
 
-  const accountSlot = (): string | null | undefined => {
+  const runtimeClaim = (): CoordinatorRuntimeClaim | null | undefined => {
     switch (state.kind) {
       case "unstarted":
       case "disposed":
@@ -133,7 +150,7 @@ export function createCoordinatorAccountRuntime<Status extends CoordinatorAuthSt
         return null;
       case "active":
       case "blocked":
-        return state.slot;
+        return state.claim;
     }
   };
 
@@ -152,13 +169,13 @@ export function createCoordinatorAccountRuntime<Status extends CoordinatorAuthSt
   };
 
   const activateSession = (args: {
-    readonly slot: string;
+    readonly claim: CoordinatorRuntimeClaim;
     readonly session: CoordinatorRuntime;
     readonly version: number;
   }): void => {
     state = {
       kind: "active",
-      slot: args.slot,
+      claim: args.claim,
       session: args.session,
       appliedVersion: args.version,
       rendererRequestRevoked: false,
@@ -204,18 +221,20 @@ export function createCoordinatorAccountRuntime<Status extends CoordinatorAuthSt
     }
   };
 
-  const startForAccount = async (
-    slot: string,
+  const startForClaim = async (
+    claim: CoordinatorRuntimeClaim,
     context: CoordinatorAccountTransition,
     version: number,
   ): Promise<StartOutcome<Status>> => {
-    let authorized = false;
-    try {
-      authorized = await dependencies.authorizeAccount(slot, context);
-    } catch (error) {
-      dependencies.onProblem(
-        `account authorization for coordinator failed: ${String(error)}`,
-      );
+    let authorized = claim.kind === "local-workspace";
+    if (claim.kind === "account") {
+      try {
+        authorized = await dependencies.authorizeAccount(claim.slot, context);
+      } catch (error) {
+        dependencies.onProblem(
+          `account authorization for coordinator failed: ${String(error)}`,
+        );
+      }
     }
     if (version !== observedVersion) return { kind: "superseded" };
     if (!authorized) {
@@ -242,12 +261,12 @@ export function createCoordinatorAccountRuntime<Status extends CoordinatorAuthSt
     if (isDisposed()) return { kind: "disposed" };
     let session: CoordinatorRuntime;
     try {
-      session = dependencies.createRuntime();
+      session = dependencies.createRuntime(claim);
     } catch (error) {
       dependencies.onProblem(`coordinator launch failed: ${String(error)}`);
       return { kind: "launch-failed" };
     }
-    activateSession({ slot, session, version });
+    activateSession({ claim, session, version });
     return { kind: "accepted" };
   };
 
@@ -259,8 +278,12 @@ export function createCoordinatorAccountRuntime<Status extends CoordinatorAuthSt
     }
   };
 
-  const settleObservedStatus = (status: Status): void => {
+  const settleObservedStatus = (
+    status: Status,
+    claim: CoordinatorRuntimeClaim | null,
+  ): void => {
     settledStatus = status;
+    settledClaim = claim;
     deliver(status);
   };
 
@@ -269,46 +292,54 @@ export function createCoordinatorAccountRuntime<Status extends CoordinatorAuthSt
       if (state.kind !== "blocked") return;
       const blocked = state;
       const version = observedVersion;
-      const nextSlot = cursorAccountSlot(settledStatus);
-      if (nextSlot === null || nextSlot !== blocked.slot) {
+      const nextClaim = settledClaim;
+      if (nextClaim === null || !sameClaim(nextClaim, blocked.claim)) {
         state = { kind: "inactive" };
         return;
       }
-      const outcome = await startForAccount(
-        nextSlot,
-        { isStartup: false, previousSlot: blocked.previousSlot },
+      const outcome = await startForClaim(
+        nextClaim,
+        {
+          isStartup: false,
+          previousSlot: blocked.previousClaim?.kind === "account"
+            ? blocked.previousClaim.slot
+            : blocked.previousClaim === undefined ? undefined : null,
+        },
         version,
       );
       if (isDisposed() || outcome.kind === "disposed") return;
       if (outcome.kind === "accepted") return;
       state = { kind: "inactive" };
-      if (outcome.kind === "refused") settleObservedStatus(outcome.status);
+      if (outcome.kind === "refused") settleObservedStatus(outcome.status, null);
     });
   }
 
   const applyClaim = async (
-    nextSlot: string | null,
+    nextClaim: CoordinatorRuntimeClaim | null,
     status: Status,
     isStartup: boolean,
     version: number,
-    settle: (status: Status) => void,
+    settle: (status: Status, claim: CoordinatorRuntimeClaim | null) => void,
   ): Promise<void> => {
     if (isDisposed()) return;
-    const previousSlot = accountSlot();
+    const previousClaim = runtimeClaim();
     if (state.kind === "blocked") {
-      state = { ...state, slot: nextSlot };
-      settle(status);
+      state = { ...state, claim: nextClaim };
+      settle(status, nextClaim);
       return;
     }
-    if (nextSlot === previousSlot) {
+    if (sameClaim(nextClaim, previousClaim)) {
       if (state.kind === "active") state = { ...state, appliedVersion: version };
-      settle(status);
+      settle(status, nextClaim);
       return;
     }
     revokeActiveRendererPortRequest();
-    if (previousSlot != null) {
+    if (previousClaim?.kind === "account") {
       try {
-        await dependencies.prepareAccountTransition({ previousSlot, nextSlot });
+        await dependencies.prepareAccountTransition({
+          previousSlot: previousClaim.slot,
+          nextSlot: nextClaim?.kind === "account" ? nextClaim.slot : null,
+        });
       } catch (error) {
         dependencies.onProblem(
           `account transition preparation failed: ${String(error)}`,
@@ -317,41 +348,46 @@ export function createCoordinatorAccountRuntime<Status extends CoordinatorAuthSt
     }
     if (isDisposed()) return;
     const stopping = stop(detachActive(), enqueueReplacementRecovery);
-    if (previousSlot !== undefined) {
+    if (previousClaim !== undefined) {
       try {
         dependencies.resetAccountState();
       } catch (error) {
         dependencies.onProblem(`account state reset failed: ${String(error)}`);
       }
     }
-    if (nextSlot === null) {
+    if (nextClaim === null) {
       state = { kind: "inactive" };
-      settle(status);
+      settle(status, null);
       if (!(await stopping) && !isDisposed()) {
-        state = { kind: "blocked", slot: null, previousSlot };
+        state = { kind: "blocked", claim: null, previousClaim };
       }
       return;
     }
     if (!(await stopping)) {
       if (!isDisposed()) {
-        state = { kind: "blocked", slot: nextSlot, previousSlot };
-        settle(status);
+        state = { kind: "blocked", claim: nextClaim, previousClaim };
+        settle(status, nextClaim);
       }
       return;
     }
-    const outcome = await startForAccount(
-      nextSlot,
-      { isStartup, previousSlot },
+    const outcome = await startForClaim(
+      nextClaim,
+      {
+        isStartup,
+        previousSlot: previousClaim?.kind === "account"
+          ? previousClaim.slot
+          : previousClaim === undefined ? undefined : null,
+      },
       version,
     );
     if (isDisposed() || outcome.kind === "disposed") return;
     if (outcome.kind === "accepted") {
-      settle(status);
+      settle(status, nextClaim);
       return;
     }
     state = { kind: "inactive" };
     if (outcome.kind === "superseded") return;
-    settle(outcome.kind === "refused" ? outcome.status : status);
+    settle(outcome.kind === "refused" ? outcome.status : status, null);
   };
 
   const waitForIdle = async (): Promise<Status> => {
@@ -364,12 +400,16 @@ export function createCoordinatorAccountRuntime<Status extends CoordinatorAuthSt
   };
 
   return {
-    async start(status) {
+    async start(status, suppliedClaim) {
       if (state.kind !== "unstarted") return;
+      const claim = suppliedClaim === undefined
+        ? cursorAccountClaim(status)
+        : suppliedClaim;
       startWork = (async () => {
         try {
-          await applyClaim(cursorAccountSlot(status), status, true, 0, (settled) => {
+          await applyClaim(claim, status, true, 0, (settled, settledRuntimeClaim) => {
             settledStatus = settled;
+            settledClaim = settledRuntimeClaim;
           });
         } finally {
           releaseStart();
@@ -377,15 +417,17 @@ export function createCoordinatorAccountRuntime<Status extends CoordinatorAuthSt
       })();
       await startWork;
     },
-    observe(status) {
+    observe(status, suppliedClaim) {
       if (isDisposed()) return;
       const version = ++observedVersion;
-      const nextSlot = cursorAccountSlot(status);
-      if (nextSlot !== accountSlot()) revokeActiveRendererPortRequest();
+      const nextClaim = suppliedClaim === undefined
+        ? cursorAccountClaim(status)
+        : suppliedClaim;
+      if (!sameClaim(nextClaim, runtimeClaim())) revokeActiveRendererPortRequest();
       chain = chain.then(async () => {
         await startArrived;
         if (isDisposed()) return;
-        await applyClaim(nextSlot, status, false, version, settleObservedStatus);
+        await applyClaim(nextClaim, status, false, version, settleObservedStatus);
       });
     },
     whenIdle: waitForIdle,

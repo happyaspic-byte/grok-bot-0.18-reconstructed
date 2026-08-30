@@ -3,6 +3,10 @@ import {
   parseCoordinatorAgentThreadRequest,
   parseCoordinatorTranscriptWindowRequest,
 } from "../shared/rpc/coordinator.js";
+import {
+  clearCliProxyCredentialLease,
+  installCliProxyCredentialLease,
+} from "./extensions/inference/cli-proxy-credential-lease.js";
 
 export const HOST_CAPABILITIES = [
   "orderedReplicasV1",
@@ -180,6 +184,9 @@ export function createHostGatewayApi(
       if (request == null) throw new Error("Malformed getAgentThread request");
       return method(manager, "getAgentThread")(request.id, request.rootId);
     },
+
+    leaseCliProxyCredential: (args: any) =>
+      installCliProxyCredentialLease(args?.config),
 
     sendPrompt: async (args: any) => {
       const agentId =
@@ -616,6 +623,12 @@ export function createHostGatewayApi(
     readAttachmentChunk: (args: any) => method(attachments, "readChunk")(args),
     getHostSettings: () => method(settings, "getHostSettings")(),
     setHostSettings: (args: any) => {
+      if (
+        args?.clearCliProxyCredentialLease === true
+        || (args?.inferenceProvider !== undefined && args.inferenceProvider !== "cli-proxy")
+      ) {
+        clearCliProxyCredentialLease();
+      }
       const result = method(settings, "setHostSettings")(args);
       if (args.localToolPermission !== undefined) {
         method(localToolPermission, "notePermissionChanged")();

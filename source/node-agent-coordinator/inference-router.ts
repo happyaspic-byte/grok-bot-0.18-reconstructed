@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { runRoutedProviderText } from "../host/extensions/inference/provider-session.js";
+import type { SandBoxRuntime } from "../shared/box-runtime.js";
 import type { SandInferenceProvider } from "../shared/inference-router.js";
 import { SandSettingsStore } from "../shared/node/settings/sand-settings-store.js";
 import { createRoutedMcpBridge } from "./routed-mcp-bridge.js";
@@ -50,6 +51,10 @@ export function projectInferenceRouterTranscriptEntry(entry: StoredEntry): Recor
     : { kind: "send-message", id: entry.id, message: { type: "text", content: entry.content }, timestampMs: entry.timestampMs, ...(entry.reactions === undefined ? {} : { reactions: entry.reactions }) };
 }
 
+export function shouldUseNativeCliProxyHost(provider: SandInferenceProvider, boxRuntime: SandBoxRuntime): boolean {
+  return provider === "cli-proxy" && boxRuntime === "local-docker";
+}
+
 export function createCoordinatorInferenceRouter(options: {
   readonly dataDir: string;
   readonly postEvent: (family: string, payload: unknown) => void;
@@ -87,7 +92,7 @@ export function createCoordinatorInferenceRouter(options: {
         if (row?.id !== agentId) return raw;
         return { ...row, isRunning, isRunningTurn: isRunning, isComposingMessage: isRunning, isRetrying: false, ...(isRunning ? { currentActivity: { kind: "thinking" } } : { currentActivity: undefined }) };
       });
-      const publishRunning = () => options.postEvent("agents", { activeAgentId: agentId, agents: project(true) });
+      const publishRunning = () => options.postEvent("agents", project(true));
       publishRunning();
       // Transcript refreshes can fetch the remote (idle) roster while a local CLI turn is
       // running. Pulse the locally authoritative state until the turn settles so those
@@ -96,7 +101,7 @@ export function createCoordinatorInferenceRouter(options: {
       pulse.unref();
       return () => {
         clearInterval(pulse);
-        options.postEvent("agents", { activeAgentId: agentId, agents: project(false) });
+        options.postEvent("agents", project(false));
       };
     } catch { return () => {}; }
   };
@@ -192,7 +197,8 @@ export function createCoordinatorInferenceRouter(options: {
     provider(): SandInferenceProvider { return settings.getInferenceProvider(); },
     async dispatch(method: string, args: unknown): Promise<{ handled: boolean; value?: unknown }> {
       const provider = settings.getInferenceProvider();
-      if (method === "reactToMessage") {
+      const usesNativeCliProxyHost = shouldUseNativeCliProxyHost(provider, settings.getBoxRuntime());
+      if (!usesNativeCliProxyHost && method === "reactToMessage") {
         const record = asRecord(args) ?? {};
         const agentId = typeof record.agentId === "string" ? record.agentId : "";
         const entryId = typeof record.entryId === "string" ? record.entryId : "";
@@ -203,7 +209,7 @@ export function createCoordinatorInferenceRouter(options: {
           return { handled: true, value: undefined };
         }
       }
-      if (provider !== "cursor" && ["getAgentTranscriptTail", "openAgentTail", "getAgentTranscriptWindow"].includes(method)) {
+      if (!usesNativeCliProxyHost && provider !== "cursor" && ["getAgentTranscriptTail", "openAgentTail", "getAgentTranscriptWindow"].includes(method)) {
         const record = asRecord(args) ?? {};
         const agentId = typeof record.id === "string" ? record.id : "";
         const [remote, local] = await Promise.all([options.dispatchRemote(method, args), load()]);
@@ -214,6 +220,13 @@ export function createCoordinatorInferenceRouter(options: {
         return { handled: true, value: { ...result, entries: entries.slice(-limit) } };
       }
       if (method !== "sendPrompt" || provider === "cursor") return { handled: false };
+      if (usesNativeCliProxyHost) {
+        // Electron main serializes the complete host resync and memory-only
+        // credential lease with provider/key transitions. The native host may
+        // receive sendPrompt only after that fail-closed preparation succeeds.
+        await options.dispatchRemote("prepareCliProxyNativeTurn", {});
+        return { handled: false };
+      }
       const record = asRecord(args) ?? {};
       const agentId = typeof record.agentId === "string" ? record.agentId : "";
       const previous = queues.get(agentId) ?? Promise.resolve();

@@ -10,6 +10,7 @@ import {
   type CoordinatorAccountTransition,
   type CoordinatorAuthStatus,
   type CoordinatorRefusedAccountResult,
+  type CoordinatorRuntimeClaim,
 } from "./coordinator-account-runtime.js";
 import {
   createCoordinatorControlExecutors,
@@ -44,9 +45,27 @@ import {
 } from "./coordinator-telemetry.js";
 import { createElectronDesktopConnectivity } from "./desktop-connectivity.js";
 import type { BoxConnectionInfo } from "../../shared/node/egress-tunnel/box-connection.js";
+import {
+  LOCAL_9ROUTER_WORKSPACE_ID,
+  resolveLocal9RouterWorkspaceClaim,
+  type LocalWorkspaceStatus,
+  type ProductionLocalWorkspaceControl,
+} from "./local-workspace.js";
+
+export {
+  LOCAL_9ROUTER_WORKSPACE_ID,
+  resolveLocal9RouterWorkspaceClaim,
+  type LocalWorkspaceStatus,
+  type ProductionLocalWorkspaceControl,
+} from "./local-workspace.js";
 
 export interface ProductionCoordinatorAuthStatus extends CoordinatorAuthStatus {
   readonly isAnysphereUser?: boolean;
+}
+
+export interface ProductionCoordinatorWithLocalWorkspace
+  extends ProductionCoordinatorService {
+  readonly localWorkspace: ProductionLocalWorkspaceControl;
 }
 
 export interface ProductionCoordinatorUtilityProcess {
@@ -163,6 +182,7 @@ export interface ProductionCoordinatorPorts<Status extends ProductionCoordinator
     setMcpDisabledToolsByServerId(value: DisabledToolsByServer): void;
     detectTimeZone(): string | null | undefined;
     getUserTimeZoneOverride(): string | null | undefined;
+    getInferenceProvider(): unknown;
     getComputerUseModel(): unknown;
     getAutoReviewInstructions(): unknown;
     getLocalToolPermission(): unknown;
@@ -206,7 +226,7 @@ export interface ProductionCoordinatorPorts<Status extends ProductionCoordinator
 }
 
 export interface ProductionCoordinatorAdapter {
-  create(context: ProductionServiceContext): ProductionCoordinatorService;
+  create(context: ProductionServiceContext): ProductionCoordinatorWithLocalWorkspace;
   requestRendererPort(sink: (port: CoordinatorMessagePort) => void): void;
 }
 
@@ -229,6 +249,16 @@ function assertCoordinatorArtifact(artifactPath: string): void {
       `Production coordinator artifact is missing or is not a file: ${artifactPath}`,
     );
   }
+}
+
+function accountRuntimeClaim(
+  status: ProductionCoordinatorAuthStatus,
+): CoordinatorRuntimeClaim | null {
+  if (status.kind !== "logged-in") return null;
+  const slot = status.authId ?? status.email;
+  return slot == null || slot.length === 0
+    ? null
+    : { kind: "account", slot };
 }
 
 function validateProductionPorts<Status extends ProductionCoordinatorAuthStatus>(
@@ -278,6 +308,7 @@ function validateProductionPorts<Status extends ProductionCoordinatorAuthStatus>
     ports.resync?.getUserTimeZoneOverride,
     "user time-zone override reader",
   );
+  requiredFunction(ports.resync?.getInferenceProvider, "inference-provider reader");
   requiredFunction(ports.resync?.getComputerUseModel, "computer-use model reader");
   requiredFunction(
     ports.resync?.getAutoReviewInstructions,
@@ -397,6 +428,50 @@ export function createProductionCoordinatorAdapter<
       let focusedState = { isFocused: false };
       let disposed = false;
       let observationSequence = 0;
+      let localWorkspaceRequested = false;
+      let cliProxyCredentialMutationDepth = 0;
+      let localWorkspaceStatus: LocalWorkspaceStatus = { kind: "disabled" };
+      const localWorkspaceListeners = new Set<(
+        status: LocalWorkspaceStatus,
+      ) => void>();
+
+      const publishLocalWorkspaceStatus = (status: LocalWorkspaceStatus): void => {
+        if (
+          status.kind === localWorkspaceStatus.kind
+          && (status.kind === "disabled"
+            || status.workspaceId === (localWorkspaceStatus as { readonly workspaceId?: string }).workspaceId)
+        ) return;
+        localWorkspaceStatus = status;
+        for (const listener of localWorkspaceListeners) {
+          try { listener(status); }
+          catch (error) {
+            ports.reportFailure("coordinator-local-workspace", "status-listener", error);
+          }
+        }
+      };
+
+      const resolveRuntimeClaim = async (
+        status: Status,
+      ): Promise<CoordinatorRuntimeClaim | null> => {
+        let localClaim: CoordinatorRuntimeClaim | null = null;
+        try {
+          localClaim = await resolveLocal9RouterWorkspaceClaim({
+            status,
+            settings: context.settings.settingsStore,
+            cliProxyStatus: () => context.secretsStores.cliProxySecretStore.status(),
+          });
+        } catch (error) {
+          ports.reportFailure("coordinator-local-workspace", "eligibility", error);
+        }
+        return localClaim ?? accountRuntimeClaim(status);
+      };
+
+      const applyRuntimeClaimState = (
+        claim: CoordinatorRuntimeClaim | null,
+      ): void => {
+        localWorkspaceRequested = claim?.kind === "local-workspace";
+        if (!localWorkspaceRequested) publishLocalWorkspaceStatus({ kind: "disabled" });
+      };
 
       const syncWindowFocused = () =>
         context.coordinatorLegs.legs.setWindowFocused!(focusedState);
@@ -424,9 +499,28 @@ export function createProductionCoordinatorAdapter<
         listRoutedMcpTools: () => context.requireMcp().listRoutedTools(),
         executeRoutedMcpTool: (request) => context.requireMcp().executeRoutedTool(request),
         getCliProxyTurnConfig: () => context.secretsStores.cliProxySecretStore.getTurnConfig(),
+        prepareCliProxyNativeTurn: () => resync.withSuccessfulResync(async () => {
+          const assertEligible = (): void => {
+            if (cliProxyCredentialMutationDepth > 0) {
+              throw new Error("9Router credentials are being changed; retry the turn.");
+            }
+            if (
+              context.settings.settingsStore.getInferenceProvider() !== "cli-proxy"
+              || context.settings.settingsStore.getBoxRuntime() !== "local-docker"
+            ) {
+              throw new Error("Native 9Router routing is no longer selected.");
+            }
+          };
+          assertEligible();
+          const config = await context.secretsStores.cliProxySecretStore.getTurnConfig();
+          assertEligible();
+          const leaseCliProxyCredential = context.coordinatorLegs.legs.leaseCliProxyCredential;
+          requiredFunction(leaseCliProxyCredential, "coordinator leaseCliProxyCredential()");
+          return await leaseCliProxyCredential({ config });
+        }),
         native: ports.localExecNative,
       });
-      const createRuntime = () =>
+      const createRuntime = (claim: CoordinatorRuntimeClaim) =>
         createCoordinatorRuntime({
           fork: (path, options) =>
             ports.utilityProcess.fork(path, [], { serviceName: options.serviceName }),
@@ -443,12 +537,28 @@ export function createProductionCoordinatorAdapter<
               void Promise.resolve(ports.telemetry.flushNow()).catch((error) =>
                 ports.reportFailure("coordinator", "connect-flush", error),
               );
-              void resync.onTransportConnected();
+              void resync.onTransportConnected().then((summary) => {
+                if (claim.kind !== "local-workspace" || !localWorkspaceRequested) return;
+                if (summary.failedSteps.length > 0) {
+                  publishLocalWorkspaceStatus({ kind: "disabled" });
+                  return;
+                }
+                publishLocalWorkspaceStatus({
+                  kind: "ready",
+                  workspaceId: LOCAL_9ROUTER_WORKSPACE_ID,
+                });
+              }).catch((error) => {
+                if (claim.kind === "local-workspace") publishLocalWorkspaceStatus({ kind: "disabled" });
+                ports.reportFailure("coordinator-local-workspace", "transport-resync", error);
+              });
               ports.resync.onHostSettingsTransportConnected();
               context.hostSettingsFields.onTransportConnected();
             },
             "transport-down": (payload) => {
               telemetry.transportStream.onDown(payload);
+              if (claim.kind === "local-workspace") {
+                publishLocalWorkspaceStatus({ kind: "disabled" });
+              }
               ports.resync.onHostSettingsTransportDown();
               context.hostSettingsFields.setBoxStreamLive(false);
             },
@@ -497,17 +607,39 @@ export function createProductionCoordinatorAdapter<
       });
       active = accountRuntime;
 
+      const refreshLocalWorkspace = async (
+        restartAfterRefresh: boolean,
+      ): Promise<LocalWorkspaceStatus> => {
+        const sequence = ++observationSequence;
+        try {
+          const status = await accountService.getStatus() as Status;
+          const claim = await resolveRuntimeClaim(status);
+          if (disposed || sequence !== observationSequence) return localWorkspaceStatus;
+          applyRuntimeClaimState(claim);
+          accountRuntime.observe(status, claim);
+          await accountRuntime.whenIdle();
+          if (restartAfterRefresh && !disposed && sequence === observationSequence) {
+            await accountRuntime.restart();
+          }
+        } catch (error) {
+          ports.reportFailure("coordinator-local-workspace", "refresh", error);
+          publishLocalWorkspaceStatus({ kind: "disabled" });
+        }
+        return localWorkspaceStatus;
+      };
+
       let unsubscribe: () => void;
       try {
         unsubscribe = accountService.subscribe(() => {
           const sequence = ++observationSequence;
-          void accountService.getStatus().then(
-            (status) => {
-              if (disposed || sequence !== observationSequence) return;
-              accountRuntime.observe(status as Status);
-            },
-            (error) =>
-              ports.reportFailure("coordinator-account", "status-refresh", error),
+          void accountService.getStatus().then(async (status) => {
+            const typedStatus = status as Status;
+            const claim = await resolveRuntimeClaim(typedStatus);
+            if (disposed || sequence !== observationSequence) return;
+            applyRuntimeClaimState(claim);
+            accountRuntime.observe(typedStatus, claim);
+          }).catch((error) =>
+            ports.reportFailure("coordinator-account", "status-refresh", error),
           );
         });
       } catch (error) {
@@ -524,9 +656,22 @@ export function createProductionCoordinatorAdapter<
       }
 
       return {
-        start: (status) => accountRuntime.start(status as Status),
+        start: async (status) => {
+          const typedStatus = status as Status;
+          const claim = await resolveRuntimeClaim(typedStatus);
+          applyRuntimeClaimState(claim);
+          await accountRuntime.start(typedStatus, claim);
+        },
         getAccountRuntime: () => active,
-        restartCoordinator: () => { void active?.restart(); },
+        restartCoordinator: () => { void refreshLocalWorkspace(true); },
+        localWorkspace: {
+          getStatus: () => localWorkspaceStatus,
+          refresh: () => refreshLocalWorkspace(false),
+          onStatusChanged(listener) {
+            localWorkspaceListeners.add(listener);
+            return () => { localWorkspaceListeners.delete(listener); };
+          },
+        },
         getTelemetryReportPipes: () => ({
           agentsUnreachable: telemetry.agentsUnreachable,
           recoveryAction: telemetry.recoveryAction,
@@ -536,6 +681,13 @@ export function createProductionCoordinatorAdapter<
           resyncCompleted: telemetry.resyncCompleted,
         }),
         pushHostSettings: (update) => resync.pushHostSettings(update),
+        pushHostSettingsStrict: (update) => resync.pushHostSettingsStrict(update),
+        beginCliProxyCredentialMutation() {
+          cliProxyCredentialMutationDepth += 1;
+        },
+        endCliProxyCredentialMutation() {
+          cliProxyCredentialMutationDepth = Math.max(0, cliProxyCredentialMutationDepth - 1);
+        },
         readHostSettings: async () => {
           const getHostSettings = context.coordinatorLegs.legs.getHostSettings;
           requiredFunction(getHostSettings, "coordinator getHostSettings()");
@@ -550,6 +702,9 @@ export function createProductionCoordinatorAdapter<
           disposed = true;
           observationSequence += 1;
           unsubscribe();
+          localWorkspaceRequested = false;
+          publishLocalWorkspaceStatus({ kind: "disabled" });
+          localWorkspaceListeners.clear();
           prompt.finish();
           if (active === accountRuntime) active = undefined;
           await accountRuntime.dispose();

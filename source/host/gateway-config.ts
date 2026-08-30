@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { lstatSync, readFileSync, type Stats } from "node:fs";
 
 export class SandGatewayConfigError extends Error {
   constructor(message: string) { super(message); this.name = "SandGatewayConfigError"; }
@@ -38,6 +38,35 @@ function resolveTls(env: NodeJS.ProcessEnv): GatewayServerConfig["tls"] {
   catch (error) { throw new SandGatewayConfigError(`Failed to read gateway TLS cert/key (${certPath}, ${keyPath}): ${String(error)}`); }
 }
 
+function normalizedGatewayToken(value: string, source: string): string {
+  const token = value.trim();
+  if (!/^[A-Za-z0-9_-]{32,256}$/.test(token)) throw new SandGatewayConfigError(`${source} did not contain a valid gateway token.`);
+  return token;
+}
+
+export function readPrivateGatewayTokenFile(
+  target: string,
+  options: {
+    readonly lstat?: (path: string) => Stats;
+    readonly readFile?: (path: string) => string;
+    readonly currentUid?: number;
+    readonly platform?: NodeJS.Platform;
+  } = {},
+): string {
+  try {
+    const state = (options.lstat ?? lstatSync)(target);
+    if (state.isSymbolicLink() || !state.isFile()) throw new Error("not a direct regular file");
+    if ((options.platform ?? process.platform) !== "win32") {
+      const currentUid = options.currentUid ?? process.getuid?.();
+      if (currentUid == null || state.uid !== currentUid || (state.mode & 0o077) !== 0) throw new Error("owner or mode mismatch");
+    }
+    return normalizedGatewayToken((options.readFile ?? ((path: string) => readFileSync(path, "utf8")))(target), "The gateway token file");
+  } catch (error) {
+    if (error instanceof SandGatewayConfigError) throw error;
+    throw new SandGatewayConfigError(`Failed to read the private gateway token file ${target}.`);
+  }
+}
+
 export function resolveGatewayServerConfig(
   env: NodeJS.ProcessEnv = process.env,
   generateToken: () => string = () => randomBytes(32).toString("base64url")
@@ -45,7 +74,12 @@ export function resolveGatewayServerConfig(
   const host = env.SAND_GATEWAY_BIND_HOST?.trim() || "127.0.0.1";
   const port = readPort(env.SAND_HOST_PORT);
   const tls = resolveTls(env);
-  const pinnedToken = env.SAND_GATEWAY_TOKEN?.trim();
+  const directToken = env.SAND_GATEWAY_TOKEN?.trim();
+  const tokenFile = env.SAND_GATEWAY_TOKEN_FILE?.trim();
+  if (directToken && tokenFile) throw new SandGatewayConfigError("Gateway authentication must use either a direct token or a token file, not both.");
+  const pinnedToken = tokenFile
+    ? readPrivateGatewayTokenFile(tokenFile)
+    : directToken == null || directToken.length === 0 ? undefined : normalizedGatewayToken(directToken, "SAND_GATEWAY_TOKEN");
   const requireAuth = !isLoopbackHost(host) || isTruthyEnv(env.SAND_GATEWAY_REQUIRE_AUTH) || (pinnedToken != null && pinnedToken.length > 0);
   const authToken = requireAuth ? (pinnedToken != null && pinnedToken.length > 0 ? pinnedToken : generateToken()) : undefined;
   return { host, ...(port === undefined ? {} : { port }), ...(authToken === undefined ? {} : { authToken }), ...(tls === undefined ? {} : { tls }) };

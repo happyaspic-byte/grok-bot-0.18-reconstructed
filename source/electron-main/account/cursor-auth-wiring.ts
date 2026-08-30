@@ -33,6 +33,8 @@ export function createCursorAuthWiring(deps: {
   readonly updateProfileName?: (getAccessToken: AccessTokenReader, name: string) => Promise<void>;
   readonly reportSessionSettlement?: SandCursorAuthServiceOptions["reportSessionSettlement"];
   readonly getAccountRuntime: () => AccountRuntime | null | undefined;
+  /** The production coordinator resolves local-workspace claims before it observes auth state. */
+  readonly runtimeObservationOwner?: "auth-wiring" | "coordinator";
   readonly emitAuthStatus: (status: SandAuthStatus & { readonly freshness: number }) => void;
   readonly sentryEnabled: boolean;
   readonly syncSentryAccount?: (status: SandAuthStatus, privacyMode: () => Promise<unknown>) => void | Promise<void>;
@@ -93,7 +95,7 @@ export function createCursorAuthWiring(deps: {
     unsubscribeAuthStatus = service.subscribe((status) => {
       const runtime = deps.getAccountRuntime();
       if (runtime == null) deliverCursorAuthStatus(service, status);
-      else runtime.observe(status);
+      else if (deps.runtimeObservationOwner !== "coordinator") runtime.observe(status);
     });
     cursorAuthService = service;
     if (deps.sentryEnabled) void service.getStatus().then((status) => syncSentryAccount(status, () => readPrivacyMode((options) => service.getValidAccessToken(options))));

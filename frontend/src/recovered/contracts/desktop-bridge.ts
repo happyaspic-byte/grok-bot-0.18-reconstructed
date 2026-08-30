@@ -355,6 +355,22 @@ export interface TelemetryDesktopBridge {
   noteSentryConversation(report: unknown): void;
 }
 
+export type DesktopBoxRuntimeMode = "remote" | "local-docker";
+
+export interface DesktopLocalDockerStatus {
+  readonly available: boolean;
+  readonly running: boolean;
+  readonly ready: boolean;
+  readonly containerName: string;
+  readonly image: string;
+  readonly detail: string;
+}
+
+export interface DesktopBoxRuntimeState {
+  readonly mode: DesktopBoxRuntimeMode;
+  readonly status: DesktopLocalDockerStatus | null;
+}
+
 export interface AgentDesktopBridge {
   getPinnedAgents(): Promise<string[] | null>;
   setPinnedAgents(pinnedAgentIds: readonly string[]): Promise<string[] | null>;
@@ -367,6 +383,8 @@ export interface AgentDesktopBridge {
   getAvailableModels(): Promise<unknown>;
   getInferenceRouter(): Promise<unknown>;
   setInferenceRouter(provider: string): Promise<unknown>;
+  getBoxRuntime(): Promise<DesktopBoxRuntimeState>;
+  setBoxRuntime(mode: DesktopBoxRuntimeMode): Promise<DesktopBoxRuntimeState>;
   clientPersistence: {
     read(key: string): Promise<string | null>;
     write(key: string, value: string): Promise<void>;

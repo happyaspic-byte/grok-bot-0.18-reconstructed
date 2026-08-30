@@ -1,6 +1,6 @@
 import type { SpawnOptions } from "node:child_process";
 
-import { scrubSocketEnvVars } from "../env-filter.js";
+import { filterElectronEnv, scrubSocketEnvVars } from "../env-filter.js";
 import { withConfiguredRipgrepEnv } from "../ripgrep.js";
 import { isNetworkEnabledByPolicy, type NetworkPolicy } from "./network-policy-utils.js";
 
@@ -95,10 +95,10 @@ export function buildSandboxArgv(
 }
 
 export function buildSandboxChildEnvironment(optionsEnv?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const baseEnv = process.platform === "linux" ? scrubSocketEnvVars(process.env) : process.env;
+  const baseEnv = filterElectronEnv(process.platform === "linux" ? scrubSocketEnvVars(process.env) : process.env);
   const environment = process.platform === "linux" && optionsEnv !== undefined
-    ? scrubSocketEnvVars(optionsEnv)
-    : optionsEnv;
+    ? filterElectronEnv(scrubSocketEnvVars(optionsEnv))
+    : optionsEnv === undefined ? undefined : filterElectronEnv(optionsEnv);
   const mergedEnv: NodeJS.ProcessEnv = {
     ...baseEnv,
     ...environment,

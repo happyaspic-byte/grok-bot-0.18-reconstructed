@@ -102,7 +102,7 @@ function buildPreflightInvocation(ctx: Context, cwd: string): PreflightInvocatio
   const binaryPath = String(getSandboxBinary());
   logger.info(ctx, `[sandboxPreflight] Running preflight with binary: ${binaryPath}`);
   logger.info(ctx, `[sandboxPreflight] CWD: ${cwd}`);
-  const env = { ...process.env };
+  const env = filterElectronEnv(process.env);
   applyConfiguredRipgrepToSandboxEnv(env);
   const policyFilePath = writeSandboxPolicyFile(JSON.stringify(unifiedPolicy));
   return {
@@ -267,8 +267,10 @@ export function spawnWithSandboxHelperPolicy(
   }
   const policyFilePath = writeSandboxPolicyFile(JSON.stringify(unifiedPolicy));
   const sandboxArgs = ["--policy", policyFilePath, "--", actualCommand, ...actualArgs];
-  const baseEnv = process.platform === "linux" ? scrubSocketEnvVars(process.env) : process.env;
-  const optionsEnv = process.platform === "linux" && options.env !== undefined ? scrubSocketEnvVars(options.env) : options.env;
+  const baseEnv = filterElectronEnv(process.platform === "linux" ? scrubSocketEnvVars(process.env) : process.env);
+  const optionsEnv = process.platform === "linux" && options.env !== undefined
+    ? filterElectronEnv(scrubSocketEnvVars(options.env))
+    : options.env === undefined ? undefined : filterElectronEnv(options.env);
   const mergedEnv: NodeJS.ProcessEnv = {
     ...baseEnv,
     ...optionsEnv,

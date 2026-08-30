@@ -127,6 +127,10 @@ function derivedLastMessage(entry: RendererAgentLastEntry | null, fallback: unkn
 }
 
 export function projectRendererAgent(value: unknown, now = Date.now()): RendererAgent | null {
+  // Native host roster deltas use { activeAgentId, agent, ordered }. Keep
+  // direct RPC results source-compatible while accepting that transport
+  // envelope at the renderer boundary.
+  if (isRecord(value) && stringValue(value.id) == null && isRecord(value.agent)) value = value.agent;
   if (!isRecord(value)) return null;
   const id = stringValue(value.id);
   if (id == null) return null;
@@ -173,8 +177,14 @@ export function projectRendererAgent(value: unknown, now = Date.now()): Renderer
 }
 
 export function projectRendererAgents(value: unknown, now = Date.now()): RendererAgent[] {
-  if (!Array.isArray(value)) return [];
-  return value
+  // Native host full-roster events use { activeAgentId, agents, ... }, while
+  // listAgents and the recovered fallback return the array directly.
+  const roster = Array.isArray(value)
+    ? value
+    : isRecord(value) && Array.isArray(value.agents)
+      ? value.agents
+      : [];
+  return roster
     .map((agent) => projectRendererAgent(agent, now))
     .filter((agent): agent is RendererAgent => agent != null)
     .sort((left, right) => right.updatedAt - left.updatedAt);
