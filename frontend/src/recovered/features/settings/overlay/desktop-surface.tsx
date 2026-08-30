@@ -41,6 +41,7 @@ import {
   isLocalWorkspaceClaimReady,
   localWorkspaceConfigurationReady,
   readLocalWorkspaceReadiness,
+  reconcileSettingsLocalWorkspaceClaim,
   type LocalWorkspaceReadiness
 } from "../../../../production/local-workspace";
 
@@ -102,15 +103,27 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
   const [cliProxyPending, setCliProxyPending] = useState(false);
   const [localWorkspaceReadiness, setLocalWorkspaceReadiness] = useState<LocalWorkspaceReadiness>({ kind: "checking" });
   const [localWorkspaceError, setLocalWorkspaceError] = useState<string | null>(null);
-  const initialLocalWorkspaceClaimRef = useRef<DesktopLocalWorkspaceStatus>(initialLocalWorkspace?.kind === "ready"
+  const localWorkspaceClaimRef = useRef<DesktopLocalWorkspaceStatus>(initialLocalWorkspace?.kind === "ready"
     ? { kind: "ready", workspaceId: initialLocalWorkspace.workspaceId }
     : { kind: "disabled" });
-  const localWorkspaceClaimRef = useRef<DesktopLocalWorkspaceStatus>(initialLocalWorkspaceClaimRef.current);
+  const settingsWasOpenRef = useRef(false);
+  const onNoticeRef = useRef(onNotice);
+  onNoticeRef.current = onNotice;
   const handleCancelTrialDialogOpen = useCallback((open: boolean) => setCancelTrialDialogOpen(open), []);
   const handleNotice = useCallback((event: SettingsNoticeEvent) => {
     setSurfaceNotice(settingsNoticeFromEvent(event));
-    onNotice?.(event);
-  }, [onNotice]);
+    onNoticeRef.current?.(event);
+  }, []);
+  useEffect(() => {
+    const wasOpen = settingsWasOpenRef.current;
+    settingsWasOpenRef.current = isOpen;
+    localWorkspaceClaimRef.current = reconcileSettingsLocalWorkspaceClaim(
+      localWorkspaceClaimRef.current,
+      initialLocalWorkspace,
+      wasOpen,
+      isOpen
+    );
+  }, [initialLocalWorkspace, isOpen]);
   const refreshLocalWorkspace = useCallback(async (
     notifyRenderer = true,
     claimStatus: DesktopLocalWorkspaceStatus = localWorkspaceClaimRef.current
@@ -130,7 +143,6 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
     let active = true;
     setLocalWorkspaceReadiness({ kind: "checking" });
     setLocalWorkspaceError(null);
-    localWorkspaceClaimRef.current = initialLocalWorkspaceClaimRef.current;
     setBoxRuntimeError(null);
     let unsubscribe = () => {};
     setSnapshot(null);
@@ -234,9 +246,10 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
       if (!active) return;
       setLocalWorkspaceError(reason instanceof Error ? reason.message : String(reason));
     });
-    const unsubscribeCoordinator = coordinatorClient?.subscribeTransport((state) => {
+    const unsubscribeCoordinator = coordinatorClient?.subscribeTransport((_state) => {
       if (!active) return;
-      if (state === "down") localWorkspaceClaimRef.current = { kind: "disabled" };
+      // Transport loss fails the coordinator check without revoking the
+      // authoritative claim returned by the main-process activation.
       void refreshLocalWorkspace(false).catch((reason: unknown) => {
         if (active) setLocalWorkspaceError(reason instanceof Error ? reason.message : String(reason));
       });

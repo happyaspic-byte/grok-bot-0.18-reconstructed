@@ -20,7 +20,7 @@ async function loadModules() {
   await build({
     stdin: {
       contents: `
-        export { createCoordinatorConnectionController } from "./frontend/src/recovered/features/root-resilience/connection-state.ts";
+        export { createCoordinatorConnectionController, createCoordinatorConnectionSource } from "./frontend/src/recovered/features/root-resilience/connection-state.ts";
         export { createComputerRebuildTransportStore } from "./frontend/src/recovered/features/access/cover/computer-rebuild-transport-store.ts";
         export { initialComputerRebuildState } from "./frontend/src/recovered/features/access/cover/computer-rebuild-model.ts";
       `,
@@ -67,6 +67,35 @@ function transportSource(initialState = "down") {
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test("connection source reads coordinator readiness lazily", async () => {
+  const loaded = await loadModules();
+  try {
+    const first = Promise.withResolvers();
+    const second = Promise.withResolvers();
+    void first.promise.catch(() => {});
+    let currentReady = first.promise;
+    const source = loaded.module.createCoordinatorConnectionSource({
+      get ready() { return currentReady; },
+      getTransportState: () => "down",
+      subscribeTransport: () => () => {},
+    }, {
+      cursorAccount: {
+        getStatus: async () => ({ kind: "logged-out" }),
+        onStatusChanged: () => () => {},
+      },
+    }, async () => {});
+
+    assert.equal(source.ready, first.promise);
+    currentReady = second.promise;
+    assert.equal(source.ready, second.promise, "the adapter must not retain an obsolete readiness promise");
+    first.reject(new Error("replaced"));
+    second.resolve();
+    await source.ready;
+  } finally {
+    await loaded.dispose();
+  }
+});
 
 test("lifecycle ready hydrates the root connection controller from authoritative gateway state", async () => {
   const loaded = await loadModules();

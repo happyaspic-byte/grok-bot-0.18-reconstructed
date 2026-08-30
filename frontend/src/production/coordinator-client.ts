@@ -81,9 +81,23 @@ export function createCoordinatorClient(portBridge: CoordinatorPortBridge): Prod
     resolveReady = resolve;
     rejectReady = reject;
   });
-  const ready = makeReady();
-  let currentReady = ready;
-  ready.catch(() => {});
+  let currentReady = makeReady();
+  currentReady.catch(() => {});
+  const waitForCurrentReady = async (): Promise<void> => {
+    while (true) {
+      if (disposed) throw new Error("Coordinator client is disposed.");
+      const candidate = currentReady;
+      try {
+        await candidate;
+      } catch (error) {
+        if (disposed) throw error;
+        if (candidate !== currentReady) continue;
+        throw error;
+      }
+      if (disposed) throw new Error("Coordinator client is disposed.");
+      if (candidate === currentReady && port != null && serving) return;
+    }
+  };
 
   const publishTransport = (state: CoordinatorTransportState): void => {
     if (transportState === state) return;
@@ -180,7 +194,7 @@ export function createCoordinatorClient(portBridge: CoordinatorPortBridge): Prod
   };
 
   return {
-    ready,
+    get ready() { return waitForCurrentReady(); },
     call,
     getAgentTranscriptWindow: async (args) => await call("getAgentTranscriptWindow", args) as CoordinatorTranscriptWindowResponse,
     getAgentThread: async (args) => await call("getAgentThread", args) as CoordinatorAgentThreadResponse,

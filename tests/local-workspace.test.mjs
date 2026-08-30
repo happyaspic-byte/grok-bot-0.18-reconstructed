@@ -128,6 +128,49 @@ test("activation snapshots detect transport and claim changes during asynchronou
   }
 });
 
+test("settings claim survives rerenders and a transient coordinator replacement", async () => {
+  const loaded = await loadModule();
+  try {
+    const readyClaim = { kind: "ready", workspaceId: "local:9router" };
+    const initial = { kind: "checking" };
+    const opened = loaded.module.reconcileSettingsLocalWorkspaceClaim(
+      { kind: "disabled" },
+      initial,
+      false,
+      true,
+    );
+    assert.deepEqual(opened, { kind: "disabled" });
+
+    const rerendered = loaded.module.reconcileSettingsLocalWorkspaceClaim(
+      readyClaim,
+      initial,
+      true,
+      true,
+    );
+    assert.equal(rerendered, readyClaim, "an open-surface rerender must retain the activation claim");
+
+    const disconnected = await loaded.module.readLocalWorkspaceReadiness(bridge(), {
+      transportState: "down",
+      claimStatus: rerendered,
+    });
+    assert.equal(disconnected.kind, "disabled");
+    assert.deepEqual(disconnected.blockers.map((blocker) => blocker.code), ["coordinator-not-connected"]);
+
+    const reconnected = await loaded.module.readLocalWorkspaceReadiness(bridge(), {
+      transportState: "connected",
+      claimStatus: rerendered,
+    });
+    assert.equal(reconnected.kind, "ready", "the replacement connected edge must recover without a second claim");
+
+    const closed = loaded.module.reconcileSettingsLocalWorkspaceClaim(readyClaim, initial, true, false);
+    assert.equal(closed, readyClaim);
+    const reopened = loaded.module.reconcileSettingsLocalWorkspaceClaim(closed, initial, false, true);
+    assert.deepEqual(reopened, { kind: "disabled" }, "a real reopen may adopt the latest initial workspace state");
+  } finally {
+    await rm(loaded.directory, { recursive: true, force: true });
+  }
+});
+
 test("fresh activation fences an older result and publishes only the latest claim", async () => {
   const loaded = await loadModule();
   try {
@@ -251,6 +294,7 @@ test("workspace session prefers real login and never impersonates Cursor auth", 
 
 test("production renderer unlocks local core while keeping account-only surfaces gated", async () => {
   const renderer = await readFile(path.join(repoRoot, "frontend/src/production/ProductionRenderer.tsx"), "utf8");
+  const settings = await readFile(path.join(repoRoot, "frontend/src/recovered/features/settings/overlay/desktop-surface.tsx"), "utf8");
   assert.match(renderer, /const workspaceReady = workspaceSession\.kind === "ready"/);
   assert.match(renderer, /const transcriptAccountSlot = workspaceAccountSlot/);
   assert.match(renderer, /if \(!isCurrent\(\) \|\| !workspaceReadyRef\.current\) return/);
@@ -278,6 +322,14 @@ test("production renderer unlocks local core while keeping account-only surfaces
     "activation must capture the old port generation before reconnect and await the replacement afterward"
   );
   assert.match(renderer, /client\?\.getTransportState\(\) \?\? "down"/);
+  const clientLifecycleStart = renderer.indexOf("const lifecycleGeneration = ++clientLifecycleGenerationRef.current");
+  const clientTransportSubscription = renderer.indexOf("const stopTransport = client.subscribeTransport", clientLifecycleStart);
+  assert.ok(clientLifecycleStart >= 0 && clientTransportSubscription > clientLifecycleStart);
+  assert.doesNotMatch(
+    renderer.slice(clientLifecycleStart, clientTransportSubscription),
+    /client\.ready/,
+    "transport subscription must be the sole renderer transport-state writer"
+  );
   assert.match(renderer, /localWorkspaceActivationStateEqual\(observedActivation, activationState\(\)\)/);
   assert.match(renderer, /overlay === "settings" \|\| !localWorkspaceConfigurationReady\(next\)/);
   assert.match(renderer, /invalidateLocalWorkspaceActivationQueue\(localWorkspaceActivationQueueRef\.current, localWorkspaceClaimRef\);[\s\S]{0,100}setLocalWorkspace\(\{ kind: "checking" \}\)/);
@@ -290,5 +342,10 @@ test("production renderer unlocks local core while keeping account-only surfaces
   assert.match(renderer, /onActivateLocalWorkspace=\{activateFreshLocalWorkspace\}/);
   assert.match(renderer, /onInvalidateLocalWorkspace=\{invalidateRootLocalWorkspace\}/);
   assert.match(renderer, /onLocalWorkspaceReady=\{\(readiness\) => \{ localWorkspaceClaimRef\.current = \{ kind: "ready", workspaceId: readiness\.workspaceId \}; setLocalWorkspace\(readiness\); setOverlay\(null\); \}\}/);
+  assert.doesNotMatch(renderer, /if \(state === "down"\) localWorkspaceClaimRef\.current = \{ kind: "disabled" \}/);
+  assert.match(settings, /reconcileSettingsLocalWorkspaceClaim\([\s\S]{0,220}wasOpen,[\s\S]{0,80}isOpen/);
+  assert.match(settings, /onNoticeRef\.current\?\.\(event\)/);
+  assert.doesNotMatch(settings, /initialLocalWorkspaceClaimRef/);
+  assert.doesNotMatch(settings, /if \(state === "down"\) localWorkspaceClaimRef\.current = \{ kind: "disabled" \}/);
   assert.doesNotMatch(renderer, /setAccount\(\{\s*kind:\s*"logged-in"/);
 });

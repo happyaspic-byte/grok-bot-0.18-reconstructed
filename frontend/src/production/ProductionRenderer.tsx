@@ -2378,23 +2378,6 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
     const isCurrent = () => active
       && clientLifecycleGenerationRef.current === lifecycleGeneration
       && accountScopeGenerationRef.current === accountScopeGeneration;
-    client.ready.then(() => {
-      if (!isCurrent() || !workspaceReadyRef.current) return;
-      transportScopeGenerationRef.current += 1;
-      const state = client.getTransportState();
-      setTransport(state);
-      if (state === "connected") {
-        void refreshRoster().catch((error: unknown) => setNotice(error instanceof Error ? error.message : String(error)));
-        if (accountRef.current?.kind === "logged-in") void refreshAgentNetworkAvailability();
-      } else {
-        setRosterLoadFailed(true);
-      }
-    }, () => {
-      if (!isCurrent() || !workspaceReadyRef.current) return;
-      transportScopeGenerationRef.current += 1;
-      setTransport("down");
-      setRosterLoadFailed(true);
-    });
     const stopTransport = client.subscribeTransport((state) => {
       if (!isCurrent()) return;
       transportScopeGenerationRef.current += 1;
@@ -2877,7 +2860,8 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
         refreshAfterCurrentActivation(overlay !== "settings");
         return;
       }
-      localWorkspaceClaimRef.current = { kind: "disabled" };
+      // The connected check fails closed while the port is down. Preserve the
+      // main-process claim so the replacement connected edge can recover it.
       setLocalWorkspace({ kind: "checking" });
       if (overlay === "settings" || localWorkspaceActivationQueueRef.current.pending != null) {
         refreshAfterCurrentActivation();

@@ -171,6 +171,18 @@ export function localWorkspaceConfigurationReady(readiness: LocalWorkspaceReadin
   return LOCAL_WORKSPACE_CONFIGURATION_CHECKS.every((id) => readiness.checks.some((item) => item.id === id && item.ready));
 }
 
+export function reconcileSettingsLocalWorkspaceClaim(
+  currentClaim: DesktopLocalWorkspaceStatus,
+  initialLocalWorkspace: LocalWorkspaceReadiness | undefined,
+  wasOpen: boolean,
+  isOpen: boolean
+): DesktopLocalWorkspaceStatus {
+  if (!isOpen || wasOpen) return currentClaim;
+  return initialLocalWorkspace?.kind === "ready"
+    ? { kind: "ready", workspaceId: initialLocalWorkspace.workspaceId }
+    : { kind: "disabled" };
+}
+
 /**
  * Reads the persisted settings surfaces concurrently and combines them with
  * the main-process claim plus the coordinator client's replayed transport

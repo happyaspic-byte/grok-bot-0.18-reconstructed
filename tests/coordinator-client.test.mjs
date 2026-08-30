@@ -213,6 +213,52 @@ test("a replacement coordinator generation can serve calls after the first disco
   }
 });
 
+test("public readiness follows a coordinator port replaced before lifecycle ready", async () => {
+  const loaded = await loadClient();
+  try {
+    const ports = bridge();
+    const client = loaded.module.createCoordinatorClient(ports.source);
+    assert.ok(client);
+    const ready = client.ready;
+    let outcome = "pending";
+    void ready.then(
+      () => { outcome = "resolved"; },
+      () => { outcome = "rejected"; },
+    );
+
+    const first = transferredPort();
+    ports.deliver(first);
+    const second = transferredPort();
+    ports.deliver(second);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(outcome, "pending", "a recoverable pre-ready replacement must not reject public readiness");
+
+    second.emitMessage({ kind: "lifecycle", phase: "ready", protocolVersion: 1 });
+    second.emitMessage({ kind: "event", family: "coordinator-transport-state", payload: { state: "connected" } });
+    await ready;
+    assert.equal(outcome, "resolved");
+    assert.equal(client.getPortGeneration(), 2);
+    assert.equal(client.getTransportState(), "connected");
+    client.dispose();
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("public readiness rejects when the client is disposed before serving", async () => {
+  const loaded = await loadClient();
+  try {
+    const ports = bridge();
+    const client = loaded.module.createCoordinatorClient(ports.source);
+    assert.ok(client);
+    const ready = client.ready;
+    client.dispose();
+    await assert.rejects(ready, /coordinator source disposed|Coordinator client is disposed/);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
 test("coordinator serving replays an already-live gateway connection", async () => {
   const source = await readFile(
     path.join(repoRoot, "source/node-agent-coordinator/main.ts"),

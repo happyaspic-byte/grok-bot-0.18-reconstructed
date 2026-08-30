@@ -42,7 +42,7 @@ export function createCoordinatorConnectionSource(
   retry: () => Promise<unknown>
 ): CoordinatorConnectionSource {
   return {
-    ready: client.ready,
+    get ready() { return client.ready; },
     getTransportState: () => client.getTransportState(),
     getAccountStatus: () => bridge.cursorAccount.getStatus(),
     subscribeAccount: (listener) => bridge.cursorAccount.onStatusChanged(listener),
