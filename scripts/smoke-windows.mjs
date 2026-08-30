@@ -17,6 +17,9 @@ const delay = milliseconds => new Promise(resolve => setTimeout(resolve, millise
 const SMOKE_MODEL = "smoke/tool-capable-model";
 const SECOND_SMOKE_MODEL = "smoke/secondary-model";
 const SMOKE_CONTAINER = "grok-bot-local-vm";
+const RETRYABLE_TEMP_CLEANUP_ERRORS = new Set(["EBUSY", "EMFILE", "ENFILE", "ENOTEMPTY", "EPERM"]);
+const childClosePromises = new WeakMap();
+const childLaunchErrors = new WeakMap();
 
 async function waitForHarnessState(predicate, label, timeoutMs = 30_000) {
   const deadline = Date.now() + timeoutMs;
@@ -25,6 +28,22 @@ async function waitForHarnessState(predicate, label, timeoutMs = 30_000) {
     await delay(50);
   }
   throw new Error(label);
+}
+
+async function removeTemporaryDirectory(target, timeoutMs = 12_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      await rm(target, { recursive: true, force: true, maxRetries: 0 });
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!RETRYABLE_TEMP_CLEANUP_ERRORS.has(error?.code)) throw error;
+      await delay(250);
+    }
+  }
+  throw lastError ?? new Error(`Timed out removing Windows smoke temporary directory: ${target}`);
 }
 
 function parseArguments(argv) {
@@ -45,13 +64,18 @@ async function waitForDebugEndpoint(userDataDir, child, timeoutMs = 30_000) {
   const activePort = path.join(userDataDir, "DevToolsActivePort");
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    const launchError = childLaunchErrors.get(child);
+    if (launchError != null) throw new Error(`Portable process failed to launch: ${launchError.message}`, { cause: launchError });
     if (child.exitCode != null) throw new Error(`Portable process exited before renderer startup (${child.exitCode})`);
     if (await pathExists(activePort)) {
       const [line] = (await readFile(activePort, "utf8")).trim().split(/\r?\n/);
       const port = Number(line);
       if (Number.isInteger(port) && port > 0 && port <= 65535) {
         try {
-          const pages = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+          const remainingMs = Math.max(1, deadline - Date.now());
+          const pages = await (await fetch(`http://127.0.0.1:${port}/json/list`, {
+            signal: AbortSignal.timeout(Math.min(1_000, remainingMs)),
+          })).json();
           const page = pages.find(candidate => candidate.type === "page" && typeof candidate.webSocketDebuggerUrl === "string");
           if (page != null) return page.webSocketDebuggerUrl;
         } catch {
@@ -66,11 +90,16 @@ async function waitForDebugEndpoint(userDataDir, child, timeoutMs = 30_000) {
 
 async function connectCdp(endpoint) {
   const socket = new WebSocket(endpoint);
-  await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Timed out connecting to renderer debugger")), 10_000);
-    socket.once("open", () => { clearTimeout(timeout); resolve(); });
-    socket.once("error", error => { clearTimeout(timeout); reject(error); });
-  });
+  try {
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Timed out connecting to renderer debugger")), 10_000);
+      socket.once("open", () => { clearTimeout(timeout); resolve(); });
+      socket.once("error", error => { clearTimeout(timeout); reject(error); });
+    });
+  } catch (error) {
+    socket.terminate();
+    throw error;
+  }
   let id = 0;
   const request = (method, params = {}) => new Promise((resolve, reject) => {
     const requestId = ++id;
@@ -115,11 +144,28 @@ function processHasExited(child) {
   return child == null || child.exitCode != null || child.signalCode != null;
 }
 
+async function waitForProcessClose(child, timeoutMs = 5_000) {
+  if (child == null) return;
+  const closed = childClosePromises.get(child);
+  if (closed == null) throw new Error("Packaged process close was not tracked from spawn");
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error(`Timed out waiting for packaged process close ${child.pid ?? "unknown"}`)),
+      timeoutMs,
+    );
+    closed.then(() => { clearTimeout(timeout); resolve(); });
+  });
+}
+
 async function stopProcess(child) {
-  if (processHasExited(child) || child.pid == null) return;
-  try { await execFileAsync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { timeout: 10_000, windowsHide: true }); }
-  catch { child.kill(); }
-  await delay(300);
+  if (child == null) return;
+  if (!processHasExited(child) && child.pid != null) {
+    try { await execFileAsync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { timeout: 10_000, windowsHide: true }); }
+    catch { if (!processHasExited(child)) child.kill(); }
+  }
+  await waitForProcessClose(child);
+  child.stdout?.destroy();
+  child.stderr?.destroy();
 }
 
 async function stopPortableGracefully(launched, { label, leaseRevoked = () => true, timeoutMs = 60_000 }) {
@@ -139,6 +185,7 @@ async function stopPortableGracefully(launched, { label, leaseRevoked = () => tr
           throw new Error(`the packaged process did not exit cleanly (code=${launched.child.exitCode}, signal=${launched.child.signalCode})`);
         }
         if (!leaseRevoked()) throw new Error("the process exited before its final 9Router credential lease revocation was acknowledged");
+        await waitForProcessClose(launched.child);
         launched.cdp.close();
         return;
       }
@@ -146,9 +193,11 @@ async function stopPortableGracefully(launched, { label, leaseRevoked = () => tr
     }
     throw new Error(`timed out after ${timeoutMs} ms`);
   } catch (error) {
-    await stopProcess(launched.child);
     const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`${label}: ${detail}; taskkill was used only as failure cleanup`);
+    let cleanupDetail = "";
+    try { await stopProcess(launched.child); }
+    catch (cleanupError) { cleanupDetail = `, which also failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`; }
+    throw new Error(`${label}: ${detail}; taskkill was used only as failure cleanup${cleanupDetail}`, { cause: error });
   }
 }
 
@@ -158,7 +207,7 @@ function appendBoundedLog(logs, chunk) {
   if (currentSize < 1024 * 1024) logs.push(value.slice(0, 1024 * 1024 - currentSize));
 }
 
-async function launchPortable(verified, environment, userDataDir, logs) {
+async function launchPortable(verified, environment, userDataDir, logs, onLaunch = () => {}) {
   await rm(path.join(userDataDir, "DevToolsActivePort"), { force: true }).catch(() => undefined);
   const child = spawn(verified.executable, [
     `--user-data-dir=${userDataDir}`,
@@ -172,15 +221,22 @@ async function launchPortable(verified, environment, userDataDir, logs) {
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
+  childClosePromises.set(child, new Promise(resolve => child.once("close", () => resolve())));
+  child.once("error", error => childLaunchErrors.set(child, error));
+  const launched = { child, cdp: undefined };
+  // Publish ownership immediately: failures while discovering or mounting the
+  // renderer must not orphan an Electron process that still owns this profile.
+  onLaunch(launched);
   for (const stream of [child.stdout, child.stderr]) stream?.on("data", chunk => appendBoundedLog(logs, chunk));
   const cdp = await connectCdp(await waitForDebugEndpoint(userDataDir, child));
+  launched.cdp = cdp;
   await waitForRendererState(
     cdp,
     `(() => ({ readyState: document.readyState, title: document.title, text: document.body?.innerText ?? "", rootChildren: document.getElementById("root")?.childElementCount ?? 0 }))()`,
     value => value?.readyState === "complete" && value.rootChildren > 0,
     "Packaged clean renderer did not mount",
   );
-  return { child, cdp };
+  return launched;
 }
 
 async function openRouterSettings(cdp) {
@@ -331,10 +387,27 @@ async function listenLoopback(server, port) {
   return server.address().port;
 }
 
-async function closeServer(server) {
+async function closeServer(server, label) {
   if (server == null || !server.listening) return;
-  server.closeAllConnections?.();
-  await new Promise(resolve => server.close(() => resolve()));
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = error => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (error != null && error.code !== "ERR_SERVER_NOT_RUNNING") reject(error);
+      else resolve();
+    };
+    const timeout = setTimeout(() => {
+      server.closeAllConnections?.();
+      server.unref?.();
+      finish(new Error(`Timed out closing the Windows smoke ${label}`));
+    }, 5_000);
+    server.close(finish);
+    // Stop accepting first, then terminate persistent SSE/keep-alive sockets so
+    // a reconnect cannot race into the close callback and mask the real error.
+    server.closeAllConnections?.();
+  });
 }
 
 async function readJsonRequest(request, maximumBytes = 1024 * 1024) {
@@ -488,7 +561,13 @@ async function startHarnessServers(secretCanary) {
     });
   });
   try { await listenLoopback(gateway, 1340); }
-  catch (error) { await closeServer(router); throw error; }
+  catch (error) {
+    try { await closeServer(router, "router harness after gateway bind failure"); }
+    catch (cleanupError) {
+      throw new Error(`Gateway harness bind failed: ${error instanceof Error ? error.message : String(error)}; router cleanup also failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`, { cause: new AggregateError([error, cleanupError]) });
+    }
+    throw error;
+  }
   return {
     router,
     gateway,
@@ -655,8 +734,9 @@ async function writeFailureArtifacts({ cdp, error, logs, secretCanary, transcrip
 
 async function runBasicSmoke(verified, environment, userDataDir, logs) {
   let launched;
+  let failure;
   try {
-    launched = await launchPortable(verified, environment, userDataDir, logs);
+    launched = await launchPortable(verified, environment, userDataDir, logs, handle => { launched = handle; });
     await openRouterSettings(launched.cdp);
     await select9RouterProvider(launched.cdp);
     await waitForRendererState(
@@ -670,11 +750,20 @@ async function runBasicSmoke(verified, environment, userDataDir, logs) {
     console.log(`PASS Windows packaged launch smoke: ${verified.executable}`);
     console.log("Fresh isolated profile mounted the clean renderer and reached the 9Router settings surface.");
   } catch (error) {
+    failure = error;
     if (logs.length > 0) process.stderr.write(`\n--- packaged process output ---\n${logs.join("").slice(-16_384)}\n`);
     throw error;
   } finally {
-    launched?.cdp.close();
-    await stopProcess(launched?.child);
+    const cleanupErrors = [];
+    try { launched?.cdp?.close(); }
+    catch (error) { cleanupErrors.push(error); }
+    try { await stopProcess(launched?.child); }
+    catch (error) { cleanupErrors.push(error); }
+    if (cleanupErrors.length > 0) {
+      const cleanupFailure = new AggregateError(cleanupErrors, "Basic Windows smoke cleanup did not settle cleanly");
+      if (failure != null) process.stderr.write(`Basic Windows smoke cleanup also failed: ${cleanupErrors.map(error => String(error)).join("; ")}\n`);
+      else throw cleanupFailure;
+    }
   }
 }
 
@@ -684,6 +773,7 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
   const dockerTranscriptPath = path.join(temporary, "fake-docker-transcript.ndjson");
   let servers;
   let launched;
+  let failure;
   let phase = "harness-start";
   try {
     const fakeDockerDirectory = await buildStrictFakeDocker(temporary);
@@ -698,7 +788,7 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     };
 
     phase = "fresh-profile-launch";
-    launched = await launchPortable(verified, environment, userDataDir, logs);
+    launched = await launchPortable(verified, environment, userDataDir, logs, handle => { launched = handle; });
     await assertSignedOutLanding(launched.cdp, "Fresh profile did not begin at the real signed-out landing");
     const initial = await launched.cdp.evaluate(`(async () => { const [credential, router, runtime] = await Promise.all([window.desktop.cliProxy.status(), window.desktop.agent.getInferenceRouter(), window.desktop.agent.getBoxRuntime()]); return { configured: credential?.configured === true, provider: router?.provider ?? null, mode: runtime?.mode ?? null }; })()`);
     if (initial?.configured || initial?.provider !== "cursor" || initial?.mode !== "remote") throw new Error(`Fresh profile inherited router state: ${JSON.stringify(initial)}`);
@@ -818,7 +908,7 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     await assertCredentialPersistence(temporary, secretCanary, servers.routerBaseUrl);
 
     phase = "persistent-profile-relaunch";
-    launched = await launchPortable(verified, environment, userDataDir, logs);
+    launched = await launchPortable(verified, environment, userDataDir, logs, handle => { launched = handle; });
     await assertLoginFreeWorkspace(launched.cdp, servers.routerBaseUrl, { probe: true });
     phase = "persistent-container-recovered";
     await assertFakeDockerContainerState(
@@ -889,13 +979,25 @@ async function runFullLoginFreeSmoke(verified, temporary, baseEnvironment, userD
     });
     if (logs.length > 0) process.stderr.write(`\n--- packaged process output (redacted) ---\n${redactSensitive(logs.join("").slice(-16_384), secretCanary)}\n`);
     const message = redactSensitive(error instanceof Error ? error.message : error, secretCanary);
-    throw new Error(`Windows login-free 9Router smoke failed during ${phase}: ${message}`);
+    failure = new Error(`Windows login-free 9Router smoke failed during ${phase}: ${message}`);
+    process.stderr.write(`${failure.message}\n`);
+    throw failure;
   } finally {
-    servers?.gatewayState.releaseHeldEventStream?.();
-    launched?.cdp.close();
-    await stopProcess(launched?.child);
-    await closeServer(servers?.gateway);
-    await closeServer(servers?.router);
+    const cleanupErrors = [];
+    const cleanup = async (label, operation) => {
+      try { await operation(); }
+      catch (error) { cleanupErrors.push(new Error(`${label}: ${error instanceof Error ? error.message : String(error)}`, { cause: error })); }
+    };
+    await cleanup("release held gateway stream", async () => servers?.gatewayState.releaseHeldEventStream?.());
+    await cleanup("close renderer debugger", async () => launched?.cdp?.close());
+    await cleanup("stop packaged process tree", async () => stopProcess(launched?.child));
+    await cleanup("close gateway harness", async () => closeServer(servers?.gateway, "gateway harness"));
+    await cleanup("close router harness", async () => closeServer(servers?.router, "router harness"));
+    if (cleanupErrors.length > 0) {
+      const cleanupFailure = new AggregateError(cleanupErrors, "Windows smoke cleanup did not settle cleanly");
+      if (failure != null) process.stderr.write(`Windows smoke cleanup also failed: ${redactSensitive(cleanupErrors.map(error => error.message).join("; "), secretCanary)}\n`);
+      else throw cleanupFailure;
+    }
   }
 }
 
@@ -922,9 +1024,18 @@ const environment = {
   SAND_DISABLE_PROTOCOL_REGISTRATION: "1",
 };
 
+let smokeFailure;
 try {
   if (options.basic) await runBasicSmoke(verified, environment, userDataDir, logs);
   else await runFullLoginFreeSmoke(verified, temporary, environment, userDataDir, logs);
+} catch (error) {
+  smokeFailure = error;
+  throw error;
 } finally {
-  await rm(temporary, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  try { await removeTemporaryDirectory(temporary); }
+  catch (error) {
+    const cleanupFailure = new Error(`Windows smoke temporary directory cleanup failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+    if (smokeFailure != null) process.stderr.write(`${cleanupFailure.message}\n`);
+    else throw cleanupFailure;
+  }
 }

@@ -129,6 +129,9 @@ test("Windows release workflow verifies and launches both the directory and ZIP 
   assert.match(windowsJob, /dotnet-version: 8\.0\.x/);
   assert.match(windowsJob, /npm test/);
   assert.match(windowsJob, /npm run publication:check/);
+  assert.match(windowsJob, /actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/);
+  assert.match(windowsJob, /path: reports\/windows-smoke-failure-\*/);
+  assert.match(windowsJob, /Preserve redacted Windows smoke diagnostics on failure[\s\S]*if: failure\(\)[\s\S]*if-no-files-found: ignore[\s\S]*include-hidden-files: false[\s\S]*retention-days: 7/);
 
   const publicationCheck = await readFile(path.join(repoRoot, "scripts", "verify-publication-tree.mjs"), "utf8");
   assert.match(publicationCheck, /process\.platform === "win32" \? "git" : "\/usr\/bin\/git"/);

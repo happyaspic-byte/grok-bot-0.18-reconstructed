@@ -112,6 +112,19 @@ test("Windows smoke preserves the basic and --app entrypoints while defaulting C
   assert.match(source, /if \(options\.basic\) await runBasicSmoke/);
   assert.match(source, /else await runFullLoginFreeSmoke/);
   assert.match(source, /const verified = await verifyWindowsPortable\(options\.root\)/);
+  assert.match(source, /onLaunch\(launched\)[\s\S]{0,300}await connectCdp/);
+  assert.match(source, /fetch\(`http:\/\/127\.0\.0\.1:\$\{port\}\/json\/list`, \{[\s\S]{0,120}AbortSignal\.timeout\(Math\.min\(1_000, remainingMs\)\)/);
+  assert.equal(source.match(/handle => \{ launched = handle; \}/g)?.length, 3);
+  assert.match(source, /childClosePromises\.set\(child, new Promise\(resolve => child\.once\("close"/);
+  assert.match(source, /child\.once\("error", error => childLaunchErrors\.set\(child, error\)\)/);
+  assert.match(source, /await waitForProcessClose\(launched\.child\)/);
+  assert.match(source, /setTimeout\([\s\S]{0,180}Timed out waiting for packaged process close[\s\S]{0,180}closed\.then\(\(\) => \{ clearTimeout\(timeout\); resolve\(\); \}\)/);
+  assert.match(source, /Timed out waiting for packaged process close/);
+  assert.match(source, /Basic Windows smoke cleanup also failed/);
+  assert.match(source, /RETRYABLE_TEMP_CLEANUP_ERRORS/);
+  assert.match(source, /rm\(target, \{ recursive: true, force: true, maxRetries: 0 \}\)/);
+  assert.match(source, /removeTemporaryDirectory\(temporary\)/);
+  assert.doesNotMatch(source, /rm\(temporary,[^\n]*maxRetries:/);
   assert.match(source, /PASS Windows structural smoke \(launch skipped on \$\{process\.platform\}\)/);
 });
 
@@ -124,6 +137,11 @@ test("Windows smoke scans persistence for UTF-8 and UTF-16 key canaries and reda
   assert.match(source, /Page\.captureScreenshot/);
   assert.match(source, /\[REDACTED-9ROUTER-KEY\]/);
   assert.match(source, /Refusing to write an unredacted Windows smoke failure artifact/);
+  assert.match(source, /process\.stderr\.write\(`\$\{failure\.message\}\\n`\)/);
+  assert.match(source, /Windows smoke cleanup also failed/);
+  assert.match(source, /Windows smoke temporary directory cleanup failed/);
+  assert.match(source, /if \(smokeFailure != null\) process\.stderr\.write/);
+  assert.match(source, /server\.close\(finish\);[\s\S]{0,240}server\.closeAllConnections\?\.\(\)/);
   assert.match(source, /reports.*windows-smoke-failure/s);
 });
 

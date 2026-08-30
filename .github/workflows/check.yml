@@ -74,6 +74,15 @@ jobs:
           npm run verify:windows
       - name: Verify login-free 9Router workspace and graceful quit
         run: npm run smoke:windows
+      - name: Preserve redacted Windows smoke diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: windows-pr-smoke-diagnostics-${{ github.sha }}-${{ github.run_attempt }}
+          path: reports/windows-smoke-failure-*
+          if-no-files-found: ignore
+          include-hidden-files: false
+          retention-days: 7
 
   full-original-provenance:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
