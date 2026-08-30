@@ -1685,6 +1685,44 @@ test("post-spawn failures consume and stop at the supervisor respawn budget", as
   }
 });
 
+test("legacy startup retirement never treats a sampled idle discovery as kill authorization", async () => {
+  const loaded = await loadModule("source/electron-main/startup/legacy-daemon-retirement.ts");
+  const pid = 4_091;
+  const discovery = {
+    pid,
+    entryRealpath: "C:\\old-app\\local-exec-daemon\\main.cjs",
+    generationToken: "legacy-generation",
+    inflightCount: 0,
+  };
+  let workBeganAfterDiscoveryRead = false;
+  let terminationCalls = 0;
+  try {
+    const disposition = await loaded.module.retireIdleLegacyDaemon({
+      settlement: { route: "legacy", reason: "idle-legacy-writer", pid },
+      hasPendingActivation: () => false,
+      async readDiscovery() { return discovery; },
+      isDaemonProcess(observedPid, observedDiscovery) {
+        assert.equal(observedPid, pid);
+        assert.deepEqual(observedDiscovery, discovery);
+        workBeganAfterDiscoveryRead = true;
+        return true;
+      },
+      async terminate() {
+        terminationCalls += 1;
+        assert.fail("a non-atomic idle sample must never authorize startup termination");
+      },
+      isProcessAlive() { return true; },
+      relaunch() { assert.fail("startup must not relaunch without explicit daemon shutdown"); },
+      exit() { assert.fail("startup must not exit without explicit daemon shutdown"); },
+    });
+    assert.equal(workBeganAfterDiscoveryRead, true);
+    assert.equal(terminationCalls, 0);
+    assert.equal(disposition, "continue-bootstrap");
+  } finally {
+    await loaded.dispose();
+  }
+});
+
 test("a prior-version exact daemon fails closed without signalling or replacement spawn", async () => {
   const loaded = await loadModule("source/node-agent-coordinator/local-exec/supervisor.ts");
   const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-supervisor-"));
@@ -1959,7 +1997,7 @@ test("local-exec discovery identity failures quarantine a live PID across reconc
   }
 });
 
-test("local-exec termination errors quarantine the verified predecessor before retries", async () => {
+test("explicit pause termination errors quarantine an adopted daemon before retries", async () => {
   const loaded = await loadModule("source/node-agent-coordinator/local-exec/supervisor.ts");
   const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-supervisor-"));
   const discoveryPath = path.join(temporary, "local-exec-daemon.json");
@@ -1988,7 +2026,7 @@ test("local-exec termination errors quarantine the verified predecessor before r
         async mintLocalExecDaemonCredential() { return null; },
         async spawnLocalExecDaemon() {
           spawnCalls += 1;
-          assert.fail("a termination error must block every replacement retry");
+          assert.fail("a failed explicit pause termination must block replacement spawn");
         },
         async getProcessIdentity({ pid }) { return pid === predecessor.pid ? predecessor : null; },
         async isProcessAlive({ pid }) { return pid === predecessor.pid; },
@@ -2002,6 +2040,8 @@ test("local-exec termination errors quarantine the verified predecessor before r
     });
 
     await supervisor.start();
+    assert.equal(supervisor.state().phase, "active");
+    await supervisor.setPaused(true);
     assert.equal(supervisor.state().phase, "failed");
     assert.match(supervisor.state().reason, /simulated termination timeout/);
     await liveness.tick();
@@ -3165,7 +3205,8 @@ test("local-exec startup ownership is persisted before polling and cleared only 
     path.join(repoRoot, "source/electron-main/startup/legacy-daemon-retirement.ts"),
     "utf8",
   );
-  assert.match(legacySource, /options\.terminate\(pid, discovery\.value\)/);
+  assert.doesNotMatch(legacySource, /options\.terminate\(pid, discovery\.value\)/);
+  assert.match(legacySource, /sampled zero cannot prove/);
 });
 
 test("coordinator supervisor wires structured startup, readiness, and handleless adoption", async () => {

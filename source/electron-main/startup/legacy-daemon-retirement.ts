@@ -13,11 +13,8 @@ export async function retireIdleLegacyDaemon(options: { readonly settlement?: Da
   if (!discovery.ok || discovery.value == null || discovery.value.pid !== pid || (discovery.value.inflightCount ?? 0) > 0 || options.hasPendingActivation()) return "continue-bootstrap";
   const identified = attempt(() => options.isDaemonProcess(pid, discovery.value!));
   if (!identified.ok || !identified.value) return "continue-bootstrap";
-  const terminated = await options.terminate(pid, discovery.value).then(() => true, () => false);
-  if (!terminated || options.hasPendingActivation()) return "continue-bootstrap";
-  const stillAlive = attempt(() => options.isProcessAlive(pid));
-  if (!stillAlive.ok || stillAlive.value) return "continue-bootstrap";
-  if (!attempt(options.relaunch).ok) return "continue-bootstrap";
-  options.exit();
-  return "stop-bootstrap";
+  // inflightCount is published asynchronously, so a sampled zero cannot prove
+  // an atomic idle window. Automatic startup migration must never signal a
+  // verified live daemon; explicit staged-update shutdown owns that boundary.
+  return "continue-bootstrap";
 }
