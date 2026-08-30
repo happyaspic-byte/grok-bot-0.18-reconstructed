@@ -15,6 +15,7 @@ export function parseCoordinatorRendererPortRequestPayload(
 ): CoordinatorRendererPortRequestPayload | null {
   if (
     !isRecord(value)
+    || Array.isArray(value)
     || Object.keys(value).length !== 1
     || typeof value.knownGeneration !== "number"
     || !Number.isSafeInteger(value.knownGeneration)
@@ -28,6 +29,7 @@ export function parseCoordinatorRendererPortDeliveryPayload(
 ): CoordinatorRendererPortDeliveryPayload | null {
   if (
     !isRecord(value)
+    || Array.isArray(value)
     || Object.keys(value).length !== 1
     || typeof value.generation !== "number"
     || !Number.isSafeInteger(value.generation)

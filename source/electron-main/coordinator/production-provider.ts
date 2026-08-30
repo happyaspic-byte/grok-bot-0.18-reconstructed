@@ -1160,6 +1160,9 @@ export function createCoordinatorRendererPortIpcRegistrar<
         dispose() {
           if (disposed) return;
           disposed = true;
+          activeSinkEpoch += 1;
+          activeRequesterFrame = undefined;
+          postedGeneration = 0;
           ports.ipcMain.removeHandler(COORDINATOR_PORT_REQUEST_CHANNEL);
           registered = false;
         },

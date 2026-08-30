@@ -730,6 +730,9 @@ test("preload coordinator broker carries and fences renderer-port handoff genera
     const malformed = { closed: 0, close() { this.closed += 1; } };
     broker.deliver(malformed, { generation: "2" });
     assert.equal(malformed.closed, 1);
+    const arrayPayload = { closed: 0, close() { this.closed += 1; } };
+    broker.deliver(arrayPayload, Object.assign([], { generation: 2 }));
+    assert.equal(arrayPayload.closed, 1);
 
     const replacement = { closed: 0, close() { this.closed += 1; } };
     broker.deliver(replacement, { generation: 3 });
@@ -756,11 +759,16 @@ test("renderer-port IPC suppresses stale close requests after a proactive replac
     const queuedPorts = [];
     const posts = [];
     const failures = [];
+    let failNextPost = false;
     const frame = {};
     const contents = {
       mainFrame: frame,
       isDestroyed: () => false,
       postMessage(channel, payload, transfer) {
+        if (failNextPost) {
+          failNextPost = false;
+          throw new Error("synthetic post failure");
+        }
         posts.push({ channel, payload, transfer });
       },
     };
@@ -820,6 +828,30 @@ test("renderer-port IPC suppresses stale close requests after a proactive replac
       () => handler({ sender: contents, senderFrame: frame }, null),
       /exactly one non-negative safe knownGeneration/
     );
+    assert.throws(
+      () => handler(
+        { sender: contents, senderFrame: frame },
+        Object.assign([], { knownGeneration: 3 })
+      ),
+      /exactly one non-negative safe knownGeneration/
+    );
+    assert.throws(
+      () => handler({ sender: {}, senderFrame: {} }, null),
+      /only available from the Sand app window/
+    );
+
+    const failedPostPort = { id: "failed-post", closed: 0, close() { this.closed += 1; } };
+    queuedPorts.push(failedPostPort);
+    failNextPost = true;
+    assert.throws(
+      () => handler({ sender: contents, senderFrame: frame }, { knownGeneration: 3 }),
+      /synthetic post failure/
+    );
+    assert.equal(failures.length, 1);
+    const retryPort = { id: "retry", closed: 0, close() { this.closed += 1; } };
+    queuedPorts.push(retryPort);
+    handler({ sender: contents, senderFrame: frame }, { knownGeneration: 3 });
+    assert.deepEqual(posts.at(-1).payload, { generation: 4 });
 
     const previousFrameSink = activeSink;
     const nextFrame = {};
@@ -832,10 +864,13 @@ test("renderer-port IPC suppresses stale close requests after a proactive replac
     queuedPorts.push(nextFramePort);
     handler({ sender: contents, senderFrame: nextFrame }, { knownGeneration: 0 });
     assert.deepEqual(posts.at(-1).payload, { generation: 1 });
-    assert.deepEqual(failures, []);
 
+    const retainedSink = activeSink;
     registration.dispose();
     assert.equal(removedChannel, "sand:coordinator-port-request");
+    const afterDispose = { id: "after-dispose", closed: 0, close() { this.closed += 1; } };
+    retainedSink(afterDispose);
+    assert.equal(afterDispose.closed, 1, "a retained sink must fail closed after IPC unregisters");
   } finally {
     await loaded.dispose();
   }
