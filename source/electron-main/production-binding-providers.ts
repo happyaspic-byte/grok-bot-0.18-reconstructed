@@ -314,10 +314,13 @@ export function createProductionUpdaterInstallerBinding(
   const env = ports.env ?? process.env;
   const platform = ports.platform ?? process.platform;
   let created = false;
+  let requiresLocalExecDiscovery: (() => boolean) | undefined;
   return {
     async create(context) {
       if (created) throw new Error("Electron production updater service was created more than once.");
       created = true;
+      requiresLocalExecDiscovery = () =>
+        context.settings.settingsStore.getBoxRuntime() === "local-docker";
       const relay = createUpdateTelemetryRelay();
       const getHostStatus = coordinatorHostStatus(context);
       const updateService = createUpdateServiceWiring({
@@ -382,7 +385,10 @@ export function createProductionUpdaterInstallerBinding(
         },
       };
     },
-    killLocalExecDaemon: () => killLocalExecDaemon(getLocalExecDaemonDiscoveryPath()),
+    killLocalExecDaemon: () => killLocalExecDaemon(
+      getLocalExecDaemonDiscoveryPath(),
+      { requireDiscovery: requiresLocalExecDiscovery?.() === true },
+    ),
   };
 }
 

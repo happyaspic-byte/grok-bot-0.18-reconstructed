@@ -347,6 +347,7 @@ export async function killLocalExecDaemon(
   deps: {
     readonly expectedPid?: number;
     readonly expectedEntryRealpath?: string;
+    readonly requireDiscovery?: boolean;
     readonly readIdentity?: typeof readProcessIdentity;
     readonly isAlive?: typeof isProcessAlive;
     readonly terminate?: (
@@ -360,7 +361,12 @@ export async function killLocalExecDaemon(
   } = {},
 ): Promise<void> {
   const existing = await readLocalExecDaemonDiscovery(discoveryPath);
-  if (existing == null) return;
+  if (existing == null) {
+    if (deps.requireDiscovery === true) {
+      throw new Error("local-exec discovery is required for staged shutdown but is missing");
+    }
+    return;
+  }
   const alive = deps.isAlive ?? isProcessAlive;
   const requireAbsent = (reason: string): void => {
     let processAlive: boolean;

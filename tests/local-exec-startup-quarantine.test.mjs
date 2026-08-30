@@ -404,7 +404,7 @@ test("restart reconciliation accepts a matching ready discovery and adopts it wi
       {
         status: "matching",
         identity: { ...exactIdentity, entryRealpath: quarantined.entryRealpath, generationToken: quarantined.generationToken },
-        terminationMode: "win32-stable-handle",
+        terminationMode: "none",
       },
     );
   } finally {
@@ -541,7 +541,7 @@ test("restart readiness confirmation clears an exact disk fence without an inher
     assert.deepEqual(ledger.records, []);
     assert.deepEqual(
       await executors.inspectLocalExecProcessIdentity(identity),
-      { status: "matching", identity, terminationMode: "win32-stable-handle" },
+      { status: "matching", identity, terminationMode: "none" },
     );
   } finally {
     await loaded.dispose();
@@ -763,7 +763,7 @@ test("a live prior-version daemon needs exact main-process discovery before Wind
       {
         status: "matching",
         identity,
-        terminationMode: "win32-stable-handle",
+        terminationMode: "prior-version",
       },
     );
     assert.deepEqual(
@@ -833,7 +833,7 @@ test("same-PID reuse never lends a stale retained child handle to a later identi
       {
         status: "matching",
         identity: secondIdentity,
-        terminationMode: "win32-stable-handle",
+        terminationMode: "none",
       },
     );
     assert.deepEqual(

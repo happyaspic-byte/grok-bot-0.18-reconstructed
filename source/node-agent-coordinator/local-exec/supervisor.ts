@@ -39,8 +39,7 @@ export type LocalExecDaemonAction =
 
 export function decideLocalExecDaemonAction(existing: { readonly pid: number; readonly inflightCount?: number } | null): LocalExecDaemonAction {
   if (existing == null) return { kind: "spawn" };
-  if ((existing.inflightCount ?? 0) > 0) return { kind: "adopt", pid: existing.pid };
-  return { kind: "replace", pid: existing.pid };
+  return { kind: "adopt", pid: existing.pid };
 }
 
 export type LocalExecDaemonState =
@@ -61,7 +60,7 @@ interface LocalExecControl {
     | {
         readonly status: "matching";
         readonly identity: LocalExecProcessIdentity;
-        readonly terminationMode?: "retained-child" | "win32-stable-handle" | "none";
+        readonly terminationMode?: "retained-child" | "win32-stable-handle" | "prior-version" | "none";
       }
     | { readonly status: "different" | "absent" | "unreadable" }
   >;
@@ -166,7 +165,7 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
     | {
         readonly status: "matching";
         readonly identity: LocalExecProcessIdentity;
-        readonly terminationMode: "retained-child" | "win32-stable-handle" | "none";
+        readonly terminationMode: "retained-child" | "win32-stable-handle" | "prior-version" | "none";
       }
     | { readonly status: "different" | "absent" | "unreadable" }
   > => {
@@ -179,6 +178,7 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
             identity: inspected.identity,
             terminationMode: inspected.terminationMode === "retained-child"
               || inspected.terminationMode === "win32-stable-handle"
+              || inspected.terminationMode === "prior-version"
               ? inspected.terminationMode
               : "none",
           };
@@ -358,7 +358,7 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
           ? { ...existing, discoveryStartedAt: existing.startedAt }
           : undefined;
         let identity = expected == null ? null : await currentIdentity(expected);
-        let terminationMode: "retained-child" | "win32-stable-handle" | "none" = "retained-child";
+        let terminationMode: "retained-child" | "win32-stable-handle" | "prior-version" | "none" = "none";
         if (expected != null) {
           const inspected = await inspectQuarantinedProcess(expected);
           if (inspected.status === "matching") {
@@ -381,19 +381,18 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
           await spawnDaemon();
           return;
         }
-        if ((existing.inflightCount ?? 0) > 0 || terminationMode === "none") {
-          await confirmReadyIdentity(identity);
-          clearQuarantine();
-          state = { phase: "adopting", pid: existing.pid };
-          state = activeGeneration("adopted", existing, identity);
-          missingDiscoveryTicks = 0;
-          return;
+        if (terminationMode === "prior-version") {
+          quarantine(existing.pid, expected);
+          throw new Error(`local-exec prior-version daemon ${existing.pid} requires explicit shutdown before replacement`);
         }
-        state = { phase: "replacing", pid: existing.pid };
-        await terminateIfStillOwned(identity);
-        if (disposed) return;
-        await removeLocalExecDaemonDiscoveryIfMatches(paths.discoveryPath, existing);
-        await spawnDaemon();
+        // Discovery inflightCount is asynchronously published and cannot prove
+        // an atomic idle window. A verified current daemon is therefore always
+        // adopted here, even when a termination capability is available.
+        await confirmReadyIdentity(identity);
+        clearQuarantine();
+        state = { phase: "adopting", pid: existing.pid };
+        state = activeGeneration("adopted", existing, identity);
+        missingDiscoveryTicks = 0;
         return;
       }
       await spawnDaemon();

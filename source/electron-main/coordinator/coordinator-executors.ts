@@ -495,7 +495,7 @@ export function createCoordinatorControlExecutors(
     | {
         readonly status: "matching";
         readonly identity: LocalExecProcessIdentity;
-        readonly terminationMode: "retained-child" | "win32-stable-handle" | "none";
+        readonly terminationMode: "retained-child" | "prior-version" | "none";
       }
     | { readonly status: "different" | "absent" | "unreadable" };
   const classifyStartupQuarantineProcess = (
@@ -712,16 +712,16 @@ export function createCoordinatorControlExecutors(
     }
 
     // A prior-version entry is not adoptable as the current daemon. Only an
-    // exact main-process discovery record can lend it a Windows stable-handle
-    // termination capability; arbitrary caller-supplied identities cannot.
+    // exact main-process discovery record can register its identity; arbitrary
+    // caller-supplied identities cannot. Initial replacement remains fail-closed.
     ownedDaemonIdentities.set(identity.pid, identity);
     return {
       status: "matching",
       identity,
-      terminationMode: retainedOwnedChild(identity) !== undefined
-        ? "retained-child"
-        : platform === "win32"
-          ? "win32-stable-handle"
+      terminationMode: expected.entryRealpath !== canonicalEntryRealpath
+        ? "prior-version"
+        : retainedOwnedChild(identity) !== undefined
+          ? "retained-child"
           : "none",
     };
   };
