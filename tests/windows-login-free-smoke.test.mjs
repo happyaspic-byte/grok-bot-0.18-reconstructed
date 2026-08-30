@@ -212,7 +212,8 @@ test("Windows smoke scans persistence for UTF-8 and UTF-16 key canaries and reda
   assert.match(source, /\[REDACTED-9ROUTER-KEY\]/);
   assert.match(source, /redactLocalExecGeneration\(value\)/);
   assert.match(processSource, /local-exec-daemon\.json/);
-  assert.match(processSource, /--sand-local-exec-generation=\[REDACTED\]/);
+  assert.match(processSource, /const marker = "--sand-local-exec-generation="/);
+  assert.match(processSource, /output \+= source\.slice\(cursor, start\) \+ marker \+ "\[REDACTED\]"/);
   assert.doesNotMatch(processSource, /console\.(?:log|error)|process\.stderr\.write/);
   assert.match(source, /Windows smoke relevant process inventory \(redacted\)/);
   assert.match(source, /Refusing to write an unredacted Windows smoke failure artifact/);
