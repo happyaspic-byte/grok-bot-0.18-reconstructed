@@ -104,6 +104,46 @@ test("coordinator connection wait times out while lifecycle is ready but gateway
   }
 });
 
+test("replacement readiness cannot reuse a connected previous coordinator port", async () => {
+  const loaded = await loadClient();
+  try {
+    const ports = bridge();
+    const client = loaded.module.createCoordinatorClient(ports.source);
+    assert.ok(client);
+    assert.equal(client.getPortGeneration(), 0);
+
+    const first = transferredPort();
+    ports.deliver(first);
+    first.emitMessage({ kind: "lifecycle", phase: "ready", protocolVersion: 1 });
+    first.emitMessage({ kind: "event", family: "coordinator-transport-state", payload: { state: "connected" } });
+    assert.equal(client.getPortGeneration(), 1);
+    assert.equal(client.getTransportState(), "connected");
+
+    const replacementGeneration = client.getPortGeneration();
+    let settled = false;
+    const replacementConnected = client
+      .waitForTransportConnectedAfterPortGeneration(replacementGeneration, 1_000)
+      .then(() => { settled = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false, "the previous connected port must not satisfy replacement readiness");
+
+    const second = transferredPort();
+    ports.deliver(second);
+    assert.equal(client.getPortGeneration(), replacementGeneration + 1);
+    assert.equal(client.getTransportState(), "down");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false, "port delivery without gateway connection must remain pending");
+
+    second.emitMessage({ kind: "lifecycle", phase: "ready", protocolVersion: 1 });
+    second.emitMessage({ kind: "event", family: "coordinator-transport-state", payload: { state: "connected" } });
+    await replacementConnected;
+    assert.equal(settled, true);
+    client.dispose();
+  } finally {
+    await loaded.dispose();
+  }
+});
+
 test("a replacement coordinator generation can serve calls after the first disconnects", async () => {
   const loaded = await loadClient();
   try {

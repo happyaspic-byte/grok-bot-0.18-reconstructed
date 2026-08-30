@@ -2787,11 +2787,14 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
       forceFresh,
       queue: localWorkspaceActivationQueueRef.current,
       activate: async () => {
+        const portGeneration = client.getPortGeneration();
         const claimed = await bridge.forceGatewayReconnect();
         const normalized: DesktopLocalWorkspaceStatus = isLocalWorkspaceClaimReady(claimed)
           ? claimed
           : { kind: "disabled" };
-        if (normalized.kind === "ready") await client.waitForTransportConnected(20_000);
+        if (normalized.kind === "ready") {
+          await client.waitForTransportConnectedAfterPortGeneration(portGeneration, 20_000);
+        }
         return normalized;
       }
     });

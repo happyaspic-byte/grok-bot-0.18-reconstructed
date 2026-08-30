@@ -58,19 +58,23 @@ export interface ProductionCoordinatorClient {
   subscribe(family: string, listener: EventListener): () => void;
   subscribeTransport(listener: TransportListener): () => void;
   getTransportState(): CoordinatorTransportState;
+  getPortGeneration(): number;
   waitForTransportConnected(timeoutMs?: number): Promise<void>;
+  waitForTransportConnectedAfterPortGeneration(portGeneration: number, timeoutMs?: number): Promise<void>;
   dispose(): void;
 }
 
 export function createCoordinatorClient(portBridge: CoordinatorPortBridge): ProductionCoordinatorClient | null {
   const eventListeners = new Map<string, Set<EventListener>>();
   const transportListeners = new Set<TransportListener>();
+  const portGenerationListeners = new Set<() => void>();
   const pending = new Map<string, PendingCall>();
   let port: TransferredCoordinatorPort | null = null;
   let nextRequestId = 0;
   let disposed = false;
   let serving = false;
   let transportState: CoordinatorTransportState = "down";
+  let portGeneration = 0;
   let resolveReady = () => {};
   let rejectReady = (_reason: unknown) => {};
   const makeReady = () => new Promise<void>((resolve, reject) => {
@@ -150,7 +154,9 @@ export function createCoordinatorClient(portBridge: CoordinatorPortBridge): Prod
       port = nextPort;
       previousPort?.close();
       serving = false;
+      portGeneration += 1;
       publishTransport("down");
+      for (const listener of portGenerationListeners) listener();
       if (replacesLivePort) {
         currentReady = makeReady();
         currentReady.catch(() => {});
@@ -191,6 +197,7 @@ export function createCoordinatorClient(portBridge: CoordinatorPortBridge): Prod
       return () => transportListeners.delete(listener);
     },
     getTransportState: () => transportState,
+    getPortGeneration: () => portGeneration,
     waitForTransportConnected(timeoutMs = 20_000) {
       if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return Promise.reject(new Error("Coordinator connection timeout must be positive."));
       if (disposed) return Promise.reject(new Error("Coordinator client is disposed."));
@@ -213,9 +220,46 @@ export function createCoordinatorClient(portBridge: CoordinatorPortBridge): Prod
         if (transportState === "connected") finish();
       });
     },
+    waitForTransportConnectedAfterPortGeneration(baselineGeneration, timeoutMs = 20_000) {
+      if (!Number.isSafeInteger(baselineGeneration) || baselineGeneration < 0) {
+        return Promise.reject(new Error("Coordinator port generation must be a non-negative safe integer."));
+      }
+      if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+        return Promise.reject(new Error("Coordinator connection timeout must be positive."));
+      }
+      if (disposed) return Promise.reject(new Error("Coordinator client is disposed."));
+      return new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const finish = (error?: Error) => {
+          if (settled) return;
+          settled = true;
+          globalThis.clearTimeout(timeout);
+          transportListeners.delete(onTransport);
+          portGenerationListeners.delete(check);
+          if (error == null) resolve();
+          else reject(error);
+        };
+        const check = () => {
+          if (disposed) {
+            finish(new Error("Coordinator client is disposed."));
+            return;
+          }
+          if (portGeneration > baselineGeneration && transportState === "connected") finish();
+        };
+        const onTransport: TransportListener = () => check();
+        const timeout = globalThis.setTimeout(
+          () => finish(new Error("Timed out waiting for the replacement Local 9Router coordinator to connect.")),
+          timeoutMs
+        );
+        transportListeners.add(onTransport);
+        portGenerationListeners.add(check);
+        check();
+      });
+    },
     dispose() {
       if (disposed) return;
       disposed = true;
+      for (const listener of portGenerationListeners) listener();
       port?.postMessage({ kind: "lifecycle", phase: "shutdown", reason: "requested", detail: null });
       claim.release();
       rejectCalls("coordinator source disposed");
