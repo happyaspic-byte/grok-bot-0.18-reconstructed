@@ -2860,7 +2860,7 @@ export function ProductionRenderer({ bridge, coordinatorPort }: ProductionRender
         refreshAfterCurrentActivation(overlay !== "settings");
         return;
       }
-      localWorkspaceClaimRef.current = { kind: "disabled" };
+      if (state === "down") localWorkspaceClaimRef.current = { kind: "disabled" };
       setLocalWorkspace({ kind: "checking" });
       if (overlay === "settings" || localWorkspaceActivationQueueRef.current.pending != null) {
         refreshAfterCurrentActivation();
