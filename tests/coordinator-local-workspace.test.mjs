@@ -2163,99 +2163,6 @@ test("an inflight Windows stable-handle adoption can be paused, retired, and res
   }
 });
 
-test("an inflight Windows adoption rotates after its published work drains", async () => {
-  const loaded = await loadModule("source/node-agent-coordinator/local-exec/supervisor.ts");
-  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-supervisor-"));
-  const discoveryPath = path.join(temporary, "local-exec-daemon.json");
-  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
-  const adopted = localExecIdentity(4_174, 1_000, entryRealpath, "adopted-drain-generation");
-  const successor = localExecIdentity(4_175, 4_000, entryRealpath, "drained-successor-generation");
-  const adoptedDescriptor = {
-    pid: adopted.pid,
-    startedAt: 2_000,
-    entryRealpath,
-    generationToken: adopted.generationToken,
-    inflightCount: 1,
-  };
-  const successorDescriptor = {
-    pid: successor.pid,
-    startedAt: 4_500,
-    entryRealpath,
-    generationToken: successor.generationToken,
-    inflightCount: 0,
-  };
-  const liveness = controlledLocalExecPollingPolicy();
-  let adoptedAlive = true;
-  let successorAlive = false;
-  let spawnCalls = 0;
-  let terminationCalls = 0;
-  try {
-    await writeFile(discoveryPath, JSON.stringify(adoptedDescriptor), "utf8");
-    const supervisor = loaded.module.createLocalExecDaemonSupervisor({
-      dataDir: temporary,
-      isPackaged: true,
-      refreshPolicy: inertLocalExecPollingPolicy(),
-      livenessPolicy: liveness.policy,
-      now: () => 5_000,
-      control: {
-        async resolveGatewayConnection() { return { endpoint: "loopback" }; },
-        async mintLocalExecDaemonCredential() { return null; },
-        async reconcileLocalExecStartupQuarantine() { return { blocked: false, reason: null }; },
-        async confirmLocalExecDaemonReady() { return { confirmed: true }; },
-        async spawnLocalExecDaemon() {
-          assert.equal(adoptedAlive, false, "drained predecessor must exit before successor spawn");
-          spawnCalls += 1;
-          successorAlive = true;
-          await writeFile(discoveryPath, JSON.stringify(successorDescriptor), "utf8");
-          return successor;
-        },
-        async getProcessIdentity({ pid }) {
-          if (pid === adopted.pid && adoptedAlive) return adopted;
-          if (pid === successor.pid && successorAlive) return successor;
-          return null;
-        },
-        async inspectLocalExecProcessIdentity({ pid }) {
-          if (pid === adopted.pid && adoptedAlive) {
-            return { status: "matching", identity: adopted, terminationMode: "win32-stable-handle" };
-          }
-          if (pid === successor.pid && successorAlive) {
-            return { status: "matching", identity: successor, terminationMode: "retained-child" };
-          }
-          return { status: "absent" };
-        },
-        async isProcessAlive({ pid }) {
-          return (pid === adopted.pid && adoptedAlive) || (pid === successor.pid && successorAlive);
-        },
-        async terminateProcess({ identity }) {
-          terminationCalls += 1;
-          assert.deepEqual(identity, adopted);
-          adoptedAlive = false;
-          return { terminated: true };
-        },
-        async waitLocalExecDaemonExit() { return await new Promise(() => {}); },
-      },
-    });
-
-    await supervisor.start();
-    assert.equal(supervisor.state().daemon.origin, "adopted");
-    await writeFile(discoveryPath, JSON.stringify({
-      ...adoptedDescriptor,
-      inflightCount: 0,
-    }), "utf8");
-    await liveness.tick();
-    await liveness.tick();
-    assert.equal(terminationCalls, 1);
-    assert.equal(spawnCalls, 1);
-    assert.equal(supervisor.state().phase, "active");
-    assert.equal(supervisor.state().daemon.origin, "spawned");
-    assert.equal(supervisor.state().daemon.pid, successor.pid);
-    await supervisor.dispose();
-  } finally {
-    await loaded.dispose();
-    await rm(temporary, { recursive: true, force: true });
-  }
-});
-
 test("missing discovery retires an inflight Windows adoption before spawning its successor", async () => {
   const loaded = await loadModule("source/node-agent-coordinator/local-exec/supervisor.ts");
   const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-local-exec-supervisor-"));
@@ -2335,10 +2242,7 @@ test("missing discovery retires an inflight Windows adoption before spawning its
     await liveness.tick();
     await liveness.tick();
     await liveness.tick();
-    assert.deepEqual(supervisor.state(), { phase: "absent" });
     assert.equal(terminationCalls, 1);
-    assert.equal(spawnCalls, 0);
-    await liveness.tick();
     assert.equal(spawnCalls, 1);
     assert.equal(supervisor.state().phase, "active");
     assert.equal(supervisor.state().daemon.origin, "spawned");
@@ -3258,8 +3162,6 @@ test("coordinator supervisor wires structured startup, readiness, and handleless
   assert.match(supervisorSource, /confirmReadyIdentity\(identity\)/);
   assert.match(supervisorSource, /\(existing\.inflightCount \?\? 0\) > 0 \|\| terminationMode === "none"/);
   assert.match(supervisorSource, /activeGeneration\("adopted", existing, identity\)/);
-  assert.match(supervisorSource, /active\.daemon\.origin === "adopted"/);
-  assert.match(supervisorSource, /\(discovery\.inflightCount \?\? 0\) === 0/);
   const establishStart = supervisorSource.indexOf("const establishDaemon = async");
   const healStart = supervisorSource.indexOf("const healDaemonInternal", establishStart);
   assert.ok(establishStart >= 0 && healStart > establishStart);

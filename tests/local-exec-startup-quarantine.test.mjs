@@ -700,6 +700,58 @@ test("startup fence write failure cleans the unrecorded child only through its r
   }
 });
 
+test("a live prior-version discovery is retired through a Windows stable handle without a durable fence", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const oldEntry = "C:\\old-app\\local-exec-daemon\\main.cjs";
+  const currentEntry = "C:\\current-app\\local-exec-daemon\\main.cjs";
+  const generationToken = "prior-version-generation";
+  const nativeIdentity = matchingIdentity(4_741, oldEntry, generationToken);
+  const identity = {
+    ...nativeIdentity,
+    entryRealpath: oldEntry,
+    generationToken,
+  };
+  const ledger = { records: [] };
+  let alive = true;
+  let terminationCalls = 0;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      overrides: { platform: "win32" },
+      native: {
+        async spawnLocalExecDaemon() { assert.fail("inspection and retirement only"); },
+        async terminateProcess(pid, options) {
+          terminationCalls += 1;
+          assert.equal(pid, identity.pid);
+          assert.deepEqual(options.expectedIdentity, identity);
+          assert.equal(options.ownedChild, undefined);
+          assert.equal(options.allowVerifiedWindowsHandleAcquisition, true);
+          alive = false;
+        },
+        isProcessAlive(pid) { return alive && pid === identity.pid; },
+        readProcessIdentity(pid) { return alive && pid === identity.pid ? nativeIdentity : null; },
+        resolveLocalExecDaemonEntryRealpath() { return currentEntry; },
+      },
+    }));
+
+    assert.deepEqual(
+      await executors.inspectLocalExecProcessIdentity(identity),
+      {
+        status: "matching",
+        identity,
+        terminationMode: "win32-stable-handle",
+      },
+    );
+    assert.deepEqual(
+      await executors.terminateProcess({ identity }),
+      { terminated: true },
+    );
+    assert.equal(terminationCalls, 1);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
 test("same-PID reuse never lends a stale retained child handle to a later identity", async () => {
   const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
   const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";

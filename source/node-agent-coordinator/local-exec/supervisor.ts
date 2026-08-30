@@ -436,20 +436,6 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
       if (observed != null && sameLocalExecProcessIdentity(observed, activeIdentity)) {
         missingDiscoveryTicks = 0;
         consecutiveRespawns = 0;
-        if (active.daemon.origin === "adopted" && (discovery.inflightCount ?? 0) === 0) {
-          const inspected = await inspectQuarantinedProcess(activeIdentity);
-          if (inspected.status === "matching" && inspected.terminationMode !== "none") {
-            state = { phase: "replacing", pid: activeIdentity.pid };
-            await terminateIfStillOwned(activeIdentity);
-            const removed = await removeLocalExecDaemonDiscoveryIfMatches(paths.discoveryPath, discovery);
-            state = { phase: "absent" };
-            if (removed) await spawnDaemon();
-          } else if (inspected.status === "different" || inspected.status === "absent") {
-            const removed = await removeLocalExecDaemonDiscoveryIfMatches(paths.discoveryPath, discovery);
-            state = { phase: "absent" };
-            if (removed) await spawnDaemon();
-          }
-        }
         return;
       }
       if (await options.control.isProcessAlive({ pid: activeIdentity.pid })) {

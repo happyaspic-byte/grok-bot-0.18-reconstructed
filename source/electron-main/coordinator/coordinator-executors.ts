@@ -682,17 +682,15 @@ export function createCoordinatorControlExecutors(
       try { return native.isProcessAlive(expected.pid) ? { status: "unreadable" } : { status: "absent" }; }
       catch { return { status: "unreadable" }; }
     }
-    let canonicalEntryRealpath: string;
-    try { canonicalEntryRealpath = (native.resolveLocalExecDaemonEntryRealpath ?? resolveLocalExecDaemonEntryRealpath)(); }
-    catch { return { status: "unreadable" }; }
-    if (expected.entryRealpath !== canonicalEntryRealpath) return { status: "different" };
     const identity: LocalExecProcessIdentity = {
       ...observed,
-      entryRealpath: canonicalEntryRealpath,
+      entryRealpath: expected.entryRealpath,
       generationToken: expected.generationToken,
     };
-    if (!commandCarriesLocalExecGeneration(observed.command, canonicalEntryRealpath, expected.generationToken)
+    if (!commandCarriesLocalExecGeneration(observed.command, expected.entryRealpath, expected.generationToken)
       || !expectedMatches(expected, identity)) return { status: "different" };
+    // An exact prior-version entry is not adoptable as the current daemon, but
+    // on Windows its verified stable process handle can retire it before spawn.
     ownedDaemonIdentities.set(identity.pid, identity);
     return {
       status: "matching",
