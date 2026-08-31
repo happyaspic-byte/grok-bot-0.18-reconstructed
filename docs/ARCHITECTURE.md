@@ -40,7 +40,9 @@ surfaces agree:
   configured with Chat Completions or Auto, not explicit Responses.
 
 Manual model entry keeps the settings surface usable when `/v1/models` is
-empty, while the readiness check prevents an ambiguous model request.
+empty. Before the local workspace is published as ready, the Docker host makes
+an authenticated `/v1/models` request from inside the container; a URL that is
+reachable only from Electron main therefore fails closed.
 
 The renderer represents that state with the internal workspace identity
 `local:9router`. It is a workspace capability, not an authentication record.
@@ -96,10 +98,13 @@ The server must run the current stable 9Router release (v0.5.35 when reviewed).
 ### Prompt and credential path
 
 The renderer receives only redacted configuration status. The proxy/client API
-key remains in Electron main's fixed-purpose OS-protected secret store. For a
-native prompt, the coordinator obtains the normalized turn configuration and
-passes it immediately to the host with the authenticated desktop-to-host
-gateway command. The host installs the configuration as a memory-only lease:
+key remains in Electron main's fixed-purpose OS-protected secret store. During
+workspace readiness, the coordinator reads the normalized configuration once,
+installs it through the bearer-authenticated desktop-to-host lease setter, then
+invokes the in-container `/v1/models` probe without a config or key argument.
+The host reads only its short-lived memory lease and returns only outcome and
+latency. For a native prompt, the coordinator refreshes the same memory-only
+lease immediately before dispatch:
 
 - the lease expires after 30 minutes and is refreshed immediately before each
   later prompt;
@@ -161,9 +166,11 @@ Verification re-hashes clean-build outputs and checks renderer provenance.
 The Windows service boundary uses a separate user-data/data root, disables
 upstream update, telemetry, and protocol registration before Electron main
 starts, and exposes no reconstructed development controls in production.
-9Router is configured through the normal **Settings → Router** surface. A
-same-PC service can use `http://127.0.0.1:20128/v1`; the documented Tailscale
-server uses `http://100.112.10.8:20128/v1` with its explicit HTTP opt-in.
+9Router is configured through the normal **Settings → Router** surface. Local
+Docker does not share Windows loopback: container loopback is not Windows
+loopback, so a same-PC service bound only to `127.0.0.1` is not reachable. The
+documented Tailscale server uses `http://100.112.10.8:20128/v1` with its
+explicit HTTP opt-in.
 Secret persistence uses `source/shared/node/windows-private-path.ts` to replace
 inherited ACLs with an exact current-user/SYSTEM/Administrators allow-list.
 

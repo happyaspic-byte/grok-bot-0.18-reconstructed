@@ -111,6 +111,7 @@ import {
   NoopWebScraperService,
 } from "../../packages/agent/utils/agent-config.js";
 import { createSubagentModels } from "../../packages/agent/tools/core/subagent/models.js";
+import type { TaskSubagentModelConfig } from "../../packages/agent/tools/task-cluster-internal.js";
 import { createSandSummarizationHandler } from "./conversation-state.js";
 import {
   createDiskPressureReminderMiddleware,
@@ -694,16 +695,21 @@ export interface TurnAgentRunInputProjection {
 export async function createTurnAgentRunInputProjection(
   input: TurnAgentRunInputProjectionFactoryInput,
 ): Promise<TurnAgentRunInputProjection> {
+  input.runCtx.signal.throwIfAborted();
   const action = await input.createAction(input.runCtx);
+  input.runCtx.signal.throwIfAborted();
   let mcpTools: readonly unknown[] = [];
   if (input.mcp !== undefined) {
     try {
       mcpTools = [...await input.mcp.getTools(input.runCtx)];
     } catch (error) {
+      input.runCtx.signal.throwIfAborted();
       input.onMcpDiscoveryFailed?.(error);
     }
+    input.runCtx.signal.throwIfAborted();
     input.mcp.refreshAccountConfig();
   }
+  input.runCtx.signal.throwIfAborted();
   const conversationState = input.getConversationState();
   const baseState = ConversationStateStructure.fromBinary(
     conversationState.toBinary(),
@@ -1177,6 +1183,16 @@ export interface TurnAgentCompositionHost {
   createExecutorSubagentConfig?(): unknown;
   getSubagentTypeName?(config: unknown): string | undefined;
   transcriptsFolderAvailable?(): boolean;
+}
+
+/** Built-in desktop workers shared by the dormant composition and the live host owner. */
+export function createTurnDesktopSubagentConfigs(
+  browserUseOffered: boolean,
+): readonly TaskSubagentModelConfig[] {
+  return [
+    createSandComputerUseSubagentConfig({ browserUseOffered }),
+    ...(browserUseOffered ? [createSandBrowserUseSubagentConfig()] : []),
+  ];
 }
 
 export interface TurnAgentProductionReadiness {
@@ -1694,8 +1710,7 @@ export function createTurnAgentComposition(
     const configs = [...(host.getSubagentConfigs?.() ?? [])];
     if (host.toolHost.remoteBoxHasDesktop && host.toolHost.getRemoteBoxAvailable()) {
       const browserUseOffered = host.isBrowserUseSubagentEnabled?.() === true;
-      configs.push(createSandComputerUseSubagentConfig({ browserUseOffered }));
-      if (browserUseOffered) configs.push(createSandBrowserUseSubagentConfig());
+      configs.push(...createTurnDesktopSubagentConfigs(browserUseOffered));
     }
     if (host.isSystemPromptOverridden !== true && host.isMultitaskEnabled?.() === true) {
       const executor = createSandExecutorSubagentConfig();

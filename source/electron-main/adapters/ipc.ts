@@ -3,7 +3,10 @@ import type { ProductionDisposable, ProductionServiceContext } from "../main-pro
 import { registerExperimentsIpc } from "../experiments/experiments-ipc.js";
 import { registerSettingsIpc } from "../prefs/settings-ipc.js";
 import { createTrustedSenderGuards, registerSecretsIpc } from "../secrets/secrets-ipc.js";
-import { revokeCliProxyLeaseOrStopOwnedLocalDocker } from "../box/local-docker-host-connector.js";
+import {
+  revokeCliProxyLeaseOrStopOwnedLocalDocker,
+  stopLocalDockerBox,
+} from "../box/local-docker-host-connector.js";
 import { reportDesktopEdgeFailure } from "../desktop-edge-failures.js";
 import { requireDisposable, requireFunction, requireObject } from "./provider-guards.js";
 
@@ -51,7 +54,7 @@ export function createProductionSecretsIpcRegistrar(): ProductionIpcRegistrar {
         await revokeCliProxyLeaseOrStopOwnedLocalDocker(() =>
           coordinator.pushHostSettingsStrict({
             clearCliProxyCredentialLease: true,
-          }));
+          }), () => stopLocalDockerBox(context.settings.settingsStore.settingsPath));
       },
       afterCliProxyMutation: async () => {
         const coordinator = context.requireCoordinator() as ReturnType<typeof context.requireCoordinator> & {

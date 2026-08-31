@@ -11,7 +11,8 @@ export const COORDINATOR_PROTOCOL_VERSION = 1;
 export const COORDINATOR_TRANSPORT_STATE_FAMILY = "coordinator-transport-state";
 
 type EventListener = (payload: unknown) => void;
-type TransportListener = (state: "connected" | "down") => void;
+export type CoordinatorTransportState = "connected" | "down";
+type TransportListener = (state: CoordinatorTransportState) => void;
 
 interface PendingCall {
   method: string;
@@ -56,26 +57,53 @@ export interface ProductionCoordinatorClient {
   isEgressTunnelAvailable(): Promise<boolean>;
   subscribe(family: string, listener: EventListener): () => void;
   subscribeTransport(listener: TransportListener): () => void;
+  getTransportState(): CoordinatorTransportState;
+  getPortGeneration(): number;
+  waitForTransportConnected(timeoutMs?: number): Promise<void>;
+  waitForTransportConnectedAfterPortGeneration(portGeneration: number, timeoutMs?: number): Promise<void>;
   dispose(): void;
 }
 
 export function createCoordinatorClient(portBridge: CoordinatorPortBridge): ProductionCoordinatorClient | null {
   const eventListeners = new Map<string, Set<EventListener>>();
   const transportListeners = new Set<TransportListener>();
+  const portGenerationListeners = new Set<() => void>();
   const pending = new Map<string, PendingCall>();
   let port: TransferredCoordinatorPort | null = null;
   let nextRequestId = 0;
   let disposed = false;
   let serving = false;
+  let transportState: CoordinatorTransportState = "down";
+  let portGeneration = 0;
   let resolveReady = () => {};
   let rejectReady = (_reason: unknown) => {};
   const makeReady = () => new Promise<void>((resolve, reject) => {
     resolveReady = resolve;
     rejectReady = reject;
   });
-  const ready = makeReady();
-  let currentReady = ready;
-  ready.catch(() => {});
+  let currentReady = makeReady();
+  currentReady.catch(() => {});
+  const waitForCurrentReady = async (): Promise<void> => {
+    while (true) {
+      if (disposed) throw new Error("Coordinator client is disposed.");
+      const candidate = currentReady;
+      try {
+        await candidate;
+      } catch (error) {
+        if (disposed) throw error;
+        if (candidate !== currentReady) continue;
+        throw error;
+      }
+      if (disposed) throw new Error("Coordinator client is disposed.");
+      if (candidate === currentReady && port != null && serving) return;
+    }
+  };
+
+  const publishTransport = (state: CoordinatorTransportState): void => {
+    if (transportState === state) return;
+    transportState = state;
+    for (const listener of transportListeners) listener(state);
+  };
 
   const rejectCalls = (reason: string) => {
     rejectReady(new Error(reason));
@@ -88,7 +116,7 @@ export function createCoordinatorClient(portBridge: CoordinatorPortBridge): Prod
     port = null;
     serving = false;
     rejectCalls(reason);
-    for (const listener of transportListeners) listener("down");
+    publishTransport("down");
     currentReady = makeReady();
     currentReady.catch(() => {});
     claim?.request();
@@ -104,7 +132,6 @@ export function createCoordinatorClient(portBridge: CoordinatorPortBridge): Prod
       if (value.protocolVersion !== COORDINATOR_PROTOCOL_VERSION) return disconnect(expectedPort, "coordinator protocol version mismatch");
       serving = true;
       resolveReady();
-      for (const listener of transportListeners) listener("connected");
       return;
     }
     if (value.kind === "lifecycle" && value.phase === "shutdown") return disconnect(expectedPort, "coordinator requested shutdown");
@@ -126,7 +153,7 @@ export function createCoordinatorClient(portBridge: CoordinatorPortBridge): Prod
     }
     if (value.kind === "event" && typeof value.family === "string") {
       if (value.family === COORDINATOR_TRANSPORT_STATE_FAMILY && isRecord(value.payload) && (value.payload.state === "connected" || value.payload.state === "down")) {
-        for (const listener of transportListeners) listener(value.payload.state);
+        publishTransport(value.payload.state);
       }
       for (const listener of eventListeners.get(value.family) ?? []) listener(value.payload);
     }
@@ -141,6 +168,9 @@ export function createCoordinatorClient(portBridge: CoordinatorPortBridge): Prod
       port = nextPort;
       previousPort?.close();
       serving = false;
+      portGeneration += 1;
+      publishTransport("down");
+      for (const listener of portGenerationListeners) listener();
       if (replacesLivePort) {
         currentReady = makeReady();
         currentReady.catch(() => {});
@@ -164,7 +194,7 @@ export function createCoordinatorClient(portBridge: CoordinatorPortBridge): Prod
   };
 
   return {
-    ready,
+    get ready() { return waitForCurrentReady(); },
     call,
     getAgentTranscriptWindow: async (args) => await call("getAgentTranscriptWindow", args) as CoordinatorTranscriptWindowResponse,
     getAgentThread: async (args) => await call("getAgentThread", args) as CoordinatorAgentThreadResponse,
@@ -177,17 +207,88 @@ export function createCoordinatorClient(portBridge: CoordinatorPortBridge): Prod
     },
     subscribeTransport(listener) {
       transportListeners.add(listener);
+      listener(transportState);
       return () => transportListeners.delete(listener);
+    },
+    getTransportState: () => transportState,
+    getPortGeneration: () => portGeneration,
+    waitForTransportConnected(timeoutMs = 20_000) {
+      if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return Promise.reject(new Error("Coordinator connection timeout must be positive."));
+      if (disposed) return Promise.reject(new Error("Coordinator client is disposed."));
+      if (transportState === "connected") return Promise.resolve();
+      return new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const finish = (error?: Error) => {
+          if (settled) return;
+          settled = true;
+          globalThis.clearTimeout(timeout);
+          transportListeners.delete(onTransport);
+          if (error == null) resolve();
+          else reject(error);
+        };
+        const onTransport: TransportListener = (state) => {
+          if (state === "connected") finish();
+        };
+        const timeout = globalThis.setTimeout(() => finish(new Error("Timed out waiting for the Local 9Router coordinator to connect.")), timeoutMs);
+        transportListeners.add(onTransport);
+        if (transportState === "connected") finish();
+      });
+    },
+    waitForTransportConnectedAfterPortGeneration(baselineGeneration, timeoutMs = 20_000) {
+      if (!Number.isSafeInteger(baselineGeneration) || baselineGeneration < 0) {
+        return Promise.reject(new Error("Coordinator port generation must be a non-negative safe integer."));
+      }
+      if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+        return Promise.reject(new Error("Coordinator connection timeout must be positive."));
+      }
+      if (disposed) return Promise.reject(new Error("Coordinator client is disposed."));
+      return new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const finish = (error?: Error) => {
+          if (settled) return;
+          settled = true;
+          globalThis.clearTimeout(timeout);
+          transportListeners.delete(onTransport);
+          portGenerationListeners.delete(check);
+          if (error == null) resolve();
+          else reject(error);
+        };
+        const check = () => {
+          if (disposed) {
+            finish(new Error("Coordinator client is disposed."));
+            return;
+          }
+          if (portGeneration > baselineGeneration && transportState === "connected") finish();
+        };
+        const onTransport: TransportListener = () => check();
+        const timeout = globalThis.setTimeout(
+          () => finish(new Error("Timed out waiting for the replacement Local 9Router coordinator to connect.")),
+          timeoutMs
+        );
+        transportListeners.add(onTransport);
+        portGenerationListeners.add(check);
+        check();
+      });
     },
     dispose() {
       if (disposed) return;
       disposed = true;
-      port?.postMessage({ kind: "lifecycle", phase: "shutdown", reason: "requested", detail: null });
-      claim.release();
-      rejectCalls("coordinator source disposed");
-      port?.close();
-      port = null;
-      serving = false;
+      for (const listener of portGenerationListeners) listener();
+      const activePort = port;
+      try {
+        activePort?.postMessage({ kind: "lifecycle", phase: "shutdown", reason: "requested", detail: null });
+      } catch {
+        // A closed port must not prevent release or reject pending readiness.
+      }
+      try {
+        claim.release();
+      } finally {
+        rejectCalls("coordinator source disposed");
+        try { activePort?.close(); }
+        catch { /* The source is already disposed and detached. */ }
+        port = null;
+        serving = false;
+      }
     }
   };
 }

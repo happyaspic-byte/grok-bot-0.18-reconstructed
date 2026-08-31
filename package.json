@@ -1,9 +1,9 @@
 {
   "name": "grok-bot-0.18-reconstructed",
-  "version": "0.18.0-reconstructed.2",
+  "version": "0.18.0-reconstructed.3",
   "private": true,
   "type": "module",
-  "description": "Source-oriented reconstruction of the publicly shipped Grok Bot 0.18.0 macOS application",
+  "description": "Source-oriented reconstruction of the publicly shipped Grok Bot 0.18.0 desktop application",
   "engines": {
     "node": ">=26.5.0 <27"
   },
@@ -12,6 +12,7 @@
     "bootstrap:windows": "node scripts/bootstrap-windows-runtime.mjs",
     "build": "node scripts/build.mjs",
     "check": "npm run typecheck && npm run source:typecheck && npm test",
+    "docker:image:verify": "node scripts/verify-local-docker-image.mjs",
     "frontend:build": "vite build --config frontend/vite.config.ts",
     "frontend:recover": "node scripts/recover-frontend.mjs",
     "native:patch": "node scripts/apply-third-party-patches.mjs",

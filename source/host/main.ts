@@ -19,7 +19,7 @@ import {
 
 export const BOX_COPY_IN_ARG = "--box-copy-in";
 export const BOX_COPY_IN_EXIT_FAILED = 1;
-export const SHUTDOWN_WATCHDOG_MS = 5_000;
+export const SHUTDOWN_WATCHDOG_MS = 8_000;
 
 export interface HostProcessControl {
   readonly argv: readonly string[];
@@ -326,9 +326,23 @@ export function installShutdownHandlers(
 
     void (async () => {
       try {
-        await gateway.close();
-        await host.dispose();
-        await boxExecDaemon?.close();
+        // Close runner admission immediately on signal. Gateway close may
+        // await in-flight requests, so it must not postpone host cancellation.
+        const hostDisposal = host.dispose();
+        // The daemon owns its own bounded stop and can close alongside the
+        // host/gateway instead of consuming another serial watchdog budget.
+        const daemonDisposal = boxExecDaemon?.close() ?? Promise.resolve();
+        const gatewayDisposal = gateway.close();
+        const shutdownResults = await Promise.allSettled([
+          hostDisposal,
+          daemonDisposal,
+          gatewayDisposal,
+        ]);
+        const failed = shutdownResults.find(
+          (result): result is PromiseRejectedResult =>
+            result.status === "rejected",
+        );
+        if (failed !== undefined) throw failed.reason;
         await clearGatewayDiscovery();
       } catch (error) {
         host.reportProcessCrash(error, "shutdown_error");

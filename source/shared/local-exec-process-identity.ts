@@ -22,9 +22,9 @@ export interface ExpectedLocalExecProcessIdentity {
 function containsExactArgument(command: string, argument: string): boolean {
   let offset = command.indexOf(argument);
   while (offset >= 0) {
-    const before = offset === 0 || /\s/.test(command[offset - 1]!);
+    const before = offset === 0 || /[\s"']/.test(command[offset - 1]!);
     const end = offset + argument.length;
-    const after = end === command.length || /\s/.test(command[end]!);
+    const after = end === command.length || /[\s"']/.test(command[end]!);
     if (before && after) return true;
     offset = command.indexOf(argument, offset + 1);
   }

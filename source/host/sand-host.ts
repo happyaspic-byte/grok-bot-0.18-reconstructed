@@ -248,6 +248,7 @@ export class SandHost {
   private hostExtensions: HostExtensionRegistry | undefined;
   private rosterBookkeeping: HostRosterBookkeeping | undefined;
   private runnerComposition: HostRunnerComposition | undefined;
+  private disposePromise: Promise<void> | undefined;
   private lastBusyAtMs: number;
 
   constructor(readonly runtime: SandHostRuntime) {
@@ -724,9 +725,29 @@ export class SandHost {
     return this.requireHostExtensions().api("webauthn-proxy");
   }
 
-  async dispose(): Promise<void> {
+  dispose(): Promise<void> {
+    if (this.disposePromise !== undefined) return this.disposePromise;
+    let resolveDisposal!: () => void;
+    let rejectDisposal!: (error: unknown) => void;
+    const stableDisposal = new Promise<void>((resolve, reject) => {
+      resolveDisposal = resolve;
+      rejectDisposal = reject;
+    });
+    this.disposePromise = stableDisposal;
+    void this.disposeOnce().then(resolveDisposal, rejectDisposal);
+    return stableDisposal;
+  }
+
+  private async disposeOnce(): Promise<void> {
     const extensions = this.hostExtensions;
     if (extensions == null) return;
+    // Close turn admission synchronously with dispose(), before any other
+    // extension shutdown await can leave a window for new root work.
+    const runnerComposition = this.runnerComposition;
+    const runnerDisposal = runnerComposition?.dispose() ?? Promise.resolve();
+    // It is awaited below after the other pre-stop hooks; observe an early
+    // rejection immediately so the interim cannot become unhandled.
+    void runnerDisposal.catch(() => {});
 
     if (optionalMethod(this.transcript, "isQuiescingForUpgrade")?.()) {
       optionalMethod(
@@ -738,9 +759,13 @@ export class SandHost {
     await optionalMethod(extensions.api("automations"), "suspendWakes")?.();
     optionalMethod(extensions.api("cross-user-sharing"), "prepareForUpgrade")?.();
     optionalMethod(extensions.api("auto-review"), "expirePendingApprovals")?.();
+    // Active runners own checkpoint writes into transcript-backed stores.
+    // Stop and drain them while those stores are still open.
+    await runnerDisposal;
+    if (this.runnerComposition === runnerComposition) {
+      this.runnerComposition = undefined;
+    }
     await optionalMethod(this.transcript, "dispose")?.();
-    await this.runnerComposition?.dispose();
-    this.runnerComposition = undefined;
     await extensions.stop();
   }
 

@@ -170,8 +170,11 @@ export async function composeCoordinator(dependencies: ComposeCoordinatorDepende
       resolveGatewayConnection: (args) => command(commands, "resolveGatewayConnection", args),
       mintLocalExecDaemonCredential: (args) => command(commands, "mintLocalExecDaemonCredential", args),
       spawnLocalExecDaemon: (args) => command(commands, "spawnLocalExecDaemon", args),
+      reconcileLocalExecStartupQuarantine: (args) => command(commands, "reconcileLocalExecStartupQuarantine", args),
+      confirmLocalExecDaemonReady: (args) => command(commands, "confirmLocalExecDaemonReady", args),
       isProcessAlive: (args) => command(commands, "isProcessAlive", args),
       getProcessIdentity: (args) => command(commands, "getProcessIdentity", args),
+      inspectLocalExecProcessIdentity: (args) => command(commands, "inspectLocalExecProcessIdentity", args),
       waitLocalExecDaemonExit: (args) => command(commands, "waitLocalExecDaemonExit", args),
       terminateProcess: (args) => command(commands, "terminateProcess", args)
     },
@@ -240,7 +243,15 @@ export async function composeCoordinator(dependencies: ComposeCoordinatorDepende
   };
   server = createRendererPortServer(
     { post: (frame) => carrier.data.post(frame), close: () => carrier.data.close() },
-    { dispatchRequest, onServing: () => { toolRelay.replay(); if (!isGatewayStreamLive) server.postEvent(COORDINATOR_TRANSPORT_STATE_FAMILY, { state: "down" }); } }
+    {
+      dispatchRequest,
+      onServing: () => {
+        toolRelay.replay();
+        server.postEvent(COORDINATOR_TRANSPORT_STATE_FAMILY, {
+          state: isGatewayStreamLive ? "connected" : "down",
+        });
+      },
+    }
   );
   const mainDispatch = createGatewayRequestDispatch(gatewayClient, isCoordinatorMainMethod);
   const applyPause = (paused: boolean) => {

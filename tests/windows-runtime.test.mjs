@@ -9,6 +9,7 @@ import { createPackageWithOptions } from "@electron/asar";
 import { canonicalAsarPath, extractAsarFile, nativeAsarPath } from "../scripts/lib/asar-paths.mjs";
 import { withWindowsMsvcNodeGypSettings } from "../scripts/lib/node-gyp-environment.mjs";
 import { getRuntimePlatformSpec, resolveRuntimeLayout } from "../scripts/lib/platform-runtime.mjs";
+import { assertNoWindowsUpdaterArtifacts, verifyWindowsPortable, windowsPortableManifestName } from "../scripts/lib/windows-package.mjs";
 import { assertPeX64, sha256File, validateWindowsRuntime, windowsInstalledRuntimeCandidates } from "../scripts/lib/windows-runtime.mjs";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
@@ -67,6 +68,47 @@ test("Windows x64 runtime manifest pins the NSIS carrier, ASAR, and extractor", 
     assert.match(nativeBuild, /node-gyp", "bin", "node-gyp\.js"/);
     assert.match(nativeBuild, /withWindowsMsvcNodeGypSettings\(/);
     assert.doesNotMatch(nativeBuild, /node-gyp\.cmd/);
+  }
+});
+
+test("Windows portable verification rejects a manifest for another reconstructed version", async () => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-win-version-fixture-"));
+  try {
+    await writeFile(path.join(temporary, windowsPortableManifestName), `${JSON.stringify({
+      schemaVersion: 1,
+      kind: "unofficial-reconstructed-windows-portable",
+      platform: "win32",
+      arch: "x64",
+      reconstructedVersion: "0.18.0-reconstructed.999",
+      trust: { distributionSigned: false, publicReleaseEligible: false },
+    })}\n`);
+    await assert.rejects(() => verifyWindowsPortable(temporary), /Portable manifest identity is invalid/);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("Windows portable verification rejects every updater metadata and uninstaller artifact", async () => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-win-updater-fixture-"));
+  try {
+    await assertNoWindowsUpdaterArtifacts(temporary);
+    for (const relative of [
+      "resources/elevate.exe",
+      "resources/app-update.yml",
+      "resources/latest.yml",
+      "Update.exe",
+      "Uninstall Grok Bot.exe",
+    ]) {
+      const target = await writeFixtureFile(temporary, relative, "must not ship\n");
+      await assert.rejects(
+        () => assertNoWindowsUpdaterArtifacts(temporary),
+        new RegExp(`Updater artifact remains: ${relative.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
+      );
+      await rm(target, { force: true });
+    }
+    await assertNoWindowsUpdaterArtifacts(temporary);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
   }
 });
 

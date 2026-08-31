@@ -1,5 +1,6 @@
 import {
   backgroundShellExecutorResource,
+  writeBackgroundShellInputExecutorResource,
 } from "../../packages/agent-exec/background-shell.js";
 import { computerUseExecutorResource } from "../../packages/agent-exec/computer-use.js";
 import { readExecutorResource } from "../../packages/agent-exec/read.js";
@@ -19,6 +20,8 @@ import type { Context } from "../../packages/context/core.js";
 import type {
   BackgroundShellSpawnArgs,
   BackgroundShellSpawnResult,
+  WriteShellStdinArgs,
+  WriteShellStdinResult,
 } from "../../packages/proto/generated/agent/v1/background_shell_exec_pb.js";
 import type {
   ComputerUseArgs,
@@ -68,6 +71,8 @@ export interface RemoteBoxResourceHost {
   readonly remoteBoxHasDesktop: boolean;
   readonly preparedRemoteBoxConnection?: Promise<RemoteConnection | undefined>;
   resolveBoxId(): string;
+  /** Window assignment identity can differ from the shared container identity. */
+  resolveWindowAgentId?(): string;
   getConversationId(): string;
   setRemoteBoxTerminalsFolder(folder: string): void;
   readonly autoReviewGate: {
@@ -98,6 +103,7 @@ export interface RemoteBoxResourceHost {
 export function createRemoteBoxResourceAccessor(host: RemoteBoxResourceHost) {
   const box = host.remoteBox;
   const boxId = host.resolveBoxId();
+  const windowAgentId = host.resolveWindowAgentId?.() ?? boxId;
   const agentId = host.getConversationId();
   let connectionPromise: Promise<RemoteConnection | undefined> | undefined;
   const preparedConnection = host.preparedRemoteBoxConnection;
@@ -109,7 +115,7 @@ export function createRemoteBoxResourceAccessor(host: RemoteBoxResourceHost) {
     try {
       const connection = await (
         connectionPromise ??= (async () =>
-          await preparedConnection ?? box.ensureReady(context, boxId))()
+          await preparedConnection ?? box.ensureReady(context, windowAgentId))()
       );
       if (connection == null) throw new Error(SAND_BOX_NOT_READY_MESSAGE);
       host.setRemoteBoxTerminalsFolder(connection.terminalsFolder);
@@ -152,7 +158,7 @@ export function createRemoteBoxResourceAccessor(host: RemoteBoxResourceHost) {
     await host.computerUse.getOrCreateNavigationProbe()?.captureBaseline(
       context.withDetached(),
       connection.remoteAccessor,
-      boxAgentWindowIndex(box, boxId) ?? 1,
+      boxAgentWindowIndex(box, windowAgentId) ?? 1,
     );
   };
 
@@ -208,6 +214,18 @@ export function createRemoteBoxResourceAccessor(host: RemoteBoxResourceHost) {
       }
     },
   } satisfies Executor<BackgroundShellSpawnArgs, BackgroundShellSpawnResult>);
+  accessor.register(writeBackgroundShellInputExecutorResource, {
+    execute: async (
+      context: Context,
+      args: WriteShellStdinArgs,
+      options,
+    ): Promise<WriteShellStdinResult> => {
+      const connection = await connect(context);
+      return await connection.remoteAccessor
+        .get(writeBackgroundShellInputExecutorResource)
+        .execute(context, args, options);
+    },
+  } satisfies Executor<WriteShellStdinArgs, WriteShellStdinResult>);
   accessor.register(readExecutorResource, {
     execute: async (
       context: Context,
@@ -252,7 +270,7 @@ export function createRemoteBoxResourceAccessor(host: RemoteBoxResourceHost) {
           throw new SandBoxNoMonitorAvailableError();
         }
         ownsMonitorForNavigationAudit = true;
-        const windowIndex = boxAgentWindowIndex(box, boxId) ?? 1;
+        const windowIndex = boxAgentWindowIndex(box, windowAgentId) ?? 1;
         void host.computerUse.getOrCreateNavigationProbe()?.captureBaseline(
           context.withDetached(),
           connection.remoteAccessor,

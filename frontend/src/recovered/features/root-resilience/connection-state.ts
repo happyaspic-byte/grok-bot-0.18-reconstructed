@@ -28,6 +28,7 @@ export interface CoordinatorConnectionSnapshot extends CoordinatorConnectionRead
 
 export interface CoordinatorConnectionSource {
   readonly ready: Promise<void>;
+  getTransportState(): CoordinatorTransportState;
   getAccountStatus(): Promise<CursorAuthStatus>;
   subscribeAccount(listener: (status: CursorAuthStatus) => void): () => void;
   subscribeTransport(listener: (state: CoordinatorTransportState) => void): () => void;
@@ -36,12 +37,13 @@ export interface CoordinatorConnectionSource {
 
 /** Adapter for the existing coordinator/account-session edges; no new bridge API. */
 export function createCoordinatorConnectionSource(
-  client: Pick<ProductionCoordinatorClient, "ready" | "subscribeTransport">,
+  client: Pick<ProductionCoordinatorClient, "ready" | "getTransportState" | "subscribeTransport">,
   bridge: Pick<DesktopBridge, "cursorAccount">,
   retry: () => Promise<unknown>
 ): CoordinatorConnectionSource {
   return {
-    ready: client.ready,
+    get ready() { return client.ready; },
+    getTransportState: () => client.getTransportState(),
     getAccountStatus: () => bridge.cursorAccount.getStatus(),
     subscribeAccount: (listener) => bridge.cursorAccount.onStatusChanged(listener),
     subscribeTransport: (listener) => client.subscribeTransport(listener),
@@ -220,9 +222,9 @@ export function createCoordinatorConnectionController(
         if (isCurrent(expectedGeneration)) onAccount(status);
       }, () => {});
       source.ready.then(() => {
-        if (isCurrent(expectedGeneration)) onTransport("connected");
+        if (isCurrent(expectedGeneration)) onTransport(source.getTransportState());
       }, () => {
-        if (isCurrent(expectedGeneration)) onTransport("down");
+        if (isCurrent(expectedGeneration)) onTransport(source.getTransportState());
       });
     },
     ingestAccount: onAccount,

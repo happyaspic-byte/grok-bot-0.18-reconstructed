@@ -12,12 +12,14 @@ export type ComputerRebuildTransportState = "connected" | "down";
 
 export interface ComputerRebuildTransportSource {
   readonly ready: Promise<void>;
+  getTransportState(): ComputerRebuildTransportState;
   subscribeTransport(listener: (state: unknown) => void): () => void;
 }
 
-export function createComputerRebuildTransportSource(client: Pick<ProductionCoordinatorClient, "ready" | "subscribeTransport">): ComputerRebuildTransportSource {
+export function createComputerRebuildTransportSource(client: Pick<ProductionCoordinatorClient, "ready" | "getTransportState" | "subscribeTransport">): ComputerRebuildTransportSource {
   return {
     ready: client.ready,
+    getTransportState: () => client.getTransportState(),
     subscribeTransport: (listener) => client.subscribeTransport(listener)
   };
 }
@@ -77,7 +79,7 @@ export function createComputerRebuildTransportStore(input: {
     notify();
     const request = input.source.ready.then(() => {
       if (disposed || !connected || attempt !== generation) return;
-      ingest("connected");
+      ingest(input.source.getTransportState());
     }, () => {
       if (disposed || !connected || attempt !== generation) return;
       ingest("down");

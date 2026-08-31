@@ -22,7 +22,6 @@ import {
   isLocalExecDaemonProcess,
   isProcessAlive,
   killLocalExecDaemon,
-  terminateProcess,
 } from "./local-exec/local-exec-native.js";
 import { createAgentsControlFeed } from "./notifications/agents-control-feed.js";
 import { SandDockBadgeManager } from "./notifications/dock-badge-manager.js";
@@ -136,7 +135,10 @@ export interface ElectronStartupProviderPorts {
   readonly homeDir?: string;
   readonly readDiscovery?: () => Promise<{ readonly pid: number; readonly entryRealpath?: string; readonly generationToken?: string; readonly inflightCount?: number } | null>;
   readonly isDaemonProcess?: (pid: number, discovery: { readonly entryRealpath?: string; readonly generationToken?: string }) => boolean;
-  readonly terminate?: (pid: number) => Promise<void>;
+  readonly terminate?: (
+    pid: number,
+    discovery: { readonly entryRealpath?: string; readonly generationToken?: string },
+  ) => Promise<void>;
   readonly isProcessAlive?: (pid: number) => boolean;
   readonly scheduleStuck?: (listener: () => void) => void;
   readonly monotonicNow?: () => number;
@@ -312,10 +314,13 @@ export function createProductionUpdaterInstallerBinding(
   const env = ports.env ?? process.env;
   const platform = ports.platform ?? process.platform;
   let created = false;
+  let requiresLocalExecDiscovery: (() => boolean) | undefined;
   return {
     async create(context) {
       if (created) throw new Error("Electron production updater service was created more than once.");
       created = true;
+      requiresLocalExecDiscovery = () =>
+        context.settings.settingsStore.getBoxRuntime() === "local-docker";
       const relay = createUpdateTelemetryRelay();
       const getHostStatus = coordinatorHostStatus(context);
       const updateService = createUpdateServiceWiring({
@@ -380,7 +385,10 @@ export function createProductionUpdaterInstallerBinding(
         },
       };
     },
-    killLocalExecDaemon: () => killLocalExecDaemon(getLocalExecDaemonDiscoveryPath()),
+    killLocalExecDaemon: () => killLocalExecDaemon(
+      getLocalExecDaemonDiscoveryPath(),
+      { requireDiscovery: requiresLocalExecDiscovery?.() === true },
+    ),
   };
 }
 
@@ -522,7 +530,15 @@ export function createProductionStartupBinding(
       dialog: ports.dialog,
       readDiscovery: ports.readDiscovery ?? (() => readLocalExecDaemonDiscovery()),
       isDaemonProcess: ports.isDaemonProcess ?? ((pid, discovery) => isLocalExecDaemonProcess(pid, discovery.entryRealpath, discovery.generationToken)),
-      terminate: ports.terminate ?? terminateProcess,
+      terminate: ports.terminate ?? ((pid, discovery) => killLocalExecDaemon(
+        getLocalExecDaemonDiscoveryPath(),
+        {
+          expectedPid: pid,
+          ...(discovery.entryRealpath === undefined
+            ? {}
+            : { expectedEntryRealpath: discovery.entryRealpath }),
+        },
+      )),
       isProcessAlive: ports.isProcessAlive ?? isProcessAlive,
       reportFailure: reportDesktopEdgeFailure,
       reportFailureClass: reportDesktopEdgeFailureClass,

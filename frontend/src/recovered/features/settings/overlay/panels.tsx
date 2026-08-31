@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { CursorUsageSummary, CursorUsageUpgradeAction, DesktopTimeZoneState } from "../../../contracts/desktop-bridge";
 import { egressTunnelStatusDescription, type EgressTunnelStatus, type UpdateStatus, type UpdateTrack } from "./updates";
 // @evidence src/app/dist/renderer/assets/index-BlqerJhg.js#L1
@@ -12,8 +12,16 @@ import type { SandIconPlatform } from "../../../ui/sand-icon-registry";
 import { SandSelect } from "../../../ui/sand-floating-primitives";
 import { SandSwitch } from "../../../ui/sand-form-primitives";
 import { OverlayDialog } from "../../../ui/overlay-primitives";
-import { ROUTER_PROVIDERS, routerProviderById, type RouterProviderId } from "./router";
+import {
+  ROUTER_PROVIDERS,
+  cliProxyDraftOrigin,
+  createCliProxyApiKeyPersistenceGuard,
+  routerProviderById,
+  shouldClearCliProxyApiKeyDraft,
+  type RouterProviderId,
+} from "./router";
 import type { CliProxyPublicConfig, CliProxyStatus } from "../../../../../../source/shared/cli-proxy";
+import type { LocalWorkspaceReadiness } from "../../../../production/local-workspace";
 
 export type AccountState =
   | { kind: "logged-out"; errorMessage?: string }
@@ -472,9 +480,20 @@ export interface RouterSettingsPanelProps {
   cliProxy?: {
     status: CliProxyStatus | null;
     pending: boolean;
-    onSave(config: CliProxyPublicConfig & { readonly apiKey?: string }): Promise<unknown>;
+    onSave(
+      config: CliProxyPublicConfig & { readonly apiKey?: string },
+      onCredentialPersisted: () => void,
+    ): Promise<unknown>;
     onDelete(): Promise<unknown>;
     onTest(): Promise<unknown>;
+  };
+  localWorkspace?: {
+    readiness: LocalWorkspaceReadiness;
+    error?: string | null;
+    onContinue(
+      config: CliProxyPublicConfig & { readonly apiKey?: string },
+      onCredentialPersisted: () => void,
+    ): Promise<unknown>;
   };
 }
 
@@ -492,7 +511,7 @@ export interface RouterBoxRuntimeState {
   } | null;
 }
 
-export function RouterSettingsPanel({ provider, pending = false, onChange, boxRuntime, cliProxy }: RouterSettingsPanelProps) {
+export function RouterSettingsPanel({ provider, pending = false, onChange, boxRuntime, cliProxy, localWorkspace }: RouterSettingsPanelProps) {
   const selectedProvider = routerProviderById(provider);
   const [baseUrl, setBaseUrl] = useState("");
   const [model, setModel] = useState("");
@@ -500,23 +519,148 @@ export function RouterSettingsPanel({ provider, pending = false, onChange, boxRu
   const [allowRemoteHttps, setAllowRemoteHttps] = useState(false);
   const [allowTailscaleHttp, setAllowTailscaleHttp] = useState(false);
   const [apiKey, setApiKey] = useState("");
+  const baseUrlRef = useRef("");
+  const apiKeyRef = useRef("");
+  const apiKeyOriginRef = useRef<string | null>(null);
+  const apiKeyRevisionRef = useRef(0);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const clearApiKeyDraft = () => {
+    apiKeyRevisionRef.current += 1;
+    apiKeyRef.current = "";
+    apiKeyOriginRef.current = null;
+    setApiKey("");
+  };
+  const updateBaseUrl = (nextBaseUrl: string) => {
+    if (shouldClearCliProxyApiKeyDraft(
+      apiKeyRef.current,
+      apiKeyOriginRef.current,
+      nextBaseUrl,
+    )) clearApiKeyDraft();
+    baseUrlRef.current = nextBaseUrl;
+    setBaseUrl(nextBaseUrl);
+  };
+  const updateApiKey = (nextApiKey: string) => {
+    apiKeyRevisionRef.current += 1;
+    apiKeyRef.current = nextApiKey;
+    apiKeyOriginRef.current = nextApiKey.trim().length === 0
+      ? null
+      : cliProxyDraftOrigin(baseUrlRef.current);
+    setApiKey(nextApiKey);
+  };
   useEffect(() => {
     if (cliProxy?.status == null) return;
-    setBaseUrl(cliProxy.status.baseUrl);
-    setModel(cliProxy.status.model);
+    updateBaseUrl(cliProxy.status.baseUrl);
+    setModel((current) => {
+      if (cliProxy.status!.model.trim().length > 0) return cliProxy.status!.model;
+      if (!cliProxy.status!.configured && cliProxy.status!.probe == null) return "";
+      if (current.trim().length > 0) return current;
+      return cliProxy.status!.probe?.models[0] ?? "";
+    });
     setProtocol(cliProxy.status.protocol);
     setAllowRemoteHttps(cliProxy.status.allowRemoteHttps);
     setAllowTailscaleHttp(cliProxy.status.allowTailscaleHttp === true);
   }, [cliProxy?.status]);
+  const config = (): CliProxyPublicConfig & { readonly apiKey?: string } => {
+    // Read the key from the same mutable identity tracked by the persistence
+    // guard, so the submitted bytes and submitted revision cannot diverge
+    // between an input event and React's next render.
+    const draftApiKey = apiKeyRef.current;
+    return {
+      baseUrl,
+      model,
+      protocol,
+      allowRemoteHttps,
+      allowTailscaleHttp,
+      ...(draftApiKey.trim().length === 0 ? {} : { apiKey: draftApiKey })
+    };
+  };
+  const credentialPersistenceAcknowledgement = () => createCliProxyApiKeyPersistenceGuard(
+    {
+      revision: apiKeyRevisionRef.current,
+      origin: apiKeyOriginRef.current,
+    },
+    () => ({
+      revision: apiKeyRevisionRef.current,
+      origin: apiKeyOriginRef.current,
+    }),
+    clearApiKeyDraft,
+  );
+  const runAction = async (action: () => Promise<unknown>): Promise<boolean> => {
+    setActionError(null);
+    try {
+      await action();
+      return true;
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : String(reason));
+      return false;
+    }
+  };
   const saveCliProxy = async () => {
     if (cliProxy == null || cliProxy.pending) return;
-    try {
-      await cliProxy.onSave({ baseUrl, model, protocol, allowRemoteHttps, allowTailscaleHttp, ...(apiKey.trim().length === 0 ? {} : { apiKey }) });
-      setApiKey("");
-    } catch {}
+    const onCredentialPersisted = credentialPersistenceAcknowledgement();
+    await runAction(() => cliProxy.onSave(config(), onCredentialPersisted));
   };
+  const continueWithoutSignIn = async () => {
+    if (localWorkspace == null || cliProxy?.pending !== false || pending) return;
+    const onCredentialPersisted = credentialPersistenceAcknowledgement();
+    await runAction(() => localWorkspace.onContinue(config(), onCredentialPersisted));
+  };
+  const savedModel = cliProxy?.status?.model.trim() ?? "";
+  const draftModel = model.trim();
+  const supportedProtocol = protocol === "auto" || protocol === "chat-completions";
+  const hasCredentialDraft = cliProxy?.status?.configured === true || apiKey.trim().length > 0;
+  const modelSaved = draftModel.length > 0 && savedModel === draftModel;
+  const protocolSaved = supportedProtocol && cliProxy?.status?.protocol === protocol;
+  const providerReady = provider === "cli-proxy";
+  const runtimeSelected = boxRuntime?.state?.mode === "local-docker";
+  const dockerReady = runtimeSelected && boxRuntime?.state?.status?.ready === true;
+  const workspaceClaimReady = localWorkspace != null && localWorkspace.readiness.kind !== "checking"
+    && localWorkspace.readiness.checks.some((item) => item.id === "workspace-claim" && item.ready);
+  const coordinatorConnected = localWorkspace != null && localWorkspace.readiness.kind !== "checking"
+    && localWorkspace.readiness.checks.some((item) => item.id === "coordinator-connected" && item.ready);
+  const canContinueDraft = providerReady
+    && runtimeSelected
+    && dockerReady
+    && hasCredentialDraft
+    && draftModel.length > 0
+    && supportedProtocol
+    && baseUrl.trim().length > 0;
+  const checklist = [
+    { label: "OpenAI-compatible / 9Router selected", state: providerReady ? "ready" : "blocked", detail: providerReady ? "Ready" : "Select this provider above." },
+    { label: "Local Docker VM selected", state: runtimeSelected ? "ready" : "blocked", detail: runtimeSelected ? "Ready" : "Turn on Use local Docker VM." },
+    { label: "Local Docker VM ready", state: dockerReady ? "ready" : "blocked", detail: dockerReady ? "Ready" : runtimeSelected ? "Start Docker Desktop, then choose Repair Local Docker VM." : "Waiting for Local Docker selection." },
+    { label: "Proxy/client API key", state: cliProxy?.status?.configured ? "ready" : apiKey.trim().length > 0 ? "pending" : "blocked", detail: cliProxy?.status?.configured ? "Saved" : apiKey.trim().length > 0 ? "Entered — save required" : "Enter the required key." },
+    { label: "Model", state: modelSaved ? "ready" : draftModel.length > 0 ? "pending" : "blocked", detail: modelSaved ? `Saved: ${savedModel}` : draftModel.length > 0 ? `Selected: ${draftModel} — save required` : "Test the connection and choose a model." },
+    { label: "Native tool protocol", state: protocolSaved ? "ready" : supportedProtocol ? "pending" : "blocked", detail: protocolSaved ? "Saved" : supportedProtocol ? "Selected — save required" : "Choose Chat Completions or Auto." },
+    { label: "Local workspace claim ready", state: workspaceClaimReady ? "ready" : "blocked", detail: workspaceClaimReady ? "Confirmed by the main process" : "Save and continue to start the local workspace." },
+    { label: "Coordinator connected", state: coordinatorConnected ? "ready" : "blocked", detail: coordinatorConnected ? "Connected" : "Waiting for the Local 9Router coordinator." }
+  ] as const;
   return (
     <div className="sand-router-section">
+      {provider === "cli-proxy" && localWorkspace ? <SettingsGroup title="Continue without signing in">
+        <div className="sand-provider-usage-card" style={{ gap: 10 }}>
+          <strong>{localWorkspace.readiness.kind === "ready" ? "Local 9Router is ready" : "Finish the Local 9Router setup"}</strong>
+          <ul aria-label="Local 9Router readiness" style={{ display: "grid", gap: 6, listStyle: "none", margin: 0, padding: 0 }}>
+            {checklist.map((item) => <li key={item.label} style={{ alignItems: "start", display: "grid", gap: 8, gridTemplateColumns: "18px 1fr" }}>
+              <span aria-hidden="true">{item.state === "ready" ? "✓" : item.state === "pending" ? "•" : "○"}</span>
+              <span><strong>{item.label}</strong><small style={{ display: "block" }}>{item.detail}</small></span>
+            </li>)}
+          </ul>
+          {localWorkspace.readiness.kind === "disabled" ? <small aria-live="polite" role="status">Next: {localWorkspace.readiness.blockers[0]?.message}</small> : null}
+          {cliProxy?.status?.probe != null && savedModel.length === 0 && draftModel.length > 0
+            ? <small aria-live="polite" role="status">Connection succeeded. The first available model was selected as a draft; save is still required.</small>
+            : null}
+          {localWorkspace.error ? <small aria-live="assertive" role="alert" style={{ color: "var(--cursor-error-foreground, #b42318)" }}>{localWorkspace.error}</small> : null}
+          <div style={{ display: "flex", justifyContent: "flex-end" }}>
+            <SandButton
+              disabled={cliProxy?.pending !== false || pending || !canContinueDraft}
+              onClick={() => { void continueWithoutSignIn(); }}
+              size="sm"
+              variant="primary"
+            >{cliProxy?.pending ? "Preparing workspace…" : "Save & continue without sign-in"}</SandButton>
+          </div>
+        </div>
+      </SettingsGroup> : null}
       <SettingsGroup title="Provider">
         <label className="sand-settings-row">
           <span className="sand-settings-copy">
@@ -538,6 +682,7 @@ export function RouterSettingsPanel({ provider, pending = false, onChange, boxRu
       {boxRuntime ? <SettingsGroup title="Computer">
         <div className="sand-provider-usage-card" style={{ gap: 10 }}>
           <SandSwitch
+            ariaLabel="Use local Docker VM"
             checked={boxRuntime.state?.mode === "local-docker"}
             disabled={boxRuntime.pending || boxRuntime.state == null}
             label={<span className="sand-settings-copy">
@@ -553,24 +698,34 @@ export function RouterSettingsPanel({ provider, pending = false, onChange, boxRu
             : boxRuntime.pending
               ? boxRuntime.state.mode === "local-docker" ? "Stopping the local Docker VM…" : "Starting the local Docker VM…"
               : boxRuntime.state.status?.detail ?? (boxRuntime.state.mode === "local-docker" ? "Local Docker VM selected." : "Remote computer selected."))}</small>
+          {runtimeSelected && !dockerReady ? <div style={{ display: "flex", justifyContent: "flex-end" }}>
+            <SandButton
+              aria-label="Repair Local Docker VM"
+              disabled={boxRuntime.pending || boxRuntime.state == null}
+              onClick={() => { void boxRuntime.onChange("local-docker"); }}
+              size="sm"
+              variant="secondary"
+            >{boxRuntime.pending ? "Repairing Local Docker VM…" : "Repair Local Docker VM"}</SandButton>
+          </div> : null}
         </div>
       </SettingsGroup> : null}
       {provider === "cli-proxy" && cliProxy ? <SettingsGroup title="9Router connection">
         <div className="sand-provider-usage-card" style={{ gap: 12 }}>
-          <label><span className="sand-settings-copy"><strong>Base URL</strong><small>Use the authenticated API root, normally http://127.0.0.1:20128/v1. For this Tailscale server, use http://100.112.10.8:20128/v1. Do not use /codex.</small></span><input aria-label="9Router Base URL" disabled={cliProxy.pending} onChange={(event) => setBaseUrl(event.currentTarget.value)} spellCheck={false} type="url" value={baseUrl} /></label>
+          <label><span className="sand-settings-copy"><strong>Base URL</strong><small>Use the authenticated API root. For this Tailscale server, use http://100.112.10.8:20128/v1. Do not use /codex.</small></span><input aria-label="9Router Base URL" disabled={cliProxy.pending} onChange={(event) => updateBaseUrl(event.currentTarget.value)} spellCheck={false} type="url" value={baseUrl} /></label>
           <label><span className="sand-settings-copy"><strong>Model ID</strong><small>Enter the exact ID. If unknown, save the key first, run Test &amp; load models, choose one, then save again. Manual entry stays available when /v1/models omits a model.</small></span><input aria-label="9Router model" disabled={cliProxy.pending} list="sand-9router-models" onChange={(event) => setModel(event.currentTarget.value)} placeholder="provider/model-id" spellCheck={false} type="text" value={model} /><datalist id="sand-9router-models">{cliProxy.status?.probe?.models.map((id) => <option key={id} value={id} />)}</datalist></label>
-          <label><span className="sand-settings-copy"><strong>API key</strong><small>{cliProxy.status?.configured ? "A required proxy/client API key is saved. Leave this blank to keep it." : "Required. Use the 9Router proxy/client API key, not its management key."}</small></span><input aria-label="9Router API key" autoComplete="new-password" disabled={cliProxy.pending} onChange={(event) => setApiKey(event.currentTarget.value)} placeholder={cliProxy.status?.configured ? "Saved key (enter to replace)" : "Proxy API key"} type="password" value={apiKey} /></label>
+          <label><span className="sand-settings-copy"><strong>API key</strong><small>{cliProxy.status?.configured ? "A required proxy/client API key is saved. Leave this blank to keep it." : "Required. Use the 9Router proxy/client API key, not its management key."}</small></span><input aria-label="9Router API key" autoComplete="new-password" disabled={cliProxy.pending} onChange={(event) => updateApiKey(event.currentTarget.value)} placeholder={cliProxy.status?.configured ? "Saved key (enter to replace)" : "Proxy API key"} type="password" value={apiKey} /></label>
           <label><span className="sand-settings-copy"><strong>Protocol</strong><small>Use Chat Completions (or Auto, which prefers it) for the full Local Docker tool loop. Explicit Responses mode is blocked for native-agent turns.</small></span><SandSelect ariaLabel="9Router protocol" disabled={cliProxy.pending} onValueChange={setProtocol} options={[{ value: "chat-completions", label: "Chat Completions" }, { value: "responses", label: "Responses (not for Local Docker)" }, { value: "auto", label: "Auto (Chat first)" }]} placement="bottom-end" value={protocol} /></label>
           <SandSwitch checked={allowTailscaleHttp} disabled={cliProxy.pending} label={<span className="sand-settings-copy"><strong>Allow HTTP over Tailscale</strong><small>Off by default. Only numeric Tailscale IP addresses are accepted; verify the peer separately with tailscale ping.</small></span>} onCheckedChange={setAllowTailscaleHttp} />
           <SandSwitch checked={allowRemoteHttps} disabled={cliProxy.pending} label={<span className="sand-settings-copy"><strong>Allow a remote HTTPS endpoint</strong><small>Off by default. This separate opt-in does not allow arbitrary remote HTTP.</small></span>} onCheckedChange={setAllowRemoteHttps} />
           <small>Use the current stable 9Router release (v0.5.35 when reviewed); older builds have known authorization bypasses. Local Docker enables built-in agent, shell, file, browser, and computer tools; account-bound cloud features remain unavailable without sign-in.</small>
           <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-            <SandButton disabled={cliProxy.pending || !cliProxy.status?.configured} onClick={() => void cliProxy.onDelete().catch(() => undefined)} size="sm" variant="secondary">Delete credential</SandButton>
-            <SandButton disabled={cliProxy.pending || !cliProxy.status?.configured} onClick={() => void cliProxy.onTest().catch(() => undefined)} size="sm" variant="secondary">Test &amp; load models</SandButton>
+            <SandButton disabled={cliProxy.pending || !cliProxy.status?.configured} onClick={() => { void runAction(async () => { await cliProxy.onDelete(); clearApiKeyDraft(); }); }} size="sm" variant="secondary">Delete credential</SandButton>
+            <SandButton disabled={cliProxy.pending || !cliProxy.status?.configured} onClick={() => { void runAction(() => cliProxy.onTest()); }} size="sm" variant="secondary">Test &amp; load models</SandButton>
             <SandButton disabled={cliProxy.pending || baseUrl.trim().length === 0 || (!cliProxy.status?.configured && apiKey.trim().length === 0)} onClick={() => void saveCliProxy()} size="sm" variant="primary">{cliProxy.pending ? "Saving…" : "Save 9Router"}</SandButton>
           </div>
           <small>{cliProxy.status == null ? "Loading status…" : cliProxy.status.configured ? cliProxy.status.isPersistent ? "Credential is encrypted by the operating system." : "Secure storage is unavailable; credential is held for this session only." : "Not configured."}</small>
           {cliProxy.status?.probe ? <small role="status">{cliProxy.status.probe.message} ({cliProxy.status.probe.latencyMs} ms)</small> : null}
+          {actionError && localWorkspace?.error == null ? <small aria-live="assertive" role="alert" style={{ color: "var(--cursor-error-foreground, #b42318)" }}>{actionError}</small> : null}
         </div>
       </SettingsGroup> : null}
       <SettingsGroup title="Usage">

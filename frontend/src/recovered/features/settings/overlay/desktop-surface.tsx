@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 // @evidence src/app/dist/renderer/assets/index-BlqerJhg.js#byteOffset=36041 (released Settings Retry copy)
 import type { ProductionCoordinatorClient } from "../../../../production/coordinator-client";
 // @evidence src/app/dist/renderer/assets/index-BlqerJhg.js#L1
-import type { DesktopBridge, DesktopUpdateStatus, ThemePreference } from "../../../contracts/desktop-bridge";
+import type { DesktopBridge, DesktopLocalWorkspaceStatus, DesktopUpdateStatus, ThemePreference } from "../../../contracts/desktop-bridge";
 import {
   accountStateFromCursorStatus,
   cursorAuthErrorMessage,
@@ -37,6 +37,13 @@ import type { SettingsComputerMount } from "./computer";
 import { SettingsNoticeView, settingsNoticeFromEvent, type SettingsNotice } from "./notice";
 import { publishSurfaceNotice, type SettingsNoticeEvent } from "../../../contracts/surface-notice";
 import { SandButton } from "../../../ui/sand-kit-primitives";
+import {
+  isLocalWorkspaceClaimReady,
+  localWorkspaceConfigurationReady,
+  readLocalWorkspaceReadiness,
+  reconcileSettingsLocalWorkspaceClaim,
+  type LocalWorkspaceReadiness
+} from "../../../../production/local-workspace";
 
 const SETTINGS_FALLBACK_LABELS = { retry: "Retry" };
 const LOCAL_WORKSPACE_CHANGED_EVENT = "sand-local-workspace-changed";
@@ -68,16 +75,20 @@ function normalizeRouterBoxRuntimeState(value: unknown): RouterBoxRuntimeState {
 export interface SettingsDesktopSurfaceProps {
   bridge: DesktopBridge;
   coordinatorClient?: ProductionCoordinatorClient | null;
+  initialLocalWorkspace?: LocalWorkspaceReadiness;
   initialSection?: SettingsSectionId;
   isOpen: boolean;
+  onActivateLocalWorkspace(): Promise<DesktopLocalWorkspaceStatus>;
   onClose(): void;
+  onInvalidateLocalWorkspace(): void;
+  onLocalWorkspaceReady?(readiness: Extract<LocalWorkspaceReadiness, { kind: "ready" }>): void;
   onNotice?(event: SettingsNoticeEvent): void;
   onStatus?(status: string): void;
   /** Root-owned computer rebuild state/actions; omitted until the root owner mounts the handoff. */
   computer?: SettingsComputerMount;
 }
 
-export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initialSection = "general", isOpen, onClose, onNotice, onStatus, computer }: SettingsDesktopSurfaceProps) {
+export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initialLocalWorkspace, initialSection = "general", isOpen, onActivateLocalWorkspace, onClose, onInvalidateLocalWorkspace, onLocalWorkspaceReady, onNotice, onStatus, computer }: SettingsDesktopSurfaceProps) {
   const [snapshot, setSnapshot] = useState<SettingsDesktopSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
@@ -90,19 +101,48 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
   const [boxRuntimeError, setBoxRuntimeError] = useState<string | null>(null);
   const [cliProxyStatus, setCliProxyStatus] = useState<CliProxyStatus | null>(null);
   const [cliProxyPending, setCliProxyPending] = useState(false);
+  const [localWorkspaceReadiness, setLocalWorkspaceReadiness] = useState<LocalWorkspaceReadiness>({ kind: "checking" });
+  const [localWorkspaceError, setLocalWorkspaceError] = useState<string | null>(null);
+  const localWorkspaceClaimRef = useRef<DesktopLocalWorkspaceStatus>(initialLocalWorkspace?.kind === "ready"
+    ? { kind: "ready", workspaceId: initialLocalWorkspace.workspaceId }
+    : { kind: "disabled" });
+  const settingsWasOpenRef = useRef(false);
+  const onNoticeRef = useRef(onNotice);
+  onNoticeRef.current = onNotice;
   const handleCancelTrialDialogOpen = useCallback((open: boolean) => setCancelTrialDialogOpen(open), []);
   const handleNotice = useCallback((event: SettingsNoticeEvent) => {
     setSurfaceNotice(settingsNoticeFromEvent(event));
-    onNotice?.(event);
-  }, [onNotice]);
-  const refreshLocalWorkspace = useCallback(async () => {
-    try { await bridge.forceGatewayReconnect(); } catch {}
-    window.dispatchEvent(new Event(LOCAL_WORKSPACE_CHANGED_EVENT));
-  }, [bridge]);
+    onNoticeRef.current?.(event);
+  }, []);
+  useEffect(() => {
+    const wasOpen = settingsWasOpenRef.current;
+    settingsWasOpenRef.current = isOpen;
+    localWorkspaceClaimRef.current = reconcileSettingsLocalWorkspaceClaim(
+      localWorkspaceClaimRef.current,
+      initialLocalWorkspace,
+      wasOpen,
+      isOpen
+    );
+  }, [initialLocalWorkspace, isOpen]);
+  const refreshLocalWorkspace = useCallback(async (
+    notifyRenderer = true,
+    claimStatus: DesktopLocalWorkspaceStatus = localWorkspaceClaimRef.current
+  ) => {
+    const readiness = await readLocalWorkspaceReadiness(bridge, {
+      transportState: coordinatorClient?.getTransportState() ?? "down",
+      claimStatus
+    });
+    setLocalWorkspaceReadiness(readiness);
+    setLocalWorkspaceError(null);
+    if (notifyRenderer) window.dispatchEvent(new Event(LOCAL_WORKSPACE_CHANGED_EVENT));
+    return readiness;
+  }, [bridge, coordinatorClient]);
 
   useEffect(() => {
     if (!isOpen) return;
     let active = true;
+    setLocalWorkspaceReadiness({ kind: "checking" });
+    setLocalWorkspaceError(null);
     setBoxRuntimeError(null);
     let unsubscribe = () => {};
     setSnapshot(null);
@@ -172,6 +212,7 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
   useEffect(() => {
     if (!isOpen) return;
     let active = true;
+    let dockerRetryTimer: number | null = null;
     void bridge.agent.getInferenceRouter().then((value) => {
       const provider = typeof value === "object" && value != null && "provider" in value ? value.provider : null;
       if (active) setRouterProvider(isRouterProviderId(provider) ? provider : DEFAULT_ROUTER_PROVIDER);
@@ -179,15 +220,45 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
       if (active) setRouterProvider(DEFAULT_ROUTER_PROVIDER);
     });
     void bridge.cliProxy.status().then((status) => { if (active) setCliProxyStatus(status); }).catch(() => { if (active) setCliProxyStatus(null); });
-    void bridge.agent.getBoxRuntime().then((status) => {
-      if (active) setBoxRuntime(normalizeRouterBoxRuntimeState(status));
+    const refreshBoxRuntime = () => {
+      void bridge.agent.getBoxRuntime().then((status) => {
+        if (!active) return;
+        const normalized = normalizeRouterBoxRuntimeState(status);
+        setBoxRuntime(normalized);
+        if (normalized.mode === "local-docker" && normalized.status?.ready !== true) {
+          dockerRetryTimer = window.setTimeout(refreshBoxRuntime, 1_000);
+        } else {
+          void refreshLocalWorkspace(false).then((readiness) => {
+            if (active) setLocalWorkspaceReadiness(readiness);
+          });
+        }
+      }).catch((reason: unknown) => {
+        if (!active) return;
+        setBoxRuntime(null);
+        setBoxRuntimeError(reason instanceof Error ? reason.message : String(reason));
+        dockerRetryTimer = window.setTimeout(refreshBoxRuntime, 1_000);
+      });
+    };
+    refreshBoxRuntime();
+    void refreshLocalWorkspace(false).then((readiness) => {
+      if (active) setLocalWorkspaceReadiness(readiness);
     }).catch((reason: unknown) => {
       if (!active) return;
-      setBoxRuntime(null);
-      setBoxRuntimeError(reason instanceof Error ? reason.message : String(reason));
+      setLocalWorkspaceError(reason instanceof Error ? reason.message : String(reason));
     });
-    return () => { active = false; };
-  }, [bridge, isOpen]);
+    const unsubscribeCoordinator = coordinatorClient?.subscribeTransport((state) => {
+      if (!active) return;
+      if (state === "down") localWorkspaceClaimRef.current = { kind: "disabled" };
+      void refreshLocalWorkspace(false).catch((reason: unknown) => {
+        if (active) setLocalWorkspaceError(reason instanceof Error ? reason.message : String(reason));
+      });
+    });
+    return () => {
+      active = false;
+      if (dockerRetryTimer != null) window.clearTimeout(dockerRetryTimer);
+      unsubscribeCoordinator?.();
+    };
+  }, [bridge, coordinatorClient, isOpen, refreshLocalWorkspace]);
 
   const mutate = async <Value,>(action: () => Promise<Value>, operation: SettingsNoticeEvent["operation"], apply: (value: Value) => void): Promise<Value> => {
     try {
@@ -238,9 +309,13 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
               pending: boxRuntimePending,
               error: boxRuntimeError,
               onChange: async (mode) => {
-                if (boxRuntimePending || boxRuntime?.mode === mode) return;
+                if (boxRuntimePending) return;
+                if (boxRuntime?.mode === mode
+                  && (mode !== "local-docker" || boxRuntime.status?.ready === true)) return;
+                onInvalidateLocalWorkspace();
                 setBoxRuntimePending(true);
                 setBoxRuntimeError(null);
+                localWorkspaceClaimRef.current = { kind: "disabled" };
                 try {
                   const result = normalizeRouterBoxRuntimeState(await bridge.agent.setBoxRuntime(mode));
                   setBoxRuntime(result);
@@ -257,10 +332,12 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
             cliProxy={{
               status: cliProxyStatus,
               pending: cliProxyPending,
-              onSave: async (config) => {
+              onSave: async (config, onCredentialPersisted) => {
+                onInvalidateLocalWorkspace();
                 setCliProxyPending(true);
+                localWorkspaceClaimRef.current = { kind: "disabled" };
                 try {
-                  setCliProxyStatus(await bridge.cliProxy.save(config));
+                  setCliProxyStatus(await bridge.cliProxy.save(config, onCredentialPersisted));
                   await refreshLocalWorkspace();
                 }
                 catch (reason) {
@@ -270,7 +347,9 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
                 } finally { setCliProxyPending(false); }
               },
               onDelete: async () => {
+                onInvalidateLocalWorkspace();
                 setCliProxyPending(true);
+                localWorkspaceClaimRef.current = { kind: "disabled" };
                 try {
                   setCliProxyStatus(await bridge.cliProxy.remove());
                   await refreshLocalWorkspace();
@@ -291,11 +370,69 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
                 } finally { setCliProxyPending(false); }
               }
             }}
+            localWorkspace={{
+              readiness: localWorkspaceReadiness,
+              error: localWorkspaceError,
+              onContinue: async (config, onCredentialPersisted) => {
+                if (cliProxyPending || routerPending || boxRuntimePending) return;
+                onInvalidateLocalWorkspace();
+                setCliProxyPending(true);
+                setLocalWorkspaceError(null);
+                localWorkspaceClaimRef.current = { kind: "disabled" };
+                try {
+                  const saved = await bridge.cliProxy.save(config, onCredentialPersisted);
+                  setCliProxyStatus(saved);
+                  const configuredReadiness = await refreshLocalWorkspace(false);
+                  if (!localWorkspaceConfigurationReady(configuredReadiness)) {
+                    throw new Error(configuredReadiness.kind === "disabled"
+                      ? configuredReadiness.blockers[0]?.message ?? "Local 9Router setup is incomplete."
+                      : "Local 9Router status is still being checked.");
+                  }
+                  const claimed = await onActivateLocalWorkspace();
+                  localWorkspaceClaimRef.current = isLocalWorkspaceClaimReady(claimed) ? claimed : { kind: "disabled" };
+                  if (!isLocalWorkspaceClaimReady(claimed)) {
+                    const failedReadiness = await refreshLocalWorkspace(false);
+                    throw new Error(failedReadiness.kind === "disabled"
+                      ? failedReadiness.blockers.find((blocker) => blocker.code === "local-workspace-claim-not-ready")?.message
+                        ?? "Local workspace startup was not confirmed."
+                      : "Local workspace startup was not confirmed.");
+                  }
+                  if (coordinatorClient == null) {
+                    const failedReadiness = await refreshLocalWorkspace(false, claimed);
+                    throw new Error(failedReadiness.kind === "disabled"
+                      ? failedReadiness.blockers.find((blocker) => blocker.code === "coordinator-not-connected")?.message
+                        ?? "The Local 9Router coordinator is unavailable."
+                      : "The Local 9Router coordinator is unavailable.");
+                  }
+                  await coordinatorClient.waitForTransportConnected(20_000);
+                  const connectedReadiness = await refreshLocalWorkspace(false, claimed);
+                  if (connectedReadiness.kind !== "ready"
+                    || coordinatorClient.getTransportState() !== "connected"
+                    || !isLocalWorkspaceClaimReady(localWorkspaceClaimRef.current)) {
+                    const latestReadiness = await refreshLocalWorkspace(false);
+                    throw new Error(latestReadiness.kind === "disabled"
+                      ? latestReadiness.blockers[0]?.message ?? "Local 9Router did not become ready."
+                      : "Local 9Router status is still being checked.");
+                  }
+                  onLocalWorkspaceReady?.(connectedReadiness);
+                } catch (reason) {
+                  await refreshLocalWorkspace(false);
+                  const message = reason instanceof Error ? reason.message : String(reason);
+                  setLocalWorkspaceError(message);
+                  publishSurfaceNotice({ kind: "error", operation: "settings-router-provider", message }, handleNotice, onStatus);
+                  throw reason;
+                } finally {
+                  setCliProxyPending(false);
+                }
+              }
+            }}
             onChange={async (provider) => {
               if (routerPending || provider === routerProvider) return;
+              onInvalidateLocalWorkspace();
               const previous = routerProvider;
               setRouterProvider(provider);
               setRouterPending(true);
+              localWorkspaceClaimRef.current = { kind: "disabled" };
               try {
                 const result = await bridge.agent.setInferenceRouter(provider);
                 const applied = typeof result === "object" && result != null && "provider" in result ? result.provider : provider;

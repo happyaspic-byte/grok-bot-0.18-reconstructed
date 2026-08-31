@@ -12,6 +12,7 @@ import {
 import { createTurnAgentStreamStart } from "./turn-agent-composition.js";
 import {
   createTurnRunShell,
+  SandTurnInterruptedBeforeDispatchError,
   type PreparedTurn,
   type TurnRunContext,
   type TurnRunOptions,
@@ -57,6 +58,12 @@ function linkTurnRunContext(
   };
 }
 
+function assertProductionTurnActive(context: Context): void {
+  if (context.signal.aborted) {
+    throw new SandTurnInterruptedBeforeDispatchError();
+  }
+}
+
 /** Exact host inputs around the existing turn-run-shell lifecycle. */
 export interface ProductionTurnRunShellAdapterInput {
   readonly createOwner: (input: {
@@ -64,6 +71,10 @@ export interface ProductionTurnRunShellAdapterInput {
     readonly runOptions: TurnRunOptions;
     readonly context: Context;
     readonly cancelThisRun: ProductionTurnAgentOwner["runContext"]["scope"]["cancelThisRun"];
+    readonly endThisRunAwaitingUser: (reason: string) => void;
+    readonly onProfileUpdateAppended: NonNullable<
+      ProductionTurnAgentOwnerInput["onProfileUpdateAppended"]
+    >;
     readonly emitUpdate: (update: ForwardedUpdate) => void;
   }) => Promise<ProductionTurnAgentOwner>;
   readonly createRunInput: (input: {
@@ -118,8 +129,14 @@ export interface ProductionTurnRunShellHostInput extends Omit<
     readonly runOptions: TurnRunOptions;
     readonly context: Context;
     readonly cancelThisRun: ProductionTurnAgentOwnerInput["cancelThisRun"];
+    readonly endThisRunAwaitingUser: NonNullable<
+      ProductionTurnAgentOwnerInput["endThisRunAwaitingUser"]
+    >;
+    readonly onProfileUpdateAppended: NonNullable<
+      ProductionTurnAgentOwnerInput["onProfileUpdateAppended"]
+    >;
     readonly emitUpdate: ProductionTurnAgentOwnerInput["emitUpdate"];
-  }) => ProductionTurnAgentOwnerInput;
+  }) => ProductionTurnAgentOwnerInput | Promise<ProductionTurnAgentOwnerInput>;
   readonly promptOptions: (
     prompt: string,
     options: TurnRunOptions,
@@ -157,20 +174,29 @@ export function createProductionTurnRunShellHostInput(
       runOptions,
       context,
       cancelThisRun,
+      endThisRunAwaitingUser,
+      onProfileUpdateAppended,
       emitUpdate,
-    }) => createProductionTurnAgentOwner({
-      ...createAgentOwnerInput({
+    }) => {
+      const ownerInput = await createAgentOwnerInput({
         requestId,
         runOptions,
         context,
         cancelThisRun,
+        endThisRunAwaitingUser,
+        onProfileUpdateAppended,
         emitUpdate,
-      }),
-      context,
-      requestId,
-      cancelThisRun,
-      emitUpdate,
-    }),
+      });
+      assertProductionTurnActive(context);
+      return createProductionTurnAgentOwner({
+        ...ownerInput,
+        context,
+        requestId,
+        cancelThisRun,
+        onProfileUpdateAppended,
+        emitUpdate,
+      });
+    },
     createRunInput: async ({ owner, runContext, prompt, options }) =>
       createProductionTurnAgentRunInput({
         runCtx: runContext,
@@ -265,20 +291,30 @@ export function createProductionTurnRunShellAdapter(
           callbacks.collectReaction();
         }
       };
+      let owner: ProductionTurnAgentOwner | undefined;
       try {
-        const owner = await input.createOwner({
+        assertProductionTurnActive(linked.context);
+        owner = await input.createOwner({
           requestId: context.requestId,
           runOptions: options,
           context: linked.context,
           cancelThisRun: input.cancelThisRun,
+          endThisRunAwaitingUser: reason => {
+            updateRelay.callbacks?.pauseForUser(reason);
+          },
+          onProfileUpdateAppended: identity => {
+            updateRelay.callbacks?.noteProfileUpdateAppended(identity);
+          },
           emitUpdate,
         });
+        assertProductionTurnActive(linked.context);
         const productionInput = await input.createRunInput({
           owner,
           runContext: linked.context,
           prompt,
           options: input.promptOptions(prompt, options),
         });
+        assertProductionTurnActive(linked.context);
         const result: ProductionTurnRunShellPreparedTurn = {
           action: productionInput.action,
           baseState: cloneBaseTurnCheckpoint(productionInput.baseState),
@@ -296,20 +332,36 @@ export function createProductionTurnRunShellAdapter(
         prepared.set(result, result);
         return result;
       } catch (error) {
+        owner?.dispose();
         linked.dispose();
         throw error;
       }
     },
     async runPreparedTurn(
       preparedTurn: PreparedTurn,
-      _context: TurnRunContext,
+      context: TurnRunContext,
       callbacks: TurnStreamCallbacks,
     ): Promise<TurnCheckpoint> {
       const owned = prepared.get(preparedTurn);
       if (owned === undefined) {
         throw new TypeError("production turn prepared owner is not bound");
       }
+      assertProductionTurnActive(owned.runContext);
       owned.updateRelay.callbacks = callbacks;
+      if (owned.productionOwner.runContext.profilePromptSnapshot !== undefined) {
+        callbacks.setProfileSnapshot(
+          owned.productionOwner.runContext.profilePromptSnapshot,
+        );
+      }
+      // The current profile update is already injected into this turn's user
+      // action. Mark it pending before streaming so the durable checkpoint can
+      // advance the announced snapshot even when the history modifier sees the
+      // injected update and correctly decides not to append a duplicate.
+      if (owned.productionOwner.runContext.profileUpdateForTurn !== undefined) {
+        callbacks.noteProfileUpdateAppended(
+          owned.productionOwner.runContext.profileUpdateForTurn.identity,
+        );
+      }
       const stream = createTurnAgentStreamStart({
         agent: owned.productionOwner.built,
         baseState: owned.baseState,
@@ -324,9 +376,13 @@ export function createProductionTurnRunShellAdapter(
           _checkpointContext: Context,
           checkpoint: ConversationStateStructureMessage,
         ) => {
+          if (input.runGeneration() !== context.generation) return;
           await callbacks.persistCheckpoint(checkpoint);
         },
       );
+      if (input.runGeneration() !== context.generation) {
+        throw new SandTurnInterruptedBeforeDispatchError();
+      }
       owned.productionOwner.runContext.commitDiskPressureReminder();
       return finalState;
     },

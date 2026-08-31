@@ -371,6 +371,10 @@ export interface DesktopBoxRuntimeState {
   readonly status: DesktopLocalDockerStatus | null;
 }
 
+export type DesktopLocalWorkspaceStatus =
+  | { readonly kind: "disabled" }
+  | { readonly kind: "ready"; readonly workspaceId: "local:9router" };
+
 export interface AgentDesktopBridge {
   getPinnedAgents(): Promise<string[] | null>;
   setPinnedAgents(pinnedAgentIds: readonly string[]): Promise<string[] | null>;
@@ -408,10 +412,13 @@ export interface DesktopBridge {
   readonly mcp: McpDesktopBridge;
   readonly cliProxy: {
     status(options?: { readonly testConnection?: boolean }): Promise<CliProxyStatus>;
-    save(config: CliProxyPublicConfig & { readonly apiKey?: string }): Promise<CliProxyStatus>;
+    save(
+      config: CliProxyPublicConfig & { readonly apiKey?: string },
+      onCredentialPersisted?: () => void,
+    ): Promise<CliProxyStatus>;
     remove(): Promise<CliProxyStatus>;
   };
-  forceGatewayReconnect(): Promise<void>;
+  forceGatewayReconnect(): Promise<DesktopLocalWorkspaceStatus>;
   pickAvatarSource(): Promise<string | null>;
   pickAvatarFile(): Promise<AvatarFileSelection | null>;
   generateAgentAvatarImage(description: string): Promise<string>;

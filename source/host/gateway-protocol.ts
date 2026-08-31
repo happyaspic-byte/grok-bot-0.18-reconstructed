@@ -11,6 +11,7 @@ export const SAND_GATEWAY_COMMANDS = {
   getAgentTranscriptTail: (api: GatewayApi, body: string) => api.getAgentTranscriptTail(parseCommandArgs(body)),
   getAgentThread: (api: GatewayApi, body: string) => api.getAgentThread(parseCommandArgs(body)),
   leaseCliProxyCredential: (api: GatewayApi, body: string) => api.leaseCliProxyCredential(parseCommandArgs(body)),
+  probeCliProxyModels: (api: GatewayApi) => api.probeCliProxyModels(),
   sendPrompt: (api: GatewayApi, body: string) => api.sendPrompt(parseCommandArgs(body)),
   promptAcceptanceStatus: (api: GatewayApi, body: string) => api.promptAcceptanceStatus(parseCommandArgs(body)),
   respondToWidget: (api: GatewayApi, body: string) => api.respondToWidget(parseCommandArgs(body)),

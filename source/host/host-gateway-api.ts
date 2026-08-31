@@ -7,6 +7,7 @@ import {
   clearCliProxyCredentialLease,
   installCliProxyCredentialLease,
 } from "./extensions/inference/cli-proxy-credential-lease.js";
+import { probeCliProxyModelsFromContainer } from "./extensions/inference/cli-proxy-container-probe.js";
 
 export const HOST_CAPABILITIES = [
   "orderedReplicasV1",
@@ -187,6 +188,8 @@ export function createHostGatewayApi(
 
     leaseCliProxyCredential: (args: any) =>
       installCliProxyCredentialLease(args?.config),
+
+    probeCliProxyModels: () => probeCliProxyModelsFromContainer(),
 
     sendPrompt: async (args: any) => {
       const agentId =

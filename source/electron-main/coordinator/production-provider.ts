@@ -30,6 +30,7 @@ import {
   type CoordinatorPortRequesterContext,
 } from "./coordinator-port-ipc-guard.js";
 import {
+  CoordinatorResyncFailedError,
   createCoordinatorResyncChain,
   type DisabledToolsByServer,
 } from "./coordinator-resync.js";
@@ -45,6 +46,10 @@ import {
 } from "./coordinator-telemetry.js";
 import { createElectronDesktopConnectivity } from "./desktop-connectivity.js";
 import type { BoxConnectionInfo } from "../../shared/node/egress-tunnel/box-connection.js";
+import {
+  parseCoordinatorRendererPortRequestPayload,
+  type CoordinatorRendererPortDeliveryPayload,
+} from "../../shared/rpc/coordinator-port.js";
 import {
   LOCAL_9ROUTER_WORKSPACE_ID,
   resolveLocal9RouterWorkspaceClaim,
@@ -66,6 +71,165 @@ export interface ProductionCoordinatorAuthStatus extends CoordinatorAuthStatus {
 export interface ProductionCoordinatorWithLocalWorkspace
   extends ProductionCoordinatorService {
   readonly localWorkspace: ProductionLocalWorkspaceControl;
+}
+
+const COORDINATOR_READY_TIMEOUT_MS = 180_000;
+
+export class CoordinatorReadyTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Coordinator did not connect and finish resync within ${timeoutMs} ms.`);
+    this.name = "CoordinatorReadyTimeoutError";
+  }
+}
+
+export interface CoordinatorReadinessTicket {
+  readonly generation: number;
+  readonly promise: Promise<LocalWorkspaceStatus>;
+}
+
+/** Rejects stale async resync completions after a newer edge or disconnect. */
+export function createCoordinatorTransportEpochFence() {
+  let epoch = 0;
+  return {
+    begin: (): number => ++epoch,
+    invalidate: (): void => { epoch += 1; },
+    isCurrent: (candidate: number): boolean => candidate === epoch,
+  };
+}
+
+/** A restart-scoped barrier resolved only by a post-launch successful resync. */
+export function createCoordinatorReadinessGate(
+  timeoutMs = COORDINATOR_READY_TIMEOUT_MS,
+) {
+  let generation = 0;
+  let pending: {
+    readonly generation: number;
+    readonly expectedLaunchSequence: number;
+    readonly resolve: (status: LocalWorkspaceStatus) => void;
+    readonly reject: (error: Error) => void;
+    readonly timeout: ReturnType<typeof setTimeout>;
+  } | undefined;
+
+  const settle = (
+    expectedGeneration: number,
+    action: (current: NonNullable<typeof pending>) => void,
+  ): void => {
+    const current = pending;
+    if (current == null || current.generation !== expectedGeneration) return;
+    pending = undefined;
+    clearTimeout(current.timeout);
+    action(current);
+  };
+  const errorValue = (error: unknown): Error =>
+    error instanceof Error ? error : new Error(String(error));
+
+  return {
+    currentGeneration: () => generation,
+    begin(expectedLaunchSequence: number): CoordinatorReadinessTicket {
+      if (pending != null) {
+        const superseded = pending;
+        pending = undefined;
+        clearTimeout(superseded.timeout);
+        superseded.reject(new Error("Coordinator readiness wait was superseded."));
+      }
+      generation += 1;
+      const currentGeneration = generation;
+      const deferred = Promise.withResolvers<LocalWorkspaceStatus>();
+      const timeout = setTimeout(() => {
+        settle(currentGeneration, (current) => {
+          current.reject(new CoordinatorReadyTimeoutError(timeoutMs));
+        });
+      }, timeoutMs);
+      timeout.unref?.();
+      pending = {
+        generation: currentGeneration,
+        expectedLaunchSequence,
+        resolve: deferred.resolve,
+        reject: deferred.reject,
+        timeout,
+      };
+      return { generation: currentGeneration, promise: deferred.promise };
+    },
+    resolve(
+      expectedGeneration: number,
+      launchSequence: number,
+      status: LocalWorkspaceStatus,
+    ): void {
+      const current = pending;
+      if (current == null || launchSequence < current.expectedLaunchSequence) return;
+      settle(expectedGeneration, (settled) => settled.resolve(status));
+    },
+    reject(expectedGeneration: number, launchSequence: number, error: unknown): void {
+      const current = pending;
+      if (current == null || launchSequence < current.expectedLaunchSequence) return;
+      settle(expectedGeneration, (current) => current.reject(errorValue(error)));
+    },
+    rejectCurrent(error: unknown): void {
+      if (pending != null) settle(pending.generation, (current) => current.reject(errorValue(error)));
+    },
+    dispose(): void {
+      if (pending != null) {
+        settle(pending.generation, (current) => {
+          current.reject(new Error("Coordinator readiness wait was disposed."));
+        });
+      }
+    },
+  };
+}
+
+/** Serializes native-turn lease setup and permanently closes intake on quit. */
+export function createCliProxyNativePrepareGate() {
+  let quiesced = false;
+  let tail: Promise<void> = Promise.resolve();
+  const closedError = (): Error => new Error("Native 9Router turn preparation is quiesced.");
+  return {
+    run<T>(operation: () => Promise<T>): Promise<T> {
+      if (quiesced) return Promise.reject(closedError());
+      const work = tail.then(async () => {
+        if (quiesced) throw closedError();
+        return await operation();
+      });
+      tail = work.then(() => undefined, () => undefined);
+      return work;
+    },
+    quiesce(): Promise<void> {
+      quiesced = true;
+      return tail;
+    },
+  };
+}
+
+function invokeCoordinatorDisposalOperation(
+  operation: () => void | Promise<void>,
+): Promise<void> {
+  try {
+    return Promise.resolve(operation());
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
+/** Starts runtime intake shutdown before attempting every remaining cleanup. */
+export async function quiesceNativeTurnsAndDisposeCoordinatorRuntime(
+  quiesce: () => Promise<void>,
+  disposeRuntime: () => Promise<void>,
+  cleanup: readonly (() => void | Promise<void>)[] = [],
+): Promise<void> {
+  const outcomes = await Promise.allSettled([
+    invokeCoordinatorDisposalOperation(quiesce),
+    invokeCoordinatorDisposalOperation(disposeRuntime),
+    ...cleanup.map(invokeCoordinatorDisposalOperation),
+  ]);
+  const failures = outcomes.flatMap((outcome) =>
+    outcome.status === "rejected" ? [outcome.reason] : []
+  );
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) {
+    throw new AggregateError(
+      failures,
+      "Coordinator shutdown failed in multiple phases.",
+    );
+  }
 }
 
 export interface ProductionCoordinatorUtilityProcess {
@@ -430,7 +594,11 @@ export function createProductionCoordinatorAdapter<
       let observationSequence = 0;
       let localWorkspaceRequested = false;
       let cliProxyCredentialMutationDepth = 0;
+      let coordinatorLaunchSequence = 0;
       let localWorkspaceStatus: LocalWorkspaceStatus = { kind: "disabled" };
+      const coordinatorReadiness = createCoordinatorReadinessGate();
+      const cliProxyNativePrepareGate = createCliProxyNativePrepareGate();
+      let restartCoordinatorTail: Promise<void> = Promise.resolve();
       const localWorkspaceListeners = new Set<(
         status: LocalWorkspaceStatus,
       ) => void>();
@@ -481,6 +649,7 @@ export function createProductionCoordinatorAdapter<
           setHostSettings(update: any): Promise<any>;
         },
         ...ports.resync,
+        getLocalWorkspaceBrowserUseCapability: () => localWorkspaceRequested,
         syncWindowFocused,
         monotonicNow: now,
         onCompleted: telemetry.resyncCompleted,
@@ -499,29 +668,58 @@ export function createProductionCoordinatorAdapter<
         listRoutedMcpTools: () => context.requireMcp().listRoutedTools(),
         executeRoutedMcpTool: (request) => context.requireMcp().executeRoutedTool(request),
         getCliProxyTurnConfig: () => context.secretsStores.cliProxySecretStore.getTurnConfig(),
-        prepareCliProxyNativeTurn: () => resync.withSuccessfulResync(async () => {
-          const assertEligible = (): void => {
-            if (cliProxyCredentialMutationDepth > 0) {
-              throw new Error("9Router credentials are being changed; retry the turn.");
-            }
-            if (
-              context.settings.settingsStore.getInferenceProvider() !== "cli-proxy"
-              || context.settings.settingsStore.getBoxRuntime() !== "local-docker"
-            ) {
-              throw new Error("Native 9Router routing is no longer selected.");
-            }
-          };
-          assertEligible();
-          const config = await context.secretsStores.cliProxySecretStore.getTurnConfig();
-          assertEligible();
-          const leaseCliProxyCredential = context.coordinatorLegs.legs.leaseCliProxyCredential;
-          requiredFunction(leaseCliProxyCredential, "coordinator leaseCliProxyCredential()");
-          return await leaseCliProxyCredential({ config });
-        }),
+        prepareCliProxyNativeTurn: () => cliProxyNativePrepareGate.run(() =>
+          resync.withSuccessfulResync(async () => {
+            const assertEligible = (): void => {
+              if (disposed) throw new Error("Coordinator is shutting down.");
+              if (cliProxyCredentialMutationDepth > 0) {
+                throw new Error("9Router credentials are being changed; retry the turn.");
+              }
+              if (
+                context.settings.settingsStore.getInferenceProvider() !== "cli-proxy"
+                || context.settings.settingsStore.getBoxRuntime() !== "local-docker"
+              ) {
+                throw new Error("Native 9Router routing is no longer selected.");
+              }
+            };
+            assertEligible();
+            const config = await context.secretsStores.cliProxySecretStore.getTurnConfig();
+            assertEligible();
+            const leaseCliProxyCredential = context.coordinatorLegs.legs.leaseCliProxyCredential;
+            requiredFunction(leaseCliProxyCredential, "coordinator leaseCliProxyCredential()");
+            return await leaseCliProxyCredential({ config });
+          })),
         native: ports.localExecNative,
       });
-      const createRuntime = (claim: CoordinatorRuntimeClaim) =>
-        createCoordinatorRuntime({
+      const probeLocalWorkspaceModels = async (): Promise<void> => {
+        const assertEligible = (): void => {
+          if (disposed) throw new Error("Coordinator is shutting down.");
+          if (cliProxyCredentialMutationDepth > 0) {
+            throw new Error("9Router credentials are being changed; retry the workspace connection.");
+          }
+          if (
+            !localWorkspaceRequested
+            || context.settings.settingsStore.getInferenceProvider() !== "cli-proxy"
+            || context.settings.settingsStore.getBoxRuntime() !== "local-docker"
+          ) {
+            throw new Error("Local 9Router workspace is no longer selected.");
+          }
+        };
+        assertEligible();
+        const config = await context.secretsStores.cliProxySecretStore.getTurnConfig();
+        assertEligible();
+        const leaseCliProxyCredential = context.coordinatorLegs.legs.leaseCliProxyCredential;
+        requiredFunction(leaseCliProxyCredential, "coordinator leaseCliProxyCredential()");
+        const probeCliProxyModels = context.coordinatorLegs.legs.probeCliProxyModels;
+        requiredFunction(probeCliProxyModels, "coordinator probeCliProxyModels()");
+        await leaseCliProxyCredential({ config });
+        assertEligible();
+        await probeCliProxyModels({});
+        assertEligible();
+      };
+      const createRuntime = (claim: CoordinatorRuntimeClaim) => {
+        const transportEpoch = createCoordinatorTransportEpochFence();
+        return createCoordinatorRuntime({
           fork: (path, options) =>
             ports.utilityProcess.fork(path, [], { serviceName: options.serviceName }),
           createChannel: () => new ports.MessageChannelMain(),
@@ -533,37 +731,86 @@ export function createProductionCoordinatorAdapter<
             "agents-event": ports.events.onAgentsEvent,
             "agents-roster-seed": ports.events.onAgentsRosterSeed,
             "transport-connected": (payload) => {
+              const connectedEpoch = transportEpoch.begin();
+              const readinessGeneration = coordinatorReadiness.currentGeneration();
+              const connectedLaunchSequence = coordinatorLaunchSequence;
               telemetry.transportStream.onConnected(payload);
               void Promise.resolve(ports.telemetry.flushNow()).catch((error) =>
                 ports.reportFailure("coordinator", "connect-flush", error),
               );
-              void resync.onTransportConnected().then((summary) => {
-                if (claim.kind !== "local-workspace" || !localWorkspaceRequested) return;
+              void resync.onTransportConnected().then(async (summary) => {
+                if (!transportEpoch.isCurrent(connectedEpoch)) return;
                 if (summary.failedSteps.length > 0) {
-                  publishLocalWorkspaceStatus({ kind: "disabled" });
+                  if (claim.kind === "local-workspace") {
+                    publishLocalWorkspaceStatus({ kind: "disabled" });
+                  }
+                  coordinatorReadiness.reject(
+                    readinessGeneration,
+                    connectedLaunchSequence,
+                    new CoordinatorResyncFailedError(summary.failedSteps),
+                  );
                   return;
                 }
-                publishLocalWorkspaceStatus({
+                if (claim.kind !== "local-workspace") {
+                  coordinatorReadiness.resolve(
+                    readinessGeneration,
+                    connectedLaunchSequence,
+                    { kind: "disabled" },
+                  );
+                  return;
+                }
+                if (!localWorkspaceRequested) {
+                  coordinatorReadiness.reject(
+                    readinessGeneration,
+                    connectedLaunchSequence,
+                    new Error("Local 9Router workspace is no longer selected."),
+                  );
+                  return;
+                }
+                await probeLocalWorkspaceModels();
+                if (!transportEpoch.isCurrent(connectedEpoch)) return;
+                const ready: LocalWorkspaceStatus = {
                   kind: "ready",
                   workspaceId: LOCAL_9ROUTER_WORKSPACE_ID,
-                });
+                };
+                publishLocalWorkspaceStatus(ready);
+                coordinatorReadiness.resolve(
+                  readinessGeneration,
+                  connectedLaunchSequence,
+                  ready,
+                );
               }).catch((error) => {
+                if (!transportEpoch.isCurrent(connectedEpoch)) return;
                 if (claim.kind === "local-workspace") publishLocalWorkspaceStatus({ kind: "disabled" });
+                coordinatorReadiness.reject(
+                  readinessGeneration,
+                  connectedLaunchSequence,
+                  error,
+                );
                 ports.reportFailure("coordinator-local-workspace", "transport-resync", error);
               });
               ports.resync.onHostSettingsTransportConnected();
               context.hostSettingsFields.onTransportConnected();
             },
             "transport-down": (payload) => {
+              transportEpoch.invalidate();
               telemetry.transportStream.onDown(payload);
               if (claim.kind === "local-workspace") {
                 publishLocalWorkspaceStatus({ kind: "disabled" });
               }
               ports.resync.onHostSettingsTransportDown();
               context.hostSettingsFields.setBoxStreamLive(false);
+              coordinatorReadiness.rejectCurrent(
+                new Error("Coordinator transport disconnected before readiness completed."),
+              );
             },
           },
           onMainDataPort: (port) => {
+            // launch() installs the replacement child before the previous one
+            // exits. Invalidate any resync completion captured by that old
+            // transport before the new launch can be considered observable.
+            transportEpoch.invalidate();
+            coordinatorLaunchSequence += 1;
             ports.resync.onHostSettingsTransportDown();
             context.hostSettingsFields.setBoxStreamLive(false);
             try {
@@ -571,13 +818,17 @@ export function createProductionCoordinatorAdapter<
                 port as Parameters<typeof context.coordinatorLegs.adoptPort>[0],
               );
             } catch (error) {
+              coordinatorReadiness.rejectCurrent(error);
               handoff.invokeFailed("main_data_port");
               throw error;
             }
             if (!ports.telemetry.isQuitting()) handoff.adopted("main_data_port");
             ports.events.onCoordinatorLaunched();
           },
-          onProblem: (detail) => ports.reportProblem("coordinator", detail),
+          onProblem: (detail) => {
+            coordinatorReadiness.rejectCurrent(new Error(detail));
+            ports.reportProblem("coordinator", detail);
+          },
           onLifecycle: telemetry.coordinatorLifecycle,
           relaunchBackoff: createCoordinatorRelaunchBackoff(),
           monotonicNow: now,
@@ -588,6 +839,7 @@ export function createProductionCoordinatorAdapter<
           },
           artifactPath,
         });
+      };
 
       const accountRuntime = createCoordinatorAccountRuntime<Status>({
         createRuntime,
@@ -614,18 +866,65 @@ export function createProductionCoordinatorAdapter<
         try {
           const status = await accountService.getStatus() as Status;
           const claim = await resolveRuntimeClaim(status);
-          if (disposed || sequence !== observationSequence) return localWorkspaceStatus;
+          if (disposed) throw new Error("Coordinator is disposed.");
+          if (sequence !== observationSequence) {
+            if (restartAfterRefresh) throw new Error("Coordinator restart was superseded.");
+            return localWorkspaceStatus;
+          }
+          if (
+            restartAfterRefresh
+            && status.kind === "logged-out"
+            && context.settings.settingsStore.getBoxRuntime() === "local-docker"
+            && context.settings.settingsStore.getInferenceProvider() === "cli-proxy"
+            && claim?.kind !== "local-workspace"
+          ) {
+            throw new Error("The configured local 9Router workspace could not be claimed.");
+          }
           applyRuntimeClaimState(claim);
           accountRuntime.observe(status, claim);
           await accountRuntime.whenIdle();
-          if (restartAfterRefresh && !disposed && sequence === observationSequence) {
-            await accountRuntime.restart();
+          if (restartAfterRefresh && (disposed || sequence !== observationSequence)) {
+            throw new Error("Coordinator restart was superseded.");
+          }
+          if (restartAfterRefresh) {
+            if (claim == null) return localWorkspaceStatus;
+            if (claim.kind === "local-workspace") {
+              // A previous ready publication is never evidence for this restart.
+              publishLocalWorkspaceStatus({ kind: "disabled" });
+            }
+            const expectedLaunchSequence = coordinatorLaunchSequence + 1;
+            const readiness = coordinatorReadiness.begin(expectedLaunchSequence);
+            // A coordinator problem or disposal can reject this ticket while
+            // restart() is still awaiting the previous process. Attach a
+            // handler immediately; the awaited original promise below still
+            // preserves the rejection for the caller.
+            void readiness.promise.catch(() => undefined);
+            try {
+              await accountRuntime.restart();
+              if (coordinatorLaunchSequence < expectedLaunchSequence) {
+                throw new Error("Coordinator restart did not launch a replacement process.");
+              }
+            } catch (error) {
+              coordinatorReadiness.rejectCurrent(error);
+              await readiness.promise.catch(() => undefined);
+              throw error;
+            }
+            return await readiness.promise;
           }
         } catch (error) {
           ports.reportFailure("coordinator-local-workspace", "refresh", error);
           publishLocalWorkspaceStatus({ kind: "disabled" });
+          if (restartAfterRefresh) throw error;
         }
         return localWorkspaceStatus;
+      };
+
+      const restartCoordinator = (): Promise<LocalWorkspaceStatus> => {
+        const operation = restartCoordinatorTail
+          .catch(() => undefined)
+          .then(async () => await refreshLocalWorkspace(true));
+        restartCoordinatorTail = operation.then(() => undefined, () => undefined);
+        return operation;
       };
 
       let unsubscribe: () => void;
@@ -663,7 +962,7 @@ export function createProductionCoordinatorAdapter<
           await accountRuntime.start(typedStatus, claim);
         },
         getAccountRuntime: () => active,
-        restartCoordinator: () => { void refreshLocalWorkspace(true); },
+        restartCoordinator,
         localWorkspace: {
           getStatus: () => localWorkspaceStatus,
           refresh: () => refreshLocalWorkspace(false),
@@ -688,6 +987,7 @@ export function createProductionCoordinatorAdapter<
         endCliProxyCredentialMutation() {
           cliProxyCredentialMutationDepth = Math.max(0, cliProxyCredentialMutationDepth - 1);
         },
+        quiesceCliProxyNativeTurns: () => cliProxyNativePrepareGate.quiesce(),
         readHostSettings: async () => {
           const getHostSettings = context.coordinatorLegs.legs.getHostSettings;
           requiredFunction(getHostSettings, "coordinator getHostSettings()");
@@ -701,13 +1001,23 @@ export function createProductionCoordinatorAdapter<
           if (disposed) return;
           disposed = true;
           observationSequence += 1;
-          unsubscribe();
-          localWorkspaceRequested = false;
-          publishLocalWorkspaceStatus({ kind: "disabled" });
-          localWorkspaceListeners.clear();
-          prompt.finish();
-          if (active === accountRuntime) active = undefined;
-          await accountRuntime.dispose();
+          // Close turn intake first, but start runtime/control-port disposal
+          // synchronously instead of waiting behind a possibly stuck native
+          // prepare or fallible cleanup. Quit deadlines cannot cancel those
+          // Promises, so every phase is started and observed here.
+          await quiesceNativeTurnsAndDisposeCoordinatorRuntime(
+            () => cliProxyNativePrepareGate.quiesce(),
+            () => accountRuntime.dispose(),
+            [
+              unsubscribe,
+              () => { localWorkspaceRequested = false; },
+              () => publishLocalWorkspaceStatus({ kind: "disabled" }),
+              () => localWorkspaceListeners.clear(),
+              () => prompt.finish(),
+              () => { if (active === accountRuntime) active = undefined; },
+              () => coordinatorReadiness.dispose(),
+            ],
+          );
         },
       };
     },
@@ -738,7 +1048,7 @@ export interface CoordinatorRendererPortIpcPorts<
   readonly ipcMain: {
     handle(
       channel: string,
-      listener: (event: CoordinatorRendererPortIpcEvent<TContents, TFrame>) => unknown,
+      listener: (event: CoordinatorRendererPortIpcEvent<TContents, TFrame>, payload: unknown) => unknown,
     ): void;
     removeHandler(channel: string): void;
   };
@@ -778,7 +1088,10 @@ export function createCoordinatorRendererPortIpcRegistrar<
       }
       registered = true;
       const handoff = createCoordinatorHandoffTelemetry(ports.reportHandoff);
-      ports.ipcMain.handle(COORDINATOR_PORT_REQUEST_CHANNEL, (event) => {
+      let activeRequesterFrame: TFrame | undefined;
+      let postedGeneration = 0;
+      let activeSinkEpoch = 0;
+      ports.ipcMain.handle(COORDINATOR_PORT_REQUEST_CHANNEL, (event, payload) => {
         const trustedContents = ports.getTrustedContents();
         assertTrustedCoordinatorPortRequester({
           sender: event.sender,
@@ -786,13 +1099,55 @@ export function createCoordinatorRendererPortIpcRegistrar<
           trustedContents,
           trustedMainFrame: trustedContents?.mainFrame as TFrame | null | undefined,
         } satisfies CoordinatorPortRequesterContext<TContents, TFrame>);
+        const request = parseCoordinatorRendererPortRequestPayload(payload);
+        if (request == null) {
+          throw new Error("Coordinator renderer-port request must contain exactly one non-negative safe knownGeneration.");
+        }
+        if (activeRequesterFrame !== event.senderFrame) {
+          activeRequesterFrame = event.senderFrame;
+          postedGeneration = 0;
+          activeSinkEpoch += 1;
+        }
+        if (request.knownGeneration < postedGeneration) return null;
+        if (request.knownGeneration > postedGeneration) {
+          throw new Error("Coordinator renderer-port request generation is ahead of the main-process handoff generation.");
+        }
+
         handoff.requested();
         const requester = event.sender;
+        const requesterFrame = event.senderFrame;
+        const sinkEpoch = ++activeSinkEpoch;
         ports.requestRendererPort((port) => {
-          if (requester.isDestroyed()) return;
+          const currentContents = ports.getTrustedContents();
+          if (
+            requester.isDestroyed()
+            || activeRequesterFrame !== requesterFrame
+            || activeSinkEpoch !== sinkEpoch
+            || currentContents !== requester
+            || currentContents?.mainFrame !== requesterFrame
+          ) {
+            try { port.close(); } catch {}
+            return;
+          }
+          if (postedGeneration >= Number.MAX_SAFE_INTEGER) {
+            try { port.close(); } catch {}
+            const error = new Error("Coordinator renderer-port handoff generation is exhausted.");
+            handoff.invokeFailed("renderer_port");
+            ports.reportFailure("coordinator", "renderer-port", error);
+            throw error;
+          }
+          const previousGeneration = postedGeneration;
+          const delivery: CoordinatorRendererPortDeliveryPayload = {
+            generation: previousGeneration + 1,
+          };
+          postedGeneration = delivery.generation;
           try {
-            requester.postMessage(COORDINATOR_PORT_CHANNEL, null, [port]);
+            requester.postMessage(COORDINATOR_PORT_CHANNEL, delivery, [port]);
           } catch (error) {
+            if (postedGeneration === delivery.generation) {
+              postedGeneration = previousGeneration;
+            }
+            try { port.close(); } catch {}
             handoff.invokeFailed("renderer_port");
             ports.reportFailure("coordinator", "renderer-port", error);
             throw error;
@@ -806,6 +1161,9 @@ export function createCoordinatorRendererPortIpcRegistrar<
         dispose() {
           if (disposed) return;
           disposed = true;
+          activeSinkEpoch += 1;
+          activeRequesterFrame = undefined;
+          postedGeneration = 0;
           ports.ipcMain.removeHandler(COORDINATOR_PORT_REQUEST_CHANNEL);
           registered = false;
         },

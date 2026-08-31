@@ -29,29 +29,55 @@ test("publication ignore rules retain reconstructed frontend source", async () =
   assert.equal(matcher.ignores("recovered/generated-output.txt"), true, "root recovery output must remain ignored");
 });
 
-test("Windows owner draft release identities stay aligned", async () => {
+test("Windows push-access-visible draft release identities stay aligned", async () => {
   const [packageJson, packageLock, windowsPackage, workflow] = await Promise.all([
     readFile(path.join(repoRoot, "package.json"), "utf8").then(JSON.parse),
     readFile(path.join(repoRoot, "package-lock.json"), "utf8").then(JSON.parse),
     readFile(path.join(repoRoot, "scripts", "lib", "windows-package.mjs"), "utf8"),
     readFile(path.join(repoRoot, ".github", "workflows", "windows-draft-release.yml"), "utf8"),
   ]);
-  const version = "0.18.0-reconstructed.2";
+  const version = "0.18.0-reconstructed.3";
   assert.equal(packageJson.version, version);
   assert.equal(packageLock.version, version);
   assert.equal(packageLock.packages[""].version, version);
-  assert.match(windowsPackage, /reconstructedVersion: "0\.18\.0-reconstructed\.2"/);
-  assert.match(workflow, /v0\.18\.0-reconstructed\.2/);
-  assert.match(workflow, /Grok-Bot-0\.18\.0-reconstructed\.2-windows-x64-portable-unsigned\.zip/);
+  assert.match(windowsPackage, /reconstructedVersion: packageVersion/);
+  assert.match(windowsPackage, /manifest\.reconstructedVersion !== packageVersion/);
+  assert.match(workflow, /RELEASE_VERSION: 0\.18\.0-reconstructed\.3/);
+  assert.match(workflow, /Grok-Bot-\$\(\$env:RELEASE_VERSION\)-windows-x64-portable-unsigned\.zip/);
   assert.match(workflow, /http:\/\/100\.112\.10\.8:20128\/v1/);
   assert.match(workflow, /v0\.5\.35/);
-  assert.doesNotMatch(workflow, /reconstructed\.1/);
+  assert.doesNotMatch(workflow, /reconstructed\.[12]/);
 });
 
 test("default packaging keeps the polished checksum-pinned renderer", async () => {
   const source = await readFile(path.join(repoRoot, "scripts", "package-macos.mjs"), "utf8");
   assert.match(source, /import \{ buildFidelityReconstructedAsar \} from "\.\/clean-build\.mjs"/);
   assert.match(source, /await buildFidelityReconstructedAsar\(\)/);
+});
+
+test("runtime composition audit tracks the synchronous runner shutdown fence", async () => {
+  const [audit, activation, host, runnerComposition, agentRunner] = await Promise.all([
+    readFile(path.join(repoRoot, "scripts", "audit-runtime-composition.mjs"), "utf8"),
+    readFile(path.join(repoRoot, "scripts", "host-production-activation.mjs"), "utf8"),
+    readFile(path.join(repoRoot, "source", "host", "sand-host.ts"), "utf8"),
+    readFile(path.join(repoRoot, "source", "host", "host-runner-composition.ts"), "utf8"),
+    readFile(path.join(repoRoot, "source", "host", "runner", "sand-agent-runner.ts"), "utf8"),
+  ]);
+  assert.match(host, /const runnerDisposal = runnerComposition\?\.dispose\(\) \?\? Promise\.resolve\(\);/);
+  assert.match(host, /const runnerDisposal = runnerComposition\?\.dispose\(\) \?\? Promise\.resolve\(\);[\s\S]*await optionalMethod\(extensions\.api\("automations"\), "suspendWakes"\)\?\.\(\);[\s\S]*await runnerDisposal;[\s\S]*await optionalMethod\(this\.transcript, "dispose"\)\?\.\(\);[\s\S]*await extensions\.stop\(\);/);
+  assert.match(audit, /const cleanRunnerDisposalStart = anchorFor\(sandHostText, sandHostSource, "const runnerDisposal = runnerComposition\?\.dispose\(\) \?\? Promise\.resolve\(\);"\);/);
+  assert.match(audit, /\{ step: "begin-runner-disposal-before-extension-awaits", anchor: cleanRunnerDisposalStart \}/);
+  assert.match(audit, /const cleanRunnerDisposalDrain = anchorFor\(sandHostText, sandHostSource, "await runnerDisposal;"\);/);
+  assert.match(audit, /\{ step: "dispose-runner-before-extension-stop", anchor: cleanRunnerDisposalDrain \}/);
+  assert.match(audit, /Clean host runner shutdown no longer starts synchronously and drains before transcript and extension disposal/);
+  assert.match(audit, /construct-runner-on-demand[\s\S]*const runner = deps\.buildRunner\(runnerOptions\);/);
+  assert.equal(runnerComposition.match(/const runner = deps\.buildRunner\(runnerOptions\);/g)?.length, 1);
+  assert.doesNotMatch(runnerComposition, /return deps\.buildRunner\(runnerOptions\);/);
+  assert.doesNotMatch(audit, /anchorFor\(sandHostText, sandHostSource, "await this\.runnerComposition\?\.dispose\(\);"\)/);
+  assert.match(activation, /Runner activation evidence is ambiguous/);
+  assert.match(activation, /return this\.#productionTurnRunShell\.run\(prompt, runOptions\);/);
+  assert.doesNotMatch(activation, /sourceNeedleAnchor\("source\/host\/runner\/sand-agent-runner\.ts", "if \(this\.#productionTurnRunShell !== undefined\) \{"\)/);
+  assert.equal(agentRunner.match(/return this\.#productionTurnRunShell\.run\(prompt, runOptions\);/g)?.length, 1);
 });
 
 test("Router settings use the trusted backend and display recorded inference usage", async () => {
@@ -90,8 +116,10 @@ test("Router settings use the trusted backend and display recorded inference usa
   assert.match(mainEdge, /invoke\(deps\.settingsStore, "setInferenceProvider", provider\)/);
   assert.match(mainEdge, /return\s*\{\s*provider,\s*usage:/);
   assert.match(mainEdge, /invoke\(deps\.boxRecovery, "restartCoordinator"\)/);
-  assert.match(mainEdge, /mode === "local-docker"\) await startLocalDockerBox\(settingsPath, localDockerStartOptionsForProvider\(invoke\(deps\.settingsStore, "getInferenceProvider"\)\)\); else await stopLocalDockerBox\(\)/);
-  assert.match(mainEdge, /setBoxRuntime", mode === "local-docker" \? "remote" : "local-docker"/);
+  assert.match(mainEdge, /deps\.startOwnedLocalDockerBox \?\? startLocalDockerBox/);
+  assert.match(mainEdge, /localDockerStartOptionsForProvider\(inferenceProvider\)/);
+  assert.match(mainEdge, /setBoxRuntime", previousMode/);
+  assert.match(mainEdge, /Could not change the local Docker runtime or fully restore the previous runtime/);
   assert.match(localDocker, /public\.ecr\.aws\/k0i0n2g5\/cursorenvironments\/universal@sha256:3f9e25e1e382b7c4b71e08eb549098a6106fadc615feba848e6cc5c1ef4be3b6/);
   assert.doesNotMatch(localDocker, /cursorenvironments\/universal:sand-box-latest/);
   assert.match(localDocker, /"127\.0\.0\.1:1340:1340"/);

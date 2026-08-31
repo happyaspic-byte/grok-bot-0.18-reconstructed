@@ -5,7 +5,10 @@ import { createCoordinatorMainLegs } from "./coordinator/coordinator-main-legs.j
 import { createEgressConnectionObserver } from "./box/remote-connector-egress.js";
 import { createDesktopGatewayDescriptorFastPath } from "./box/gateway-descriptor-store.js";
 import { createRemoteHostConnector, type SandRemoteHostConnector } from "./box/box-host-connector.js";
-import { createSettingsRoutedHostConnector } from "./box/local-docker-host-connector.js";
+import {
+  createSettingsRoutedHostConnector,
+  stopLocalDockerBoxForQuit,
+} from "./box/local-docker-host-connector.js";
 import { createSandClientPauseControl } from "./box/box-client-pause.js";
 import { createSandMigrationWatcher } from "./box/box-migration-watcher.js";
 import type { RecreateResult } from "./box/box-recreate-commands.js";
@@ -28,6 +31,8 @@ import { createDesktopEventLoopTelemetry, desktopEventLoopPressureMetadata } fro
 import { wireDesktopUncleanExitSettlement } from "./telemetry/desktop-unclean-exit-wiring.js";
 import { settleUncleanExitOnSessionEnd } from "./telemetry/desktop-unclean-exit-telemetry.js";
 import { COORDINATOR_SERVICE_NAME } from "./coordinator/coordinator-launcher.js";
+import { settlePartialDesktopQuit, withDesktopQuitDeadline } from "./quit-deadline.js";
+import { settleStagedUpdateLocalExecShutdown } from "./update/staged-update-local-exec-guard.js";
 import { createWindowChromeEdgePort, type WindowChromeBrowserWindow } from "./window-chrome.js";
 import { createProductionWindowBroadcaster } from "./window-broadcast.js";
 import type { SandUpdateService } from "./update/sand-update-service.js";
@@ -289,9 +294,10 @@ export interface ProductionCoordinatorService extends ProductionDisposable {
   pushHostSettingsStrict(update: unknown): Promise<Record<string, any>>;
   beginCliProxyCredentialMutation(): void;
   endCliProxyCredentialMutation(): void;
+  quiesceCliProxyNativeTurns(): Promise<void>;
   readHostSettings(): Promise<unknown>;
   getAccountRuntime?(): unknown;
-  restartCoordinator(): void;
+  restartCoordinator(): Promise<unknown>;
   getTelemetryReportPipes?(): ProductionCoordinatorTelemetryReportPipes;
 }
 export interface ProductionCoordinatorTelemetryReportPipes {
@@ -886,34 +892,144 @@ export function createElectronMainProductionComposition(bindings: ElectronMainPr
     } catch (error) { await disposeGraph(); throw error; }
   })();
   const beginBeforeQuit = (): "continue" | "prevent" => {
-    if (quitState === "settled" || context == null || telemetry == null) return "continue";
+    if (quitState === "settled") return "continue";
     if (quitState === "flushing") return "prevent";
+    if (context == null || telemetry == null) {
+      const partialSettings = settings;
+      if (partialSettings == null) return "continue";
+      quitState = "flushing";
+      void settlePartialDesktopQuit({
+        stopLocalDocker: () => stopLocalDockerBoxForQuit(partialSettings.settingsStore.settingsPath),
+        disposeGraph,
+        reportFailure: bindings.reportFailure,
+      }).finally(() => {
+        quitState = "settled";
+        bindings.native.app.quit();
+      });
+      return "prevent";
+    }
     quitState = "flushing";
     void (async () => {
       try {
+        try {
+          if (coordinator != null) {
+            await withDesktopQuitDeadline(
+              "9Router native-turn quiescence",
+              coordinator.quiesceCliProxyNativeTurns(),
+            );
+          }
+        } catch (error) {
+          bindings.reportFailure("coordinator", "cli-proxy-quit-quiesce", error);
+        }
         desktopMetricsRuntime?.disposeProcessMetricsCollector();
         const numericMetrics = desktopMetricsRuntime?.takeClientNumericMetricsManager();
         boxVisibilityTracker?.abandonAll();
         const disposeQuitPhase = async (value: ProductionDisposable | undefined, area: string): Promise<void> => {
-          try { await disposeOnce(value); } catch (error) { bindings.reportFailure(area, "dispose", error); }
+          try {
+            await withDesktopQuitDeadline(`${area} disposal`, disposeOnce(value));
+          } catch (error) {
+            bindings.reportFailure(area, "dispose", error);
+          }
         };
+        const settleQuitPhase = async (
+          area: string,
+          leg: string,
+          step: string,
+          pending: Promise<unknown> | undefined,
+        ): Promise<void> => {
+          if (pending == null) return;
+          try {
+            await withDesktopQuitDeadline(step, pending);
+          } catch (error) {
+            bindings.reportFailure(area, leg, error);
+          }
+        };
+        const shutdownFailures: unknown[] = [];
+        if (settings != null && coordinator != null) {
+          try {
+            await withDesktopQuitDeadline(
+              "9Router credential lease revocation",
+              coordinator.pushHostSettingsStrict({ clearCliProxyCredentialLease: true }),
+            );
+          } catch (error) {
+            shutdownFailures.push(error);
+          }
+        }
+        // A timed-out strict push keeps running because Promise.race cannot
+        // cancel it. Cut the coordinator RPC legs and dispose its runtime
+        // before the final Docker lifecycle stop, so late completion cannot
+        // enqueue a new host ensure after the fail-closed stop.
+        try {
+          coordinatorLegs.dispose();
+        } catch (error) {
+          bindings.reportFailure("coordinator", "legs-dispose", error);
+        }
         await disposeQuitPhase(coordinator, "coordinator");
-        try { coordinatorLegs.dispose(); } catch (error) { bindings.reportFailure("coordinator", "legs-dispose", error); }
+        if (settings != null) {
+          // Always enter the Docker lifecycle lane before quitting. Provider
+          // and runtime mutations persist their new setting before their
+          // revoke/stop work finishes, so consulting only the current setting
+          // here could otherwise miss a still-running leased host. This must
+          // remain after coordinator/leg disposal as the final host mutation.
+          try {
+            await stopLocalDockerBoxForQuit(settings.settingsStore.settingsPath);
+          } catch (error) {
+            shutdownFailures.push(error);
+          }
+          if (shutdownFailures.length > 0) {
+            bindings.reportFailure(
+              "coordinator",
+              "cli-proxy-quit-revoke",
+              shutdownFailures.length === 1
+                ? shutdownFailures[0]
+                : new AggregateError(
+                    shutdownFailures,
+                    "Could not clear the 9Router lease and stop the owned local Docker VM during quit.",
+                  ),
+            );
+          }
+        }
         await disposeQuitPhase(boxRecovery, "box-recovery");
-        await secretsStores?.pushBoxSecrets.quiesce();
-        await secretsStores?.pushTelemetry.settled();
+        await settleQuitPhase("secrets", "box-quiesce", "box-secret push quiescence", secretsStores?.pushBoxSecrets.quiesce());
+        await settleQuitPhase("telemetry", "secret-push", "secret telemetry settlement", secretsStores?.pushTelemetry.settled());
         disposeDesktopEventLoopSampler();
-        await Promise.all([telemetry!.flushBeforeQuit(), numericMetrics?.flush() ?? Promise.resolve()]);
+        await settleQuitPhase(
+          "telemetry",
+          "flush",
+          "desktop telemetry flush",
+          Promise.all([telemetry!.flushBeforeQuit(), numericMetrics?.flush() ?? Promise.resolve()]),
+        );
         numericMetrics?.dispose();
-        if (update?.willRunStagedInstallerOnQuit?.() === true) await bindings.services.killLocalExecDaemon?.();
-        update?.applyStagedOnQuit?.();
+        const canApplyStagedUpdate = await settleStagedUpdateLocalExecShutdown({
+          willRunStagedInstallerOnQuit: update?.willRunStagedInstallerOnQuit?.() === true,
+          ...(bindings.services.killLocalExecDaemon == null
+            ? {}
+            : { killLocalExecDaemon: bindings.services.killLocalExecDaemon }),
+          reportFailure: bindings.reportFailure,
+        });
+        if (canApplyStagedUpdate) update?.applyStagedOnQuit?.();
         await disposeQuitPhase(telemetry, "telemetry");
         await disposeQuitPhase(productAnalytics, "product-analytics");
         await disposeQuitPhase(update, "update");
         await disposeQuitPhase(mcp, "mcp");
         await disposeQuitPhase(experiments, "experiments");
-      } catch (error) { bindings.reportFailure("telemetry", "quit-flush-race", error); try { await telemetry?.spillPending?.(); } catch (spillError) { bindings.reportFailure("telemetry", "quit-preserve", spillError); } }
-      finally { await disposeGraph(); quitState = "settled"; bindings.native.app.quit(); }
+      } catch (error) {
+        bindings.reportFailure("telemetry", "quit-flush-race", error);
+        try {
+          const spill = telemetry?.spillPending?.();
+          if (spill != null) await withDesktopQuitDeadline("telemetry spill", spill);
+        } catch (spillError) {
+          bindings.reportFailure("telemetry", "quit-preserve", spillError);
+        }
+      } finally {
+        try {
+          await withDesktopQuitDeadline("service graph disposal", disposeGraph());
+        } catch (error) {
+          bindings.reportFailure("main", "dispose-deadline", error);
+        }
+        quitState = "settled";
+        bindings.native.app.quit();
+      }
     })();
     return "prevent";
   };

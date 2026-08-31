@@ -471,6 +471,21 @@ async function runnerCompositionClosure({ hostGraph, hostProductionExtensionsGra
     ...(runnerRealTurn.status === "supported" ? [] : [`runner-real-turn:${runnerRealTurn.status}`]),
     ...(generatedEntryUnreachableExecutableSources.length === 0 ? [] : [`runner-executable-modules-outside-generated-host-entry-graph:${generatedEntryUnreachableExecutableSources.length}`]),
   ];
+  const cleanRunnerDisposalStart = anchorFor(sandHostText, sandHostSource, "const runnerDisposal = runnerComposition?.dispose() ?? Promise.resolve();");
+  const cleanFirstExtensionAwait = anchorFor(sandHostText, sandHostSource, "await optionalMethod(extensions.api(\"automations\"), \"suspendWakes\")?.();");
+  const cleanRunnerDisposalDrain = anchorFor(sandHostText, sandHostSource, "await runnerDisposal;");
+  const cleanTranscriptDisposal = anchorFor(sandHostText, sandHostSource, "await optionalMethod(this.transcript, \"dispose\")?.();");
+  const cleanExtensionStop = anchorFor(sandHostText, sandHostSource, "await extensions.stop();");
+  const cleanShutdownLines = [
+    cleanRunnerDisposalStart,
+    cleanFirstExtensionAwait,
+    cleanRunnerDisposalDrain,
+    cleanTranscriptDisposal,
+    cleanExtensionStop,
+  ].map(anchor => anchor.line);
+  if (!cleanShutdownLines.every((line, index) => index === 0 || cleanShutdownLines[index - 1] < line)) {
+    throw new Error("Clean host runner shutdown no longer starts synchronously and drains before transcript and extension disposal");
+  }
 
   return {
     policy: "Executable Runner recovery is reported separately from source-graph reachability and production activation. No module is production-composed merely because its standalone source or focused tests pass.",
@@ -513,8 +528,9 @@ async function runnerCompositionClosure({ hostGraph, hostProductionExtensionsGra
       { step: "create-roster-bookkeeping", anchor: anchorFor(sandHostText, sandHostSource, "this.rosterBookkeeping = createHostRosterBookkeeping(extensions);") },
       { step: "create-runner-composition", anchor: anchorFor(sandHostText, sandHostSource, "this.runnerComposition = this.runtime.createRunnerComposition({") },
       { step: "bind-turn-executor", anchor: anchorFor(sandHostText, sandHostSource, "optionalMethod(extensions.api(\"turn-execution\"), \"bindExecutor\")?.({") },
-      { step: "construct-runner-on-demand", anchor: anchorFor(runnerCompositionText, runnerCompositionSource, "return deps.buildRunner(runnerOptions);") },
-      { step: "dispose-runner-before-extension-stop", anchor: anchorFor(sandHostText, sandHostSource, "await this.runnerComposition?.dispose();") },
+      { step: "construct-runner-on-demand", anchor: anchorFor(runnerCompositionText, runnerCompositionSource, "const runner = deps.buildRunner(runnerOptions);") },
+      { step: "begin-runner-disposal-before-extension-awaits", anchor: cleanRunnerDisposalStart },
+      { step: "dispose-runner-before-extension-stop", anchor: cleanRunnerDisposalDrain },
     ],
     productionActivation: {
       hostMode,

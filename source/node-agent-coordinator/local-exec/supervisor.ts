@@ -39,8 +39,7 @@ export type LocalExecDaemonAction =
 
 export function decideLocalExecDaemonAction(existing: { readonly pid: number; readonly inflightCount?: number } | null): LocalExecDaemonAction {
   if (existing == null) return { kind: "spawn" };
-  if ((existing.inflightCount ?? 0) > 0) return { kind: "adopt", pid: existing.pid };
-  return { kind: "replace", pid: existing.pid };
+  return { kind: "adopt", pid: existing.pid };
 }
 
 export type LocalExecDaemonState =
@@ -53,8 +52,18 @@ interface LocalExecControl {
   resolveGatewayConnection(args: Record<string, never>): Promise<unknown>;
   mintLocalExecDaemonCredential(args: Record<string, never>): Promise<unknown | null>;
   spawnLocalExecDaemon(args: { readonly env: Readonly<Record<string, string>>; readonly logPath: string }): Promise<LocalExecProcessIdentity>;
+  reconcileLocalExecStartupQuarantine?(args: Record<string, never>): Promise<{ readonly blocked: boolean; readonly reason: string | null }>;
+  confirmLocalExecDaemonReady?(args: { readonly identity: LocalExecProcessIdentity }): Promise<{ readonly confirmed: boolean }>;
   isProcessAlive(args: { readonly pid: number }): Promise<boolean>;
   getProcessIdentity(args: ExpectedLocalExecProcessIdentity): Promise<LocalExecProcessIdentity | null>;
+  inspectLocalExecProcessIdentity?(args: ExpectedLocalExecProcessIdentity): Promise<
+    | {
+        readonly status: "matching";
+        readonly identity: LocalExecProcessIdentity;
+        readonly terminationMode?: "retained-child" | "win32-stable-handle" | "prior-version" | "none";
+      }
+    | { readonly status: "different" | "absent" | "unreadable" }
+  >;
   waitLocalExecDaemonExit(identity: LocalExecProcessIdentity): Promise<{ readonly identity: LocalExecProcessIdentity; readonly exitCode: number | null; readonly signal: string | null }>;
   terminateProcess(args: { readonly identity: LocalExecProcessIdentity }): Promise<{ readonly terminated: boolean }>;
 }
@@ -101,7 +110,10 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
   let reconciliation = Promise.resolve();
   let missingDiscoveryTicks = 0;
   let consecutiveRespawns = 0;
-  let quarantinedIdentity: LocalExecProcessIdentity | undefined;
+  const quarantinedProcesses = new Map<number, {
+    readonly expected?: ExpectedLocalExecProcessIdentity;
+    readonly releaseWhenVerified: boolean;
+  }>();
   const now = options.now ?? Date.now;
   const delay = options.delay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const readinessTimeoutMs = options.readinessTimeoutMs ?? LOCAL_EXEC_DAEMON_READINESS_TIMEOUT_MS;
@@ -109,16 +121,113 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
 
   const enqueue = async <T>(work: () => Promise<T>): Promise<T> => { const run = reconciliation.then(work); reconciliation = run.then(() => undefined, () => undefined); return run; };
 
-  const currentIdentity = async (expected: ExpectedLocalExecProcessIdentity): Promise<LocalExecProcessIdentity | null> => { const identity = await options.control.getProcessIdentity(expected); return isProcessIdentity(identity) ? identity : null; };
-  const terminateIfStillOwned = async (expected: LocalExecProcessIdentity): Promise<boolean> => (await options.control.terminateProcess({ identity: expected })).terminated;
-  const quarantineBlocksSpawn = async (): Promise<boolean> => {
-    if (quarantinedIdentity == null) return false;
-    const quarantined = quarantinedIdentity;
-    const observed = await currentIdentity(quarantined);
-    if (observed != null && sameLocalExecProcessIdentity(observed, quarantined)) return true;
-    if (await options.control.isProcessAlive({ pid: quarantined.pid })) return true;
-    quarantinedIdentity = undefined;
+  const currentIdentity = async (expected: ExpectedLocalExecProcessIdentity): Promise<LocalExecProcessIdentity | null> => {
+    try {
+      const identity = await options.control.getProcessIdentity(expected);
+      return isProcessIdentity(identity) ? identity : null;
+    } catch {
+      return null;
+    }
+  };
+  const quarantine = (
+    pid: number,
+    expected?: ExpectedLocalExecProcessIdentity,
+    releaseWhenVerified = false,
+  ): void => {
+    quarantinedProcesses.set(pid, {
+      ...(expected === undefined ? {} : { expected }),
+      releaseWhenVerified,
+    });
+  };
+  const clearQuarantine = (): void => {
+    quarantinedProcesses.clear();
+  };
+  const terminateIfStillOwned = async (expected: LocalExecProcessIdentity): Promise<boolean> => {
+    quarantine(expected.pid, expected);
+    const result = await options.control.terminateProcess({ identity: expected });
+    if (result.terminated) {
+      quarantinedProcesses.delete(expected.pid);
+      return true;
+    }
+    const observed = await currentIdentity(expected);
+    if (
+      (observed != null && sameLocalExecProcessIdentity(observed, expected))
+      || await options.control.isProcessAlive({ pid: expected.pid })
+    ) {
+      throw new Error(`local-exec daemon ${expected.pid} remained alive after identity-verified termination was refused`);
+    }
+    quarantinedProcesses.delete(expected.pid);
     return false;
+  };
+  const inspectQuarantinedProcess = async (
+    expected: ExpectedLocalExecProcessIdentity,
+  ): Promise<
+    | {
+        readonly status: "matching";
+        readonly identity: LocalExecProcessIdentity;
+        readonly terminationMode: "retained-child" | "win32-stable-handle" | "prior-version" | "none";
+      }
+    | { readonly status: "different" | "absent" | "unreadable" }
+  > => {
+    if (options.control.inspectLocalExecProcessIdentity != null) {
+      try {
+        const inspected = await options.control.inspectLocalExecProcessIdentity(expected);
+        if (inspected.status === "matching" && isProcessIdentity(inspected.identity)) {
+          return {
+            status: "matching",
+            identity: inspected.identity,
+            terminationMode: inspected.terminationMode === "retained-child"
+              || inspected.terminationMode === "win32-stable-handle"
+              || inspected.terminationMode === "prior-version"
+              ? inspected.terminationMode
+              : "none",
+          };
+        }
+        if (inspected.status === "different" || inspected.status === "absent" || inspected.status === "unreadable") return inspected;
+      } catch {}
+      return { status: "unreadable" };
+    }
+    const observed = await currentIdentity(expected);
+    if (observed != null) return { status: "matching", identity: observed, terminationMode: "retained-child" };
+    try { return await options.control.isProcessAlive({ pid: expected.pid }) ? { status: "unreadable" } : { status: "absent" }; }
+    catch { return { status: "unreadable" }; }
+  };
+  const quarantineBlocksSpawn = async (): Promise<boolean> => {
+    for (const [pid, quarantineEntry] of [...quarantinedProcesses]) {
+      if (quarantineEntry.expected == null) {
+        try {
+          if (await options.control.isProcessAlive({ pid })) return true;
+        } catch {
+          return true;
+        }
+        quarantinedProcesses.delete(pid);
+        continue;
+      }
+      const inspected = await inspectQuarantinedProcess(quarantineEntry.expected);
+      if (inspected.status === "different" || inspected.status === "absent") {
+        quarantinedProcesses.delete(pid);
+        continue;
+      }
+      if (inspected.status === "matching" && quarantineEntry.releaseWhenVerified) {
+        quarantinedProcesses.delete(pid);
+        continue;
+      }
+      return true;
+    }
+    return false;
+  };
+  const reconcileStartupQuarantine = async (): Promise<{ readonly blocked: boolean; readonly reason: string | null }> => {
+    if (options.control.reconcileLocalExecStartupQuarantine == null) return { blocked: false, reason: null };
+    try {
+      const result = await options.control.reconcileLocalExecStartupQuarantine({});
+      if (typeof result?.blocked !== "boolean"
+        || (result.reason !== null && typeof result.reason !== "string")) {
+        return { blocked: true, reason: "local-exec startup quarantine reconciliation returned an invalid result" };
+      }
+      return result;
+    } catch (error) {
+      return { blocked: true, reason: `local-exec startup quarantine reconciliation failed: ${failureReason(error)}` };
+    }
   };
   const observeSpawnedExit = (identity: LocalExecProcessIdentity) => { void options.control.waitLocalExecDaemonExit(identity).then((settlement) => enqueue(async () => { if (disposed || !sameLocalExecProcessIdentity(settlement.identity, identity) || state.phase !== "active" || !sameLocalExecProcessIdentity(identityFromActive(state), identity)) return; if (consecutiveRespawns >= LOCAL_EXEC_DAEMON_RESPAWN_LIMIT) { state = { phase: "failed", reason: "respawn limit reached" }; return; } state = { phase: "absent" }; if (!paused && !refusedForClientPause) { consecutiveRespawns += 1; await establishDaemon(); } }), () => {}); };
 
@@ -152,6 +261,14 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
     } catch {}
   };
 
+  const confirmReadyIdentity = async (identity: LocalExecProcessIdentity): Promise<void> => {
+    if (options.control.confirmLocalExecDaemonReady == null) return;
+    const confirmation = await options.control.confirmLocalExecDaemonReady({ identity });
+    if (confirmation?.confirmed !== true) {
+      throw new Error(`local-exec daemon ${identity.pid} readiness confirmation was refused`);
+    }
+  };
+
   const spawnDaemon = async () => {
     if (paused || refusedForClientPause) return;
     const spawned = await options.control.spawnLocalExecDaemon({
@@ -176,7 +293,8 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
         const observed = await currentIdentity(spawned);
         if (observed == null || !sameLocalExecProcessIdentity(observed, spawned)) throw new Error(`local-exec daemon ${spawned.pid} exited or changed identity before readiness`);
         if (discovery != null && descriptorMatchesProcess(discovery, spawned, now())) {
-          quarantinedIdentity = undefined;
+          await confirmReadyIdentity(spawned);
+          clearQuarantine();
           state = activeGeneration("spawned", discovery, spawned);
           missingDiscoveryTicks = 0;
           return;
@@ -194,8 +312,6 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
     refreshSequence += 1;
     try {
       if (await quarantineBlocksSpawn()) {
-        const existing = await readLocalExecDaemonDiscovery(paths.discoveryPath);
-        if (existing != null) await removeLocalExecDaemonDiscoveryIfMatches(paths.discoveryPath, existing);
         await removeLocalExecDaemonFile(paths.connectionPath);
         state = { phase: "failed", reason: "local-exec active discovery generation changed while its verified process remained live" };
         missingDiscoveryTicks = 0;
@@ -205,12 +321,20 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
       if (active != null) await terminateIfStillOwned(identityFromActive(active));
       const existing = await readLocalExecDaemonDiscovery(paths.discoveryPath);
       if (existing != null) {
-        const identity = descriptorHasIdentity(existing) ? await currentIdentity({ ...existing, discoveryStartedAt: existing.startedAt }) : null;
-        if (identity != null && descriptorMatchesProcess(existing, identity, now())) await terminateIfStillOwned(identity);
+        const expected = descriptorHasIdentity(existing)
+          ? { ...existing, discoveryStartedAt: existing.startedAt }
+          : undefined;
+        const identity = expected == null ? null : await currentIdentity(expected);
+        if (identity != null && descriptorMatchesProcess(existing, identity, now())) {
+          await terminateIfStillOwned(identity);
+        } else if (await options.control.isProcessAlive({ pid: existing.pid })) {
+          quarantine(existing.pid, expected, true);
+          throw new Error(`local-exec daemon ${existing.pid} remained alive while pause retirement could not verify its identity`);
+        }
         await removeLocalExecDaemonDiscoveryIfMatches(paths.discoveryPath, existing);
       }
       await removeLocalExecDaemonFile(paths.connectionPath);
-      quarantinedIdentity = undefined;
+      clearQuarantine();
       state = { phase: "absent" };
       missingDiscoveryTicks = 0;
     } catch (error) { state = { phase: "failed", reason: failureReason(error) }; }
@@ -219,27 +343,56 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
   const establishDaemon = async () => {
     if (paused || refusedForClientPause) return;
     try {
+      const startupQuarantine = await reconcileStartupQuarantine();
+      if (startupQuarantine.blocked) {
+        throw new Error(startupQuarantine.reason ?? "local-exec startup quarantine is blocked");
+      }
+      if (await quarantineBlocksSpawn()) {
+        state = { phase: "failed", reason: "local-exec process identity is quarantined until its exit is confirmed" };
+        return;
+      }
       const existing = await readLocalExecDaemonDiscovery(paths.discoveryPath);
       if (disposed) return;
       if (existing != null) {
-        const identity = descriptorHasIdentity(existing) ? await currentIdentity({ ...existing, discoveryStartedAt: existing.startedAt }) : null;
+        const expected = descriptorHasIdentity(existing)
+          ? { ...existing, discoveryStartedAt: existing.startedAt }
+          : undefined;
+        let identity = expected == null ? null : await currentIdentity(expected);
+        let terminationMode: "retained-child" | "win32-stable-handle" | "prior-version" | "none" = "none";
+        if (expected != null) {
+          const inspected = await inspectQuarantinedProcess(expected);
+          if (inspected.status === "matching") {
+            identity = inspected.identity;
+            terminationMode = inspected.terminationMode;
+          } else if (inspected.status === "different" || inspected.status === "absent") {
+            await removeLocalExecDaemonDiscoveryIfMatches(paths.discoveryPath, existing);
+            await spawnDaemon();
+            return;
+          } else if (identity != null) {
+            terminationMode = "none";
+          }
+        }
         if (identity == null || !descriptorMatchesProcess(existing, identity, now())) {
+          if (await options.control.isProcessAlive({ pid: existing.pid })) {
+            quarantine(existing.pid, expected, true);
+            throw new Error(`local-exec daemon ${existing.pid} remained alive while its discovery identity could not be verified`);
+          }
           await removeLocalExecDaemonDiscoveryIfMatches(paths.discoveryPath, existing);
           await spawnDaemon();
           return;
         }
-        if ((existing.inflightCount ?? 0) > 0) {
-          quarantinedIdentity = undefined;
-          state = { phase: "adopting", pid: existing.pid };
-          state = activeGeneration("adopted", existing, identity);
-          missingDiscoveryTicks = 0;
-          return;
+        if (terminationMode === "prior-version") {
+          quarantine(existing.pid, expected);
+          throw new Error(`local-exec prior-version daemon ${existing.pid} requires explicit shutdown before replacement`);
         }
-        state = { phase: "replacing", pid: existing.pid };
-        await terminateIfStillOwned(identity);
-        if (disposed) return;
-        await removeLocalExecDaemonDiscoveryIfMatches(paths.discoveryPath, existing);
-        await spawnDaemon();
+        // Discovery inflightCount is asynchronously published and cannot prove
+        // an atomic idle window. A verified current daemon is therefore always
+        // adopted here, even when a termination capability is available.
+        await confirmReadyIdentity(identity);
+        clearQuarantine();
+        state = { phase: "adopting", pid: existing.pid };
+        state = activeGeneration("adopted", existing, identity);
+        missingDiscoveryTicks = 0;
         return;
       }
       await spawnDaemon();
@@ -253,6 +406,11 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
     if (state.phase === "absent") { consecutiveRespawns = 0; await establishDaemon(); return; }
     if (state.phase === "failed") {
       if (await quarantineBlocksSpawn()) return;
+      const startupQuarantine = await reconcileStartupQuarantine();
+      if (startupQuarantine.blocked) {
+        state = { phase: "failed", reason: startupQuarantine.reason ?? "local-exec startup quarantine is blocked" };
+        return;
+      }
       if (consecutiveRespawns >= LOCAL_EXEC_DAEMON_RESPAWN_LIMIT) return;
       consecutiveRespawns += 1;
       await establishDaemon();
@@ -274,28 +432,54 @@ export function createLocalExecDaemonSupervisor(options: LocalExecDaemonSupervis
       && discovery.entryRealpath === active.daemon.entryRealpath
       && discovery.generationToken === active.daemon.generationToken) {
       const observed = await currentIdentity(activeIdentity);
-      if (observed != null && sameLocalExecProcessIdentity(observed, activeIdentity)) { missingDiscoveryTicks = 0; consecutiveRespawns = 0; return; }
+      if (observed != null && sameLocalExecProcessIdentity(observed, activeIdentity)) {
+        missingDiscoveryTicks = 0;
+        consecutiveRespawns = 0;
+        return;
+      }
+      if (await options.control.isProcessAlive({ pid: activeIdentity.pid })) {
+        quarantine(activeIdentity.pid, activeIdentity, true);
+        missingDiscoveryTicks = 0;
+        state = { phase: "failed", reason: "local-exec active process remained alive while its identity could not be verified" };
+        return;
+      }
       await removeLocalExecDaemonDiscoveryIfMatches(paths.discoveryPath, discovery);
       state = { phase: "absent" };
     } else {
       if (discovery.pid === active.daemon.pid) {
-        await removeLocalExecDaemonDiscoveryIfMatches(paths.discoveryPath, discovery);
         const observed = await currentIdentity(activeIdentity);
-        if (observed != null && sameLocalExecProcessIdentity(observed, activeIdentity)) {
-          quarantinedIdentity = activeIdentity;
+        if (
+          (observed != null && sameLocalExecProcessIdentity(observed, activeIdentity))
+          || await options.control.isProcessAlive({ pid: activeIdentity.pid })
+        ) {
+          quarantine(activeIdentity.pid, activeIdentity);
           missingDiscoveryTicks = 0;
-          state = { phase: "failed", reason: "local-exec active discovery generation changed while its verified process remained live" };
+          state = { phase: "failed", reason: "local-exec active discovery generation changed while its process remained live" };
           return;
         }
+        await removeLocalExecDaemonDiscoveryIfMatches(paths.discoveryPath, discovery);
         state = { phase: "absent" };
       } else {
         const successorIdentity = descriptorHasIdentity(discovery) ? await currentIdentity({ ...discovery, discoveryStartedAt: discovery.startedAt }) : null;
         if (successorIdentity != null && descriptorMatchesProcess(discovery, successorIdentity, now())) {
+          await confirmReadyIdentity(successorIdentity);
           await terminateIfStillOwned(activeIdentity);
-          quarantinedIdentity = undefined;
+          clearQuarantine();
           state = activeGeneration("adopted", discovery, successorIdentity);
           missingDiscoveryTicks = 0;
           consecutiveRespawns = 0;
+          return;
+        }
+        if (await options.control.isProcessAlive({ pid: discovery.pid })) {
+          quarantine(
+            discovery.pid,
+            descriptorHasIdentity(discovery)
+              ? { ...discovery, discoveryStartedAt: discovery.startedAt }
+              : undefined,
+          );
+          quarantine(activeIdentity.pid, activeIdentity);
+          missingDiscoveryTicks = 0;
+          state = { phase: "failed", reason: "local-exec replacement discovery could not be verified while related processes remained live" };
           return;
         }
         await removeLocalExecDaemonDiscoveryIfMatches(paths.discoveryPath, discovery);

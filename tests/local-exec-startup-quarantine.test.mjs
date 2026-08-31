@@ -1,0 +1,976 @@
+import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { pathToFileURL } from "node:url";
+
+import { build } from "esbuild";
+
+const repoRoot = path.resolve(import.meta.dirname, "..");
+
+async function loadModule(relative) {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-startup-quarantine-module-"));
+  const output = path.join(temporary, "module.mjs");
+  await build({
+    entryPoints: [path.join(repoRoot, relative)],
+    outfile: output,
+    bundle: true,
+    format: "esm",
+    platform: "node",
+    target: "node22",
+  });
+  const imported = await import(`${pathToFileURL(output).href}?${Date.now()}`);
+  return {
+    module: imported,
+    dispose: () => rm(temporary, { recursive: true, force: true }),
+  };
+}
+
+function fakeChild(pid) {
+  return {
+    pid,
+    exitCode: null,
+    signalCode: null,
+    once() {},
+  };
+}
+
+function controlDependencies({ native, ledger, events = [], overrides = {} }) {
+  return {
+    connector: { async connect() { return {}; } },
+    webauthnPrompt: {
+      async requestConsent() { return { approved: false, promptId: null }; },
+      async requestPin() { return { pin: null }; },
+      update() {},
+      finish() {},
+    },
+    recordSendStage() {},
+    recordGatewayCommandSpan() {},
+    onReachability() {},
+    onDnsDiagnostic() {},
+    onProcessCrash() {},
+    async readLocalExecDaemonDiscovery() { return null; },
+    async clearLocalExecDaemonDiscoveryIfMatches() {
+      events.push("clear-discovery");
+      return true;
+    },
+    async readLocalExecStartupQuarantines() { return [...ledger.records]; },
+    async writeLocalExecStartupQuarantine(record) {
+      events.push("write-quarantine");
+      const existing = ledger.records.find(candidate => candidate.pid === record.pid
+        && candidate.entryRealpath === record.entryRealpath
+        && candidate.generationToken === record.generationToken);
+      if (existing != null) return existing;
+      const stored = structuredClone(record);
+      ledger.records.push(stored);
+      return stored;
+    },
+    async clearLocalExecStartupQuarantineIfMatches(expected) {
+      const index = ledger.records.findIndex(candidate => JSON.stringify(candidate) === JSON.stringify(expected));
+      if (index < 0) return false;
+      ledger.records.splice(index, 1);
+      events.push("clear-quarantine");
+      return true;
+    },
+    now: () => 10_000,
+    delay: async () => {},
+    native,
+    ...overrides,
+  };
+}
+
+function matchingIdentity(pid, entryRealpath, generationToken) {
+  return {
+    pid,
+    startEpochMs: 9_900,
+    command: `node "${entryRealpath}" --sand-local-exec-generation=${generationToken}`,
+  };
+}
+
+test("startup quarantine protocol keeps immutable records separate and rejects corruption", async () => {
+  const loaded = await loadModule("source/host/local-exec/local-exec-daemon-protocol.ts");
+  const directory = await mkdtemp(path.join(os.tmpdir(), "grok-startup-quarantine-ledger-"));
+  const first = {
+    version: 1,
+    spawnRequestedAt: 9_900,
+    pid: 4_201,
+    recordedAt: 10_000,
+    entryRealpath: "C:\\app\\daemon.cjs",
+    generationToken: "generation-one",
+  };
+  const second = {
+    version: 1,
+    spawnRequestedAt: 9_900,
+    pid: 4_202,
+    recordedAt: 10_001,
+    entryRealpath: "C:\\app\\daemon.cjs",
+    generationToken: "generation-two",
+  };
+  try {
+    assert.equal(loaded.module.parseLocalExecStartupQuarantine({ ...first, extra: true }), null);
+    assert.equal(loaded.module.parseLocalExecStartupQuarantine({ ...first, spawnRequestedAt: undefined }), null);
+    assert.equal(loaded.module.parseLocalExecStartupQuarantine({ ...first, recordedAt: first.spawnRequestedAt + 60_001 }), null);
+    assert.deepEqual(await loaded.module.writeLocalExecStartupQuarantine(first, directory), first);
+    assert.deepEqual(await loaded.module.writeLocalExecStartupQuarantine(second, directory), second);
+    assert.deepEqual((await loaded.module.readLocalExecStartupQuarantines(directory)).map(record => record.generationToken).sort(), ["generation-one", "generation-two"]);
+
+    assert.equal(
+      await loaded.module.clearLocalExecStartupQuarantineIfMatches({ ...first, recordedAt: 99_999 }, directory),
+      false,
+    );
+    assert.deepEqual((await loaded.module.readLocalExecStartupQuarantines(directory)).map(record => record.generationToken).sort(), ["generation-one", "generation-two"]);
+    assert.equal(await loaded.module.clearLocalExecStartupQuarantineIfMatches(first, directory), true);
+    assert.deepEqual(await loaded.module.readLocalExecStartupQuarantines(directory), [second]);
+
+    const secondPath = loaded.module.getLocalExecStartupQuarantinePath(second, directory);
+    await writeFile(secondPath, "{not-json", "utf8");
+    await assert.rejects(
+      loaded.module.readLocalExecStartupQuarantines(directory),
+      /contains invalid JSON/,
+    );
+  } finally {
+    await loaded.dispose();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("failed unidentified cleanup persists before signalling and blocks a new executor instance", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const ledger = { records: [] };
+  const events = [];
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const generationToken = "durable-generation";
+  let firstSpawnCalls = 0;
+  let secondSpawnCalls = 0;
+  let terminationCalls = 0;
+  let identityReads = 0;
+  try {
+    const first = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      events,
+      native: {
+        async spawnLocalExecDaemon() {
+          firstSpawnCalls += 1;
+          events.push("spawn");
+          return { child: fakeChild(4_301), entryRealpath, generationToken };
+        },
+        async terminateProcess() {
+          terminationCalls += 1;
+          events.push("terminate");
+          throw new Error("simulated owned-child termination failure");
+        },
+        isProcessAlive(pid) { return pid === 4_301; },
+        readProcessIdentity(pid) {
+          identityReads += 1;
+          return identityReads > 40 ? matchingIdentity(pid, entryRealpath, generationToken) : null;
+        },
+        resolveLocalExecDaemonEntryRealpath() { return entryRealpath; },
+      },
+    }));
+    await assert.rejects(
+      first.spawnLocalExecDaemon({ logPath: "test.log", env: {} }),
+      /spawn verification and owned-child cleanup did not settle safely/,
+    );
+    assert.equal(firstSpawnCalls, 1);
+    assert.equal(terminationCalls, 1);
+    assert.deepEqual(events.slice(-2), ["write-quarantine", "terminate"]);
+    assert.equal(events.includes("clear-discovery"), false);
+    assert.equal(ledger.records.length, 1);
+    assert.deepEqual(ledger.records[0], {
+      version: 1,
+      spawnRequestedAt: 10_000,
+      pid: 4_301,
+      recordedAt: 10_000,
+      entryRealpath,
+      generationToken,
+    });
+
+    const second = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      native: {
+        async spawnLocalExecDaemon() {
+          secondSpawnCalls += 1;
+          assert.fail("durable quarantine must block a second executor from spawning");
+        },
+        async terminateProcess() {
+          assert.fail("an identity-unreadable live PID must not be signalled during restart reconciliation");
+        },
+        isProcessAlive(pid) { return pid === 4_301; },
+        readProcessIdentity() { return null; },
+        resolveLocalExecDaemonEntryRealpath() { return entryRealpath; },
+      },
+    }));
+    await assert.rejects(
+      second.spawnLocalExecDaemon({ logPath: "test.log", env: {} }),
+      /local-exec startup cleanup is quarantined/,
+    );
+    assert.equal(secondSpawnCalls, 0);
+    assert.equal(ledger.records.length, 1);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("restart reconciliation releases a reused PID without signalling it and then permits a fresh spawn", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const oldEntry = "C:\\app\\local-exec-daemon\\main.cjs";
+  const ledger = {
+    records: [{
+      version: 1,
+      spawnRequestedAt: 9_900,
+      pid: 4_401,
+      recordedAt: 10_000,
+      entryRealpath: oldEntry,
+      generationToken: "old-generation",
+    }],
+  };
+  const freshEntry = "C:\\app\\local-exec-daemon\\main.cjs";
+  const freshGeneration = "fresh-generation";
+  const freshIdentity = matchingIdentity(4_402, freshEntry, freshGeneration);
+  let spawnCalls = 0;
+  let terminationCalls = 0;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      native: {
+        async spawnLocalExecDaemon() {
+          spawnCalls += 1;
+          return { child: fakeChild(freshIdentity.pid), entryRealpath: freshEntry, generationToken: freshGeneration };
+        },
+        async terminateProcess() {
+          terminationCalls += 1;
+          assert.fail("a readable unrelated PID must never be signalled");
+        },
+        isProcessAlive() { return true; },
+        readProcessIdentity(pid) {
+          if (pid === 4_401) return { pid, startEpochMs: 20_000, command: "unrelated.exe --serve" };
+          if (pid === freshIdentity.pid) return freshIdentity;
+          return null;
+        },
+        resolveLocalExecDaemonEntryRealpath() { return freshEntry; },
+      },
+    }));
+    const spawned = await executors.spawnLocalExecDaemon({ logPath: "test.log", env: {} });
+    assert.deepEqual(spawned, { ...freshIdentity, entryRealpath: freshEntry, generationToken: freshGeneration });
+    assert.equal(spawnCalls, 1);
+    assert.equal(terminationCalls, 0);
+    assert.equal(ledger.records.length, 1);
+    assert.equal(ledger.records[0].generationToken, freshGeneration);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("restart reconciliation keeps an exact live generation fenced when no retained handle or ready discovery exists", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const quarantined = {
+    version: 1,
+    spawnRequestedAt: 9_900,
+    pid: 4_501,
+    recordedAt: 10_000,
+    entryRealpath: "C:\\app\\local-exec-daemon\\main.cjs",
+    generationToken: "owned-generation",
+  };
+  const exactIdentity = matchingIdentity(quarantined.pid, quarantined.entryRealpath, quarantined.generationToken);
+  const ledger = { records: [quarantined] };
+  let terminationCalls = 0;
+  let spawnCalls = 0;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      native: {
+        async spawnLocalExecDaemon() {
+          spawnCalls += 1;
+          assert.fail("an exact handleless generation must remain fenced");
+        },
+        async terminateProcess() {
+          terminationCalls += 1;
+          throw new Error("no retained child-process handle");
+        },
+        isProcessAlive() { return true; },
+        readProcessIdentity(pid) { return pid === quarantined.pid ? exactIdentity : null; },
+        resolveLocalExecDaemonEntryRealpath() { return quarantined.entryRealpath; },
+      },
+    }));
+    const status = await executors.reconcileLocalExecStartupQuarantine();
+    assert.equal(status.blocked, true);
+    assert.match(status.reason, /startup cleanup is quarantined/);
+    assert.equal(terminationCalls, 1);
+    assert.equal(spawnCalls, 0);
+    assert.deepEqual(ledger.records, [quarantined]);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("Windows restart reconciliation terminates an exact pre-ready generation through stable handle acquisition", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const quarantined = {
+    version: 1,
+    spawnRequestedAt: 9_900,
+    pid: 4_531,
+    recordedAt: 10_000,
+    entryRealpath: "C:\\app\\local-exec-daemon\\main.cjs",
+    generationToken: "windows-pre-ready-generation",
+  };
+  const exactIdentity = matchingIdentity(
+    quarantined.pid,
+    quarantined.entryRealpath,
+    quarantined.generationToken,
+  );
+  const ledger = { records: [quarantined] };
+  let alive = true;
+  let terminationCalls = 0;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      overrides: { platform: "win32" },
+      native: {
+        async spawnLocalExecDaemon() { assert.fail("reconciliation only"); },
+        async terminateProcess(pid, options) {
+          terminationCalls += 1;
+          assert.equal(pid, quarantined.pid);
+          assert.deepEqual(options.expectedIdentity, exactIdentity);
+          assert.equal(options.allowVerifiedWindowsHandleAcquisition, true);
+          assert.equal(options.ownedChild, undefined);
+          alive = false;
+        },
+        isProcessAlive() { return alive; },
+        readProcessIdentity(pid) {
+          return alive && pid === quarantined.pid ? exactIdentity : null;
+        },
+        resolveLocalExecDaemonEntryRealpath() { return quarantined.entryRealpath; },
+      },
+    }));
+    assert.deepEqual(
+      await executors.reconcileLocalExecStartupQuarantine(),
+      { blocked: false, reason: null },
+    );
+    assert.equal(terminationCalls, 1);
+    assert.deepEqual(ledger.records, []);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("restart reconciliation accepts a matching ready discovery and adopts it without PID signalling", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const quarantined = {
+    version: 1,
+    spawnRequestedAt: 9_900,
+    pid: 4_551,
+    recordedAt: 10_000,
+    entryRealpath: "C:\\app\\local-exec-daemon\\main.cjs",
+    generationToken: "ready-recovered-generation",
+  };
+  const exactIdentity = matchingIdentity(quarantined.pid, quarantined.entryRealpath, quarantined.generationToken);
+  const ledger = { records: [quarantined] };
+  let terminationCalls = 0;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      overrides: {
+        platform: "win32",
+        async readLocalExecDaemonDiscovery() {
+          return {
+            pid: quarantined.pid,
+            startedAt: 9_950,
+            entryRealpath: quarantined.entryRealpath,
+            generationToken: quarantined.generationToken,
+            inflightCount: 0,
+          };
+        },
+      },
+      native: {
+        async spawnLocalExecDaemon() { assert.fail("reconciliation only"); },
+        async terminateProcess() { terminationCalls += 1; },
+        isProcessAlive() { return true; },
+        readProcessIdentity(pid) { return pid === quarantined.pid ? exactIdentity : null; },
+        resolveLocalExecDaemonEntryRealpath() { return quarantined.entryRealpath; },
+      },
+    }));
+    assert.deepEqual(await executors.reconcileLocalExecStartupQuarantine(), { blocked: false, reason: null });
+    assert.equal(terminationCalls, 0);
+    assert.deepEqual(ledger.records, []);
+    assert.deepEqual(
+      await executors.inspectLocalExecProcessIdentity({
+        pid: quarantined.pid,
+        entryRealpath: quarantined.entryRealpath,
+        generationToken: quarantined.generationToken,
+        startEpochMs: exactIdentity.startEpochMs,
+        command: exactIdentity.command,
+      }),
+      {
+        status: "matching",
+        identity: { ...exactIdentity, entryRealpath: quarantined.entryRealpath, generationToken: quarantined.generationToken },
+        terminationMode: "none",
+      },
+    );
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("restart reconciliation never adopts a ready discovery from an obsolete daemon entry", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const oldEntry = "C:\\old-app\\local-exec-daemon\\main.cjs";
+  const currentEntry = "C:\\current-app\\local-exec-daemon\\main.cjs";
+  const quarantined = {
+    version: 1,
+    spawnRequestedAt: 9_900,
+    pid: 4_561,
+    recordedAt: 10_000,
+    entryRealpath: oldEntry,
+    generationToken: "obsolete-ready-generation",
+  };
+  const exactIdentity = matchingIdentity(
+    quarantined.pid,
+    quarantined.entryRealpath,
+    quarantined.generationToken,
+  );
+  const ledger = { records: [quarantined] };
+  let alive = true;
+  let terminationCalls = 0;
+  let spawnCalls = 0;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      overrides: {
+        platform: "win32",
+        async readLocalExecDaemonDiscovery() {
+          return {
+            pid: quarantined.pid,
+            startedAt: 9_950,
+            entryRealpath: quarantined.entryRealpath,
+            generationToken: quarantined.generationToken,
+            inflightCount: 0,
+          };
+        },
+      },
+      native: {
+        async spawnLocalExecDaemon() {
+          spawnCalls += 1;
+          assert.fail("reconciliation must finish before any replacement spawn");
+        },
+        async terminateProcess(pid, options) {
+          terminationCalls += 1;
+          assert.equal(pid, quarantined.pid);
+          assert.deepEqual(options.expectedIdentity, exactIdentity);
+          assert.equal(options.ownedChild, undefined);
+          assert.equal(options.allowVerifiedWindowsHandleAcquisition, true);
+          alive = false;
+        },
+        isProcessAlive(pid) { return alive && pid === quarantined.pid; },
+        readProcessIdentity(pid) {
+          return alive && pid === quarantined.pid ? exactIdentity : null;
+        },
+        resolveLocalExecDaemonEntryRealpath() { return currentEntry; },
+      },
+    }));
+
+    assert.deepEqual(
+      await executors.reconcileLocalExecStartupQuarantine(),
+      { blocked: false, reason: null },
+    );
+    assert.equal(terminationCalls, 1);
+    assert.equal(spawnCalls, 0);
+    assert.deepEqual(ledger.records, []);
+    assert.deepEqual(
+      await executors.inspectLocalExecProcessIdentity({
+        ...exactIdentity,
+        entryRealpath: oldEntry,
+        generationToken: quarantined.generationToken,
+      }),
+      { status: "absent" },
+    );
+  } finally {
+    await loaded.dispose();
+  }
+});
+test("restart readiness confirmation clears an exact disk fence without an inherited child handle", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const quarantined = {
+    version: 1,
+    spawnRequestedAt: 9_900,
+    pid: 4_571,
+    recordedAt: 10_000,
+    entryRealpath: "C:\\app\\local-exec-daemon\\main.cjs",
+    generationToken: "confirm-recovered-generation",
+  };
+  const observed = matchingIdentity(
+    quarantined.pid,
+    quarantined.entryRealpath,
+    quarantined.generationToken,
+  );
+  const identity = {
+    ...observed,
+    entryRealpath: quarantined.entryRealpath,
+    generationToken: quarantined.generationToken,
+  };
+  const ledger = { records: [quarantined] };
+  let terminationCalls = 0;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      overrides: {
+        platform: "win32",
+        async readLocalExecDaemonDiscovery() {
+          return {
+            pid: quarantined.pid,
+            startedAt: 9_950,
+            entryRealpath: quarantined.entryRealpath,
+            generationToken: quarantined.generationToken,
+            inflightCount: 0,
+          };
+        },
+      },
+      native: {
+        async spawnLocalExecDaemon() { assert.fail("readiness confirmation only"); },
+        async terminateProcess() { terminationCalls += 1; },
+        isProcessAlive() { return true; },
+        readProcessIdentity(pid) { return pid === quarantined.pid ? observed : null; },
+        resolveLocalExecDaemonEntryRealpath() { return quarantined.entryRealpath; },
+      },
+    }));
+    assert.deepEqual(
+      await executors.confirmLocalExecDaemonReady({ identity }),
+      { confirmed: true },
+    );
+    assert.equal(terminationCalls, 0);
+    assert.deepEqual(ledger.records, []);
+    assert.deepEqual(
+      await executors.inspectLocalExecProcessIdentity(identity),
+      { status: "matching", identity, terminationMode: "none" },
+    );
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("verified spawn quarantine survives until matching discovery readiness is acknowledged", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const ledger = { records: [] };
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const generationToken = "ready-ack-generation";
+  const identity = matchingIdentity(4_601, entryRealpath, generationToken);
+  let discovery = null;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      overrides: {
+        async readLocalExecDaemonDiscovery() { return discovery; },
+      },
+      native: {
+        async spawnLocalExecDaemon() {
+          return { child: fakeChild(identity.pid), entryRealpath, generationToken };
+        },
+        async terminateProcess() {},
+        isProcessAlive() { return true; },
+        readProcessIdentity(pid) { return pid === identity.pid ? identity : null; },
+        resolveLocalExecDaemonEntryRealpath() { return entryRealpath; },
+      },
+    }));
+    const spawned = await executors.spawnLocalExecDaemon({ logPath: "test.log", env: {} });
+    assert.equal(spawned.pid, identity.pid);
+    assert.equal(ledger.records.length, 1, "identity verification alone must not erase the crash fence");
+    assert.deepEqual(await executors.confirmLocalExecDaemonReady({ identity: spawned }), { confirmed: false });
+    assert.equal(ledger.records.length, 1);
+    discovery = {
+      pid: identity.pid,
+      startedAt: 9_950,
+      entryRealpath,
+      generationToken,
+      inflightCount: 0,
+    };
+    assert.deepEqual(await executors.confirmLocalExecDaemonReady({ identity: spawned }), { confirmed: true });
+    assert.deepEqual(ledger.records, []);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("startup quarantine is durable before the first identity-poll delay and blocks a second executor", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const ledger = { records: [] };
+  const events = [];
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const generationToken = "poll-window-generation";
+  const identity = matchingIdentity(4_701, entryRealpath, generationToken);
+  let releaseDelay;
+  const delayGate = new Promise(resolve => { releaseDelay = resolve; });
+  let firstIdentityReads = 0;
+  let secondSpawnCalls = 0;
+  try {
+    const first = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      events,
+      overrides: { delay: async () => { events.push("identity-delay"); await delayGate; } },
+      native: {
+        async spawnLocalExecDaemon() {
+          events.push("spawn");
+          return { child: fakeChild(identity.pid), entryRealpath, generationToken };
+        },
+        async terminateProcess() {},
+        isProcessAlive() { return true; },
+        readProcessIdentity(pid) {
+          firstIdentityReads += 1;
+          return firstIdentityReads > 1 && pid === identity.pid ? identity : null;
+        },
+        resolveLocalExecDaemonEntryRealpath() { return entryRealpath; },
+      },
+    }));
+    const firstSpawn = first.spawnLocalExecDaemon({ logPath: "test.log", env: {} });
+    for (let attempt = 0; attempt < 20 && !events.includes("identity-delay"); attempt += 1) {
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    assert.equal(events.includes("identity-delay"), true);
+    assert.ok(events.indexOf("write-quarantine") < events.indexOf("identity-delay"));
+    assert.equal(ledger.records.length, 1);
+
+    const second = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      native: {
+        async spawnLocalExecDaemon() {
+          secondSpawnCalls += 1;
+          assert.fail("the durable crash fence must block a concurrent second spawn");
+        },
+        async terminateProcess() { assert.fail("an unreadable live PID must not be signalled"); },
+        isProcessAlive() { return true; },
+        readProcessIdentity() { return null; },
+        resolveLocalExecDaemonEntryRealpath() { return entryRealpath; },
+      },
+    }));
+    assert.deepEqual(
+      await second.reconcileLocalExecStartupQuarantine(),
+      { blocked: true, reason: "local-exec startup cleanup is quarantined: live, ambiguous, or uninspectable process IDs 4701" },
+    );
+    await assert.rejects(
+      second.spawnLocalExecDaemon({ logPath: "test.log", env: {} }),
+      /local-exec startup cleanup is quarantined/,
+    );
+    assert.equal(secondSpawnCalls, 0);
+
+    releaseDelay();
+    const spawned = await firstSpawn;
+    assert.equal(spawned.pid, identity.pid);
+    assert.equal(ledger.records.length, 1);
+  } finally {
+    releaseDelay?.();
+    await loaded.dispose();
+  }
+});
+
+test("startup fence write failure cleans the unrecorded child only through its retained handle", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const ledger = { records: [] };
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const child = fakeChild(4_751);
+  let terminationCalls = 0;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      overrides: {
+        async writeLocalExecStartupQuarantine() {
+          throw new Error("simulated startup fence disk failure");
+        },
+      },
+      native: {
+        async spawnLocalExecDaemon() {
+          return { child, entryRealpath, generationToken: "write-failure-generation" };
+        },
+        async terminateProcess(pid, options) {
+          terminationCalls += 1;
+          assert.equal(pid, child.pid);
+          assert.equal(options.ownedChild, child);
+          assert.equal(options.allowUnidentifiedOwnedEscalation, true);
+          assert.equal(options.isUnidentifiedProcessStillOwned(), true);
+        },
+        isProcessAlive() { return true; },
+        readProcessIdentity() { return null; },
+        resolveLocalExecDaemonEntryRealpath() { return entryRealpath; },
+      },
+    }));
+    await assert.rejects(
+      executors.spawnLocalExecDaemon({ logPath: "test.log", env: {} }),
+      /simulated startup fence disk failure/,
+    );
+    assert.equal(terminationCalls, 1);
+    assert.deepEqual(ledger.records, []);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("a live prior-version daemon needs exact main-process discovery before Windows stable-handle retirement", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const oldEntry = "C:\\old-app\\local-exec-daemon\\main.cjs";
+  const currentEntry = "C:\\current-app\\local-exec-daemon\\main.cjs";
+  const generationToken = "prior-version-generation";
+  const nativeIdentity = matchingIdentity(4_741, oldEntry, generationToken);
+  const identity = {
+    ...nativeIdentity,
+    entryRealpath: oldEntry,
+    generationToken,
+  };
+  const expected = { ...identity, discoveryStartedAt: 9_950 };
+  const ledger = { records: [] };
+  let discovery = null;
+  let alive = true;
+  let terminationCalls = 0;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      overrides: {
+        platform: "win32",
+        async readLocalExecDaemonDiscovery() { return discovery; },
+      },
+      native: {
+        async spawnLocalExecDaemon() { assert.fail("inspection and retirement only"); },
+        async terminateProcess(pid, options) {
+          terminationCalls += 1;
+          assert.equal(pid, identity.pid);
+          assert.deepEqual(options.expectedIdentity, identity);
+          assert.equal(options.ownedChild, undefined);
+          assert.equal(options.allowVerifiedWindowsHandleAcquisition, true);
+          alive = false;
+        },
+        isProcessAlive(pid) { return alive && pid === identity.pid; },
+        readProcessIdentity(pid) { return alive && pid === identity.pid ? nativeIdentity : null; },
+        resolveLocalExecDaemonEntryRealpath() { return currentEntry; },
+      },
+    }));
+
+    assert.deepEqual(
+      await executors.inspectLocalExecProcessIdentity(expected),
+      { status: "unreadable" },
+    );
+    assert.deepEqual(
+      await executors.terminateProcess({ identity }),
+      { terminated: false },
+    );
+    assert.equal(terminationCalls, 0);
+
+    discovery = {
+      pid: identity.pid,
+      startedAt: expected.discoveryStartedAt,
+      entryRealpath: oldEntry,
+      generationToken,
+      inflightCount: 0,
+    };
+    assert.deepEqual(
+      await executors.inspectLocalExecProcessIdentity(expected),
+      {
+        status: "matching",
+        identity,
+        terminationMode: "prior-version",
+      },
+    );
+    assert.deepEqual(
+      await executors.terminateProcess({ identity }),
+      { terminated: true },
+    );
+    assert.equal(terminationCalls, 1);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("same-PID reuse never lends a stale retained child handle to a later identity", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const firstGeneration = "first-generation";
+  const secondGeneration = "second-generation";
+  const firstNativeIdentity = matchingIdentity(4_751, entryRealpath, firstGeneration);
+  const secondNativeIdentity = {
+    ...matchingIdentity(4_751, entryRealpath, secondGeneration),
+    startEpochMs: firstNativeIdentity.startEpochMs + 50,
+  };
+  const firstIdentity = {
+    ...firstNativeIdentity,
+    entryRealpath,
+    generationToken: firstGeneration,
+  };
+  const secondIdentity = {
+    ...secondNativeIdentity,
+    entryRealpath,
+    generationToken: secondGeneration,
+  };
+  const child = fakeChild(firstIdentity.pid);
+  const ledger = { records: [] };
+  let observed = firstNativeIdentity;
+  let alive = true;
+  let terminationCalls = 0;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      overrides: { platform: "win32" },
+      native: {
+        async spawnLocalExecDaemon() {
+          return { child, entryRealpath, generationToken: firstGeneration };
+        },
+        async terminateProcess(pid, options) {
+          terminationCalls += 1;
+          assert.equal(pid, secondIdentity.pid);
+          assert.deepEqual(options.expectedIdentity, secondIdentity);
+          assert.equal(options.ownedChild, undefined);
+          assert.equal(options.allowVerifiedWindowsHandleAcquisition, true);
+          alive = false;
+        },
+        isProcessAlive(pid) { return alive && pid === secondIdentity.pid; },
+        readProcessIdentity(pid) { return alive && pid === observed.pid ? observed : null; },
+        resolveLocalExecDaemonEntryRealpath() { return entryRealpath; },
+      },
+    }));
+    assert.deepEqual(
+      await executors.spawnLocalExecDaemon({ logPath: "test.log", env: {} }),
+      firstIdentity,
+    );
+
+    observed = secondNativeIdentity;
+    assert.deepEqual(
+      await executors.inspectLocalExecProcessIdentity(secondIdentity),
+      {
+        status: "matching",
+        identity: secondIdentity,
+        terminationMode: "none",
+      },
+    );
+    assert.deepEqual(
+      await executors.terminateProcess({ identity: secondIdentity }),
+      { terminated: true },
+    );
+    assert.equal(terminationCalls, 1);
+  } finally {
+    await loaded.dispose();
+  }
+});
+test("identity-unreadable initial spawn is never signalled and remains durably fenced", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const ledger = { records: [] };
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  let terminationCalls = 0;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      native: {
+        async spawnLocalExecDaemon() {
+          return { child: fakeChild(4_801), entryRealpath, generationToken: "unreadable-generation" };
+        },
+        async terminateProcess() { terminationCalls += 1; },
+        isProcessAlive() { return true; },
+        readProcessIdentity() { return null; },
+        resolveLocalExecDaemonEntryRealpath() { return entryRealpath; },
+      },
+    }));
+    await assert.rejects(
+      executors.spawnLocalExecDaemon({ logPath: "test.log", env: {} }),
+      /spawn verification and owned-child cleanup did not settle safely/,
+    );
+    assert.equal(terminationCalls, 0);
+    assert.equal(ledger.records.length, 1);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("same PID and generation with a later process start is treated as reuse without signalling", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const record = {
+    version: 1,
+    spawnRequestedAt: 9_900,
+    pid: 4_901,
+    recordedAt: 10_000,
+    entryRealpath,
+    generationToken: "reused-same-arguments",
+  };
+  const later = { ...matchingIdentity(record.pid, entryRealpath, record.generationToken), startEpochMs: 10_001 };
+  const ledger = { records: [record] };
+  let terminationCalls = 0;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      native: {
+        async spawnLocalExecDaemon() { assert.fail("reconciliation only"); },
+        async terminateProcess() { terminationCalls += 1; },
+        isProcessAlive() { return true; },
+        readProcessIdentity(pid) { return pid === record.pid ? later : null; },
+        resolveLocalExecDaemonEntryRealpath() { return entryRealpath; },
+      },
+    }));
+    assert.deepEqual(await executors.reconcileLocalExecStartupQuarantine(), { blocked: false, reason: null });
+    assert.equal(terminationCalls, 0);
+    assert.deepEqual(ledger.records, []);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("same PID and generation with an implausibly old process start stays ambiguous and unsignalled", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  const entryRealpath = "C:\\app\\local-exec-daemon\\main.cjs";
+  const record = {
+    version: 1,
+    spawnRequestedAt: 9_900,
+    pid: 5_001,
+    recordedAt: 10_000,
+    entryRealpath,
+    generationToken: "ambiguous-same-arguments",
+  };
+  const older = { ...matchingIdentity(record.pid, entryRealpath, record.generationToken), startEpochMs: 8_899 };
+  const ledger = { records: [record] };
+  let terminationCalls = 0;
+  try {
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      native: {
+        async spawnLocalExecDaemon() { assert.fail("reconciliation only"); },
+        async terminateProcess() { terminationCalls += 1; },
+        isProcessAlive() { return true; },
+        readProcessIdentity(pid) { return pid === record.pid ? older : null; },
+        resolveLocalExecDaemonEntryRealpath() { return entryRealpath; },
+      },
+    }));
+    const status = await executors.reconcileLocalExecStartupQuarantine();
+    assert.equal(status.blocked, true);
+    assert.match(status.reason, /startup cleanup is quarantined/);
+    assert.equal(terminationCalls, 0);
+    assert.deepEqual(ledger.records, [record]);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("quarantine inspection errors fail closed before native spawn", async () => {
+  const loaded = await loadModule("source/electron-main/coordinator/coordinator-executors.ts");
+  let spawnCalls = 0;
+  try {
+    const ledger = { records: [] };
+    const executors = loaded.module.createCoordinatorControlExecutors(controlDependencies({
+      ledger,
+      overrides: {
+        async readLocalExecStartupQuarantines() {
+          throw new Error("malformed durable quarantine record");
+        },
+      },
+      native: {
+        async spawnLocalExecDaemon() {
+          spawnCalls += 1;
+          assert.fail("a malformed durable quarantine must block spawn");
+        },
+        async terminateProcess() {},
+        isProcessAlive() { return false; },
+        readProcessIdentity() { return null; },
+        resolveLocalExecDaemonEntryRealpath() { return "C:\\app\\daemon.cjs"; },
+      },
+    }));
+    await assert.rejects(
+      executors.spawnLocalExecDaemon({ logPath: "test.log", env: {} }),
+      /malformed durable quarantine record/,
+    );
+    assert.equal(spawnCalls, 0);
+  } finally {
+    await loaded.dispose();
+  }
+});

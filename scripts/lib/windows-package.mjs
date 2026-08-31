@@ -3,20 +3,50 @@ import { cp, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/pro
 import path from "node:path";
 import { reconstructedUpdaterGuard } from "./build-asar.mjs";
 import { extractAsarFile, listAsarPackage } from "./asar-paths.mjs";
-import { reconstructedWindowsExecutableName, reconstructedWindowsName, reconstructedWindowsPackageName, upstreamWindowsAsarSha256, windowsInstallerSha256 } from "./config.mjs";
+import { reconstructedWindowsExecutableName, reconstructedWindowsName, reconstructedWindowsPackageName, repoRoot, upstreamWindowsAsarSha256, windowsInstallerSha256 } from "./config.mjs";
 import { assertPeX64, pathExists, sha256File } from "./windows-runtime.mjs";
 
 export const windowsPortableManifestName = "RECONSTRUCTED-PORTABLE.json";
 const normalizedListing = archive => new Set(listAsarPackage(archive));
 const asarJson = (archive, relative) => JSON.parse(Buffer.from(extractAsarFile(archive, relative)).toString("utf8"));
 const hashBytes = bytes => createHash("sha256").update(bytes).digest("hex");
+const windowsUpdaterArtifactPaths = Object.freeze([
+  "resources/elevate.exe",
+  "resources/app-update.yml",
+  "resources/latest.yml",
+  "Update.exe",
+]);
+const windowsUninstallerArtifactName = /^Uninstall .*\.exe$/i;
+
+async function reconstructedPackageVersion() {
+  const packageJson = JSON.parse(await readFile(path.join(repoRoot, "package.json"), "utf8"));
+  if (typeof packageJson.version !== "string" || !/^0\.18\.0-reconstructed\.\d+$/.test(packageJson.version)) {
+    throw new Error("Repository package version is not a reconstructed 0.18.0 release");
+  }
+  return packageJson.version;
+}
 
 async function removeUpdaterArtifacts(root) {
-  for (const relative of ["resources/elevate.exe", "resources/app-update.yml", "resources/latest.yml", "Update.exe"]) await rm(path.join(root, ...relative.split("/")), { force: true });
-  for (const entry of await readdir(root)) if (/^Uninstall .*\.exe$/i.test(entry)) await rm(path.join(root, entry), { force: true });
+  for (const relative of windowsUpdaterArtifactPaths) await rm(path.join(root, ...relative.split("/")), { force: true });
+  for (const entry of await readdir(root)) if (windowsUninstallerArtifactName.test(entry)) await rm(path.join(root, entry), { force: true });
+}
+
+export async function assertNoWindowsUpdaterArtifacts(root) {
+  const outputRoot = path.resolve(root);
+  for (const relative of windowsUpdaterArtifactPaths) {
+    if (await pathExists(path.join(outputRoot, ...relative.split("/")))) {
+      throw new Error(`Updater artifact remains: ${relative}`);
+    }
+  }
+  for (const entry of await readdir(outputRoot)) {
+    if (windowsUninstallerArtifactName.test(entry)) {
+      throw new Error(`Updater artifact remains: ${entry}`);
+    }
+  }
 }
 
 export async function assembleWindowsPortable({ runtime, builtAsar, builtAsarUnpacked, outputRoot }) {
+  const packageVersion = await reconstructedPackageVersion();
   await rm(outputRoot, { recursive: true, force: true }); await mkdir(path.dirname(outputRoot), { recursive: true });
   await cp(runtime.root, outputRoot, { recursive: true, dereference: false, preserveTimestamps: true });
   await removeUpdaterArtifacts(outputRoot);
@@ -34,7 +64,7 @@ export async function assembleWindowsPortable({ runtime, builtAsar, builtAsarUnp
   await writeFile(path.join(outputRoot, "README-PORTABLE.txt"), notice);
   const manifest = {
     schemaVersion: 1, kind: "unofficial-reconstructed-windows-portable", platform: "win32", arch: "x64", productName: reconstructedWindowsName,
-    executable: reconstructedWindowsExecutableName, upstreamVersion: "0.18.0", reconstructedVersion: "0.18.0-reconstructed.2",
+    executable: reconstructedWindowsExecutableName, upstreamVersion: "0.18.0", reconstructedVersion: packageVersion,
     trust: { distributionSigned: false, upstreamShellRetained: true, publicReleaseEligible: false },
     upstream: { installerSha256: windowsInstallerSha256, appAsarSha256: upstreamWindowsAsarSha256 },
     reconstructed: { appAsarSha256: await sha256File(packagedAsar), updates: "hard-disabled", updaterArtifacts: "removed", protocolRegistration: "disabled", profileName: reconstructedWindowsName },
@@ -44,12 +74,13 @@ export async function assembleWindowsPortable({ runtime, builtAsar, builtAsarUnp
 }
 
 export async function verifyWindowsPortable(root) {
+  const packageVersion = await reconstructedPackageVersion();
   const outputRoot = path.resolve(root), manifest = JSON.parse(await readFile(path.join(outputRoot, windowsPortableManifestName), "utf8"));
-  if (manifest?.schemaVersion !== 1 || manifest.kind !== "unofficial-reconstructed-windows-portable" || manifest.platform !== "win32" || manifest.arch !== "x64" || manifest.trust?.distributionSigned !== false || manifest.trust?.publicReleaseEligible !== false) throw new Error("Portable manifest identity is invalid");
+  if (manifest?.schemaVersion !== 1 || manifest.kind !== "unofficial-reconstructed-windows-portable" || manifest.platform !== "win32" || manifest.arch !== "x64" || manifest.reconstructedVersion !== packageVersion || manifest.trust?.distributionSigned !== false || manifest.trust?.publicReleaseEligible !== false) throw new Error("Portable manifest identity is invalid");
   const executable = path.join(outputRoot, manifest.executable), asar = path.join(outputRoot, "resources", "app.asar"), unpacked = `${asar}.unpacked`;
   await assertPeX64(executable, manifest.executable);
   if (await pathExists(path.join(outputRoot, "Grok Bot.exe"))) throw new Error("Portable output inherited the official executable name");
-  for (const relative of ["resources/elevate.exe", "resources/app-update.yml", "Update.exe"]) if (await pathExists(path.join(outputRoot, ...relative.split("/")))) throw new Error(`Updater artifact remains: ${relative}`);
+  await assertNoWindowsUpdaterArtifacts(outputRoot);
   if (await sha256File(asar) !== manifest.reconstructed.appAsarSha256 || manifest.upstream.appAsarSha256 !== upstreamWindowsAsarSha256 || manifest.upstream.installerSha256 !== windowsInstallerSha256) throw new Error("Portable hash provenance is invalid");
   const listing = normalizedListing(asar);
   for (const required of ["package.json", "dist/electron-main/main.cjs", "dist/host/host-main.cjs", "dist/renderer/index.html", "dist/reconstruction-build.json", "dist/runtime-composition-audit.json"]) if (!listing.has(required)) throw new Error(`Reconstructed ASAR is missing ${required}`);

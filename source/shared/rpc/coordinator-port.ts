@@ -2,6 +2,42 @@ export const COORDINATOR_PROTOCOL_VERSION = 1;
 export const COORDINATOR_UNKNOWN_METHOD = "unknown-method";
 export const COORDINATOR_CANCELLED = "cancelled";
 
+export interface CoordinatorRendererPortRequestPayload {
+  readonly knownGeneration: number;
+}
+
+export interface CoordinatorRendererPortDeliveryPayload {
+  readonly generation: number;
+}
+
+export function parseCoordinatorRendererPortRequestPayload(
+  value: unknown,
+): CoordinatorRendererPortRequestPayload | null {
+  if (
+    !isRecord(value)
+    || Array.isArray(value)
+    || Object.keys(value).length !== 1
+    || typeof value.knownGeneration !== "number"
+    || !Number.isSafeInteger(value.knownGeneration)
+    || value.knownGeneration < 0
+  ) return null;
+  return { knownGeneration: value.knownGeneration };
+}
+
+export function parseCoordinatorRendererPortDeliveryPayload(
+  value: unknown,
+): CoordinatorRendererPortDeliveryPayload | null {
+  if (
+    !isRecord(value)
+    || Array.isArray(value)
+    || Object.keys(value).length !== 1
+    || typeof value.generation !== "number"
+    || !Number.isSafeInteger(value.generation)
+    || value.generation <= 0
+  ) return null;
+  return { generation: value.generation };
+}
+
 export type CoordinatorFailure = { code: string; message: string; transportKind?: string };
 export type CoordinatorReplyOutcome = { status: "ok"; value: unknown } | { status: "failed"; failure: CoordinatorFailure };
 export type CoordinatorFrame =

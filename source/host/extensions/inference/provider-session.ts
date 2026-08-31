@@ -157,10 +157,28 @@ function configuredCodexReasoningEffort(): "minimal" | "low" | "medium" | "high"
   } catch { return undefined; }
 }
 
+function plainToolParameters(source: Loose): Loose | undefined {
+  const raw = source.inputSchema ?? source.parameters;
+  if (typeof raw !== "object" || raw == null || Array.isArray(raw)) return undefined;
+  const wrapped = raw as Loose;
+  const candidate = Object.prototype.hasOwnProperty.call(wrapped, "jsonSchema")
+    ? wrapped.jsonSchema
+    : raw;
+  if (typeof candidate !== "object" || candidate == null || Array.isArray(candidate)) return undefined;
+  try {
+    const parsed = JSON.parse(JSON.stringify(candidate)) as unknown;
+    return typeof parsed === "object" && parsed != null && !Array.isArray(parsed)
+      ? parsed as Loose
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function codexTools(definitions: readonly Loose[] | undefined): CodexDirectTool[] | undefined {
   if (definitions == null) return undefined;
   const tools = definitions.flatMap((source): CodexDirectTool[] => {
-    const parameters = source.inputSchema ?? source.parameters;
+    const parameters = plainToolParameters(source);
     return typeof source.name === "string" && source.name.length > 0 && parameters != null ? [{
       name: source.name,
       ...(typeof source.description === "string" ? { description: source.description } : {}),
@@ -234,12 +252,12 @@ function claudeExecutor(messages: readonly ProviderMessage[], invocationId: stri
   return { fullStream, response: resultResponse.promise, usage: usage.promise, extendedUsage: extendedUsage.promise, providerMetadata: metadata.promise, invocationId: Promise.resolve(invocationId) };
 }
 
-function toToolSet(definitions: readonly Loose[] | undefined, executeTool?: RoutedToolExecutor): ToolSet | undefined {
+export function toToolSet(definitions: readonly Loose[] | undefined, executeTool?: RoutedToolExecutor): ToolSet | undefined {
   if (definitions == null || definitions.length === 0) return undefined;
   const tools: ToolSet = {};
   for (const definition of definitions) {
     if (typeof definition.name !== "string" || definition.name.length === 0) continue;
-    const parameters = definition.inputSchema ?? definition.parameters;
+    const parameters = plainToolParameters(definition);
     if (parameters == null) continue;
     const routedTool: any = {
       ...(typeof definition.description === "string" ? { description: definition.description } : {}),
@@ -264,7 +282,7 @@ function openRouterExecutor(messages: readonly ProviderMessage[], invocationId: 
 function cliProxyTools(definitions: readonly Loose[] | undefined): OpenAiCompatibleTool[] | undefined {
   if (definitions == null || definitions.length === 0) return undefined;
   const tools = definitions.flatMap((source): OpenAiCompatibleTool[] => {
-    const parameters = source.inputSchema ?? source.parameters;
+    const parameters = plainToolParameters(source);
     return typeof source.name === "string" && source.name.length > 0 && parameters != null ? [{ name: source.name, ...(typeof source.description === "string" ? { description: source.description } : {}), parameters, source }] : [];
   });
   return tools.length === 0 ? undefined : tools;
